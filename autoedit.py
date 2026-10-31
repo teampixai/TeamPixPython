@@ -14,6 +14,10 @@ Usage:
     python autoedit.py photo.cr3 -o ./edited -ext png
 
 Available pipelines (see PIPELINE_ORDER for the canonical execution order):
+    tone             Highlights/midtones/shadows exposure (EV) + contrast,
+                     from --highlights/--midtones/--shadows/--contrast, or
+                     propose_tone()'s auto values when none are given. Also
+                     drives the culling app's edit-mode live preview.
     level            Auto black/white point correction.
     brightness       Auto exposure correction (highlight-safe gamma).
     aisharpen        Real-ESRGAN (realesr-general-x4v3, compact) detail
@@ -25,8 +29,9 @@ Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     openai_autoedit  Generative retouch via the OpenAI image model.
     openai_ig        Generative heroic 4:5 Instagram reframe.
 
-"all" expands to every pipeline that does NOT start with "openai", so the
-generative (billed) stages are always opt-in by name.
+"all" expands to every pipeline that does NOT start with "openai" (except
+"tone", which would double up with level+brightness), so the generative
+(billed) stages are always opt-in by name.
 
 This script is deliberately standalone: the image-reading and extension
 helpers are duplicated from algo/stages/image_analysis.py rather than imported,
@@ -191,6 +196,17 @@ BODY_SHARPEN_MIN_PERSON_COVERAGE = 0.01
 # whose caller did pass them.
 BODY_SHARPEN_KEYPOINT_CONF_MIN = 0.3
 
+# COCO-17 skeleton (pairs of keypoint indexes) used to tell overlapping
+# players apart: a pixel belongs to whichever player's skeleton is closest
+# (see _protected_keep_mask()).
+_COCO_BONES: tuple[tuple[int, int], ...] = (
+    (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6),
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+)
+# The ownership map is computed on a grid with at most this many cells along
+# the crop's long edge, then upscaled — plenty for a feathered mask.
+_PROTECT_GRID_LONG_EDGE = 512
 # Peak-VRAM-per-output-pixel at tile=0/half precision, measured on a real GPU
 # (Titan V) across 512-1600px square images: compact ~407-494 B/px, rrdbnet
 # ~6970-7015 B/px (both stable once the fixed CUDA/model overhead amortizes).
@@ -476,6 +492,222 @@ def auto_brightness(image: np.ndarray) -> np.ndarray:
     lut = np.power(ramp, gamma) * 255.0
     log.debug("brightness: median=%.3f gamma=%.3f", median, gamma)
     return _apply_lut(image, lut.round().astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# Manual tone controls (the "tone" pipeline)
+# ---------------------------------------------------------------------------
+#
+# The single source of truth for the culling app's edit-mode brightness and
+# contrast: its live preview (culling_app.py) calls apply_tone() on a
+# downscaled copy and the final render runs the same function through
+# TonePipeline, so preview and output can only differ in resolution.
+
+@dataclass(frozen=True)
+class ToneParams:
+    """Exposure in EV per tonal zone (-TONE_EV_LIMIT..+TONE_EV_LIMIT) plus a
+    contrast amount (-TONE_CONTRAST_LIMIT..+TONE_CONTRAST_LIMIT); all zero
+    is the identity."""
+
+    highlights: float = 0.0
+    midtones: float = 0.0
+    shadows: float = 0.0
+    contrast: float = 0.0
+
+    def clamped(self) -> "ToneParams":
+        ev = lambda v: float(np.clip(v, -TONE_EV_LIMIT, TONE_EV_LIMIT))  # noqa: E731
+        return ToneParams(
+            highlights=ev(self.highlights),
+            midtones=ev(self.midtones),
+            shadows=ev(self.shadows),
+            contrast=float(np.clip(self.contrast, -TONE_CONTRAST_LIMIT, TONE_CONTRAST_LIMIT)),
+        )
+
+    def is_identity(self) -> bool:
+        return not any((self.highlights, self.midtones, self.shadows, self.contrast))
+
+
+TONE_EV_LIMIT = 2.0
+TONE_CONTRAST_LIMIT = 100.0
+
+# Resolution of the luminance -> luminance tone curve.
+_TONE_CURVE_SIZE = 1024
+# Linear-light values above this roll off smoothly toward 1.0 instead of
+# hard-clipping when an exposure boost pushes them past white.
+_TONE_SHOULDER = 0.8
+# Logistic steepness at contrast +100 (mid-grey slope ~2.5x).
+_TONE_CONTRAST_STEEPNESS = 10.0
+
+# propose_tone() fitting: luminance bins, the share of the fit weight spread
+# evenly across all bins (so sparsely used tones still get a sane curve),
+# the pull toward zero, and the solver's iteration budget.
+_PROPOSE_BINS = 64
+_PROPOSE_BIN_FLOOR = 0.15
+_PROPOSE_RIDGE = 0.01
+_PROPOSE_ITERATIONS = 40
+# Highlights are only ever lifted this much: brightening them risks blowing
+# out white kit and sunlit pitches.
+_PROPOSE_HIGHLIGHT_MAX_EV = 0.5
+_PROPOSE_DEADBAND_EV = 0.1
+
+
+def _srgb_to_linear(v: np.ndarray) -> np.ndarray:
+    return np.where(v <= 0.04045, v / 12.92, np.power((v + 0.055) / 1.055, 2.4))
+
+
+def _linear_to_srgb(v: np.ndarray) -> np.ndarray:
+    v = np.clip(v, 0.0, 1.0)
+    return np.where(v <= 0.0031308, v * 12.92, 1.055 * np.power(v, 1.0 / 2.4) - 0.055)
+
+
+def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def tone_zone_weights(lum: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(shadow, midtone, highlight) weights for luminance in [0, 1]; they sum
+    to 1 everywhere, peak at black / mid-grey / white respectively and
+    cross-fade smoothly so zone edits never leave a visible seam."""
+    low = _smoothstep(0.0, 0.5, lum)
+    high = _smoothstep(0.5, 1.0, lum)
+    return 1.0 - low, low - high, high
+
+
+def _shoulder(v: np.ndarray, gain: np.ndarray) -> np.ndarray:
+    """Rolls *v* (= linear value * *gain*) off above _TONE_SHOULDER so the
+    boosted white point (*gain*) lands exactly on 1.0: identity wherever
+    gain <= 1, continuous in gain, slope 1 at the shoulder."""
+    s = _TONE_SHOULDER
+    white = np.maximum(gain, 1.0)
+    m = (white - s) / (1.0 - s)
+    t = np.clip((v - s) / (white - s), 0.0, 1.0)
+    rolled = s + (1.0 - s) * (m * t) / (1.0 + (m - 1.0) * t)
+    return np.where(v > s, rolled, v)
+
+
+def tone_curve(params: ToneParams, lum: np.ndarray) -> np.ndarray:
+    """Maps display luminance in [0, 1] to its toned value. Exposure is a
+    per-zone EV gain applied in linear light; contrast is then an S-curve
+    (positive) or its inverse (negative) pivoting on mid-grey."""
+    p = params.clamped()
+    shadow_w, mid_w, high_w = tone_zone_weights(lum)
+    gain = np.power(2.0, shadow_w * p.shadows + mid_w * p.midtones + high_w * p.highlights)
+    out = _linear_to_srgb(_shoulder(_srgb_to_linear(lum) * gain, gain))
+    return np.clip(_contrast_curve(out, p.contrast / TONE_CONTRAST_LIMIT), 0.0, 1.0)
+
+
+def _contrast_curve(y: np.ndarray, amount: float) -> np.ndarray:
+    """Contrast S-curve pivoting on mid-grey, endpoints fixed. Positive
+    *amount* (0..1) is a normalised logistic of steepness
+    _TONE_CONTRAST_STEEPNESS * sqrt(amount) — the sqrt makes the visible
+    effect grow linearly with the slider; negative uses its exact inverse,
+    so -x undoes +x."""
+    k = _TONE_CONTRAST_STEEPNESS * math.sqrt(abs(amount))
+    if k < 1e-3:
+        return y
+    lo = 1.0 / (1.0 + math.exp(k / 2.0))
+    span = 1.0 - 2.0 * lo
+    if amount > 0:
+        return (1.0 / (1.0 + np.exp(-k * (y - 0.5))) - lo) / span
+    v = np.clip(lo + y * span, 1e-12, 1.0 - 1e-12)
+    return 0.5 + np.log(v / (1.0 - v)) / k
+
+
+def _tone_lut(params: ToneParams) -> np.ndarray:
+    """tone_curve() sampled on _TONE_CURVE_SIZE points and forced monotonic
+    — opposing zone settings (e.g. shadows +2, midtones -2) could otherwise
+    invert tones where the zones overlap."""
+    ramp = np.linspace(0.0, 1.0, _TONE_CURVE_SIZE, dtype=np.float64)
+    return np.maximum.accumulate(tone_curve(params, ramp))
+
+
+def apply_tone(image: np.ndarray, params: ToneParams) -> np.ndarray:
+    """Applies *params* to a BGR uint8 image. The tone curve acts on BT.709
+    luminance and the result is applied as a per-pixel gain to all three
+    channels, so hue is preserved. Purely per-pixel: the same params give
+    the same result at any resolution."""
+    if params.clamped().is_identity():
+        return image
+    lut = _tone_lut(params)
+    ramp = np.linspace(0.0, 1.0, _TONE_CURVE_SIZE, dtype=np.float64)
+    gain_lut = np.where(ramp > 1e-4, lut / np.maximum(ramp, 1e-4), 1.0).astype(np.float32)
+    lum = _luminance(image)
+    idx = np.rint(lum * (_TONE_CURVE_SIZE - 1)).astype(np.int32)
+    gain = gain_lut[idx]
+    # Pure black has no hue to preserve: lift it by the curve directly.
+    black_lift = np.float32(lut[0] * 255.0)
+    out = image.astype(np.float32) * gain[:, :, None]
+    if black_lift > 0:
+        out = np.maximum(out, black_lift)
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def propose_tone(image: np.ndarray) -> ToneParams:
+    """Suggested ("Auto") tone settings for a BGR uint8 image.
+
+    Expresses what the established automatic corrections — auto_level()
+    followed by auto_brightness() — would do to this photo in terms of the
+    four sliders: both are run on the 512px analysis view, the resulting
+    input -> output luminance mapping is binned, and highlights/midtones/
+    shadows/contrast are least-squares fitted (Levenberg-Marquardt) so that
+    tone_curve() reproduces it, weighted by how much of the (centre-
+    weighted) frame sits in each bin. A light pull toward zero keeps tones
+    the photo barely uses from producing wild values.
+    """
+    small = _analysis_view(image)
+    lum_in = _luminance(small).astype(np.float64)
+    lum_out = _luminance(auto_brightness(auto_level(small))).astype(np.float64)
+    weights = _center_weights(*lum_in.shape[:2]).astype(np.float64)
+
+    idx = np.minimum((lum_in * _PROPOSE_BINS).astype(np.int64), _PROPOSE_BINS - 1).ravel()
+    w_flat = weights.ravel()
+    wsum = np.bincount(idx, w_flat, _PROPOSE_BINS)
+    used = wsum > 0
+    x = np.bincount(idx, w_flat * lum_in.ravel(), _PROPOSE_BINS)[used] / wsum[used]
+    y = np.bincount(idx, w_flat * lum_out.ravel(), _PROPOSE_BINS)[used] / wsum[used]
+    w = wsum[used] / wsum.sum() + _PROPOSE_BIN_FLOOR / _PROPOSE_BINS
+    sqrt_w = np.sqrt(w)
+
+    # Solved in a scaled space where every component spans roughly +-2.
+    scale = np.array([1.0, 1.0, 1.0, TONE_CONTRAST_LIMIT / TONE_EV_LIMIT])
+    lower = np.array([-TONE_EV_LIMIT] * 3 + [-TONE_EV_LIMIT])
+    upper = np.array([_PROPOSE_HIGHLIGHT_MAX_EV, TONE_EV_LIMIT, TONE_EV_LIMIT, TONE_EV_LIMIT])
+
+    def residuals(p: np.ndarray) -> np.ndarray:
+        h, m, s, c = p * scale
+        fit = tone_curve(ToneParams(highlights=h, midtones=m, shadows=s, contrast=c), x)
+        return np.concatenate([sqrt_w * (fit - y), _PROPOSE_RIDGE * p])
+
+    p = np.zeros(4)
+    r = residuals(p)
+    cost = float(r @ r)
+    damping = 1e-3
+    for _ in range(_PROPOSE_ITERATIONS):
+        jac = np.empty((r.size, 4))
+        for k in range(4):
+            dp = np.zeros(4)
+            dp[k] = 1e-4
+            jac[:, k] = (residuals(p + dp) - r) / 1e-4
+        jtj = jac.T @ jac
+        step = np.linalg.solve(jtj + damping * np.diag(np.diag(jtj) + 1e-9), -jac.T @ r)
+        candidate = np.clip(p + step, lower, upper)
+        r_new = residuals(candidate)
+        cost_new = float(r_new @ r_new)
+        if cost_new < cost:
+            p, r, cost = candidate, r_new, cost_new
+            damping /= 3.0
+            if np.abs(step).max() < 1e-4:
+                break
+        else:
+            damping *= 4.0
+
+    h, m, s, c = p * scale
+    ev = {"highlights": h, "midtones": m, "shadows": s}
+    ev = {k: (0.0 if abs(v) < _PROPOSE_DEADBAND_EV else round(float(v), 1)) for k, v in ev.items()}
+    params = ToneParams(contrast=float(round(c)) + 0.0, **ev)
+    log.debug("tone: proposed %s", params)
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -855,12 +1087,92 @@ def _select_body_component(
     return mask * keep.astype(np.float32), info
 
 
+def _skeleton_segments(
+    keypoints_px: list[tuple[float, float, float]],
+    box_px: tuple[float, float, float, float],
+) -> np.ndarray:
+    """(n, 4) array of x1, y1, x2, y2 line segments approximating a body:
+    its COCO bones between confident keypoints, plus lone confident
+    keypoints as zero-length segments; falls back to the vertical centre
+    line of its box when it has no confident keypoints at all."""
+    confident = [conf >= BODY_SHARPEN_KEYPOINT_CONF_MIN for _x, _y, conf in keypoints_px]
+    segments: list[tuple[float, float, float, float]] = []
+    used: set[int] = set()
+    if len(keypoints_px) == 17:
+        for a, b in _COCO_BONES:
+            if confident[a] and confident[b]:
+                segments.append((keypoints_px[a][0], keypoints_px[a][1], keypoints_px[b][0], keypoints_px[b][1]))
+                used.update((a, b))
+    for i, (x, y, _conf) in enumerate(keypoints_px):
+        if confident[i] and i not in used:
+            segments.append((x, y, x, y))
+    if not segments:
+        x1, y1, x2, y2 = box_px
+        cx = (x1 + x2) / 2.0
+        segments.append((cx, y1, cx, y2))
+    return np.asarray(segments, dtype=np.float32)
+
+
+def _distance_to_segments(xs: np.ndarray, ys: np.ndarray, segments: np.ndarray) -> np.ndarray:
+    """Distance from every grid point (xs along columns, ys along rows) to
+    the nearest of *segments*."""
+    px = xs[None, :]
+    py = ys[:, None]
+    best = np.full((ys.size, xs.size), np.inf, dtype=np.float32)
+    for x1, y1, x2, y2 in segments:
+        dx, dy = x2 - x1, y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq > 1e-9:
+            t = np.clip(((px - x1) * dx + (py - y1) * dy) / length_sq, 0.0, 1.0)
+        else:
+            t = 0.0
+        dist = np.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+        np.minimum(best, dist, out=best)
+    return best
+
+
+def _protected_keep_mask(
+    shape_hw: tuple[int, int],
+    target_box_px: tuple[float, float, float, float],
+    target_keypoints_px: list[tuple[float, float, float]],
+    protected_px: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]],
+) -> np.ndarray | None:
+    """Float32 [0, 1] mask of *shape_hw* that is 0 wherever a protected
+    (not selected) player overlaps the target: pixels inside that player's
+    box that are closer to their skeleton than to the target's. All
+    coordinates are in the crop's own pixels. None if nothing is excluded.
+
+    The segmentation mask can't tell two touching people apart, and the
+    target's box often contains part of a neighbour; this is what keeps
+    such an unselected neighbour from being sharpened along with them."""
+    height, width = shape_hw
+    step = max(1, int(math.ceil(max(height, width) / _PROTECT_GRID_LONG_EDGE)))
+    xs = np.arange(step / 2.0, width, step, dtype=np.float32)
+    ys = np.arange(step / 2.0, height, step, dtype=np.float32)
+    target_dist = _distance_to_segments(xs, ys, _skeleton_segments(target_keypoints_px, target_box_px))
+    remove = np.zeros((ys.size, xs.size), dtype=bool)
+    for box_px, keypoints_px in protected_px:
+        x1, y1, x2, y2 = box_px
+        inside = ((xs[None, :] >= x1) & (xs[None, :] <= x2)) & ((ys[:, None] >= y1) & (ys[:, None] <= y2))
+        if not inside.any():
+            continue
+        dist = _distance_to_segments(xs, ys, _skeleton_segments(keypoints_px, box_px))
+        remove |= inside & (dist < target_dist)
+    if not remove.any():
+        return None
+    keep = cv2.resize((~remove).astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    if BODY_SHARPEN_CLIP_FEATHER_PX > 0:
+        keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=BODY_SHARPEN_CLIP_FEATHER_PX)
+    return keep
+
+
 def sharpen_bodies(
     image: np.ndarray,
     boxes_norm: list[tuple[float, float, float, float]],
     dispatcher: SharpenDispatcher,
     label: str = "",
     keypoints_norm: list[list[tuple[float, float, float]]] | None = None,
+    protected_norm: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None,
 ) -> np.ndarray:
     """Sharpen only the given players, leaving the rest of *image*
     pixel-identical to the source.
@@ -878,14 +1190,21 @@ def sharpen_bodies(
     already there.
 
     The caller decides who is sharpened: culling_app.py only passes boxes of
-    the teammates the album marked is_teammate (see its
-    _teammate_body_entries()).
+    the players the user selected in edit mode (see its
+    _selected_body_entries()).
 
     *keypoints_norm*, if given, must be the same length as *boxes_norm*:
     keypoints_norm[i] is boxes_norm[i]'s own normalised (x, y, confidence)
     17 COCO keypoints (empty list if that body has none). None, or an empty
     list for a given box, just skips keypoint-assisted component selection
     for it — the box-clip alone is still applied.
+
+    *protected_norm*, if given, lists players that must NOT be sharpened
+    as (normalised box, normalised keypoints) pairs. Wherever one overlaps a
+    target's crop, pixels inside its box that sit closer to its skeleton
+    than to the target's are removed from the target's mask (see
+    _protected_keep_mask()) — so an unselected neighbour touching or
+    standing in front of/behind a selected player stays untouched.
 
     Logs every box it was given and, per box, whether segmentation worked
     (and how much of the crop it marked as person) or why the box was skipped.
@@ -942,6 +1261,25 @@ def sharpen_bodies(
                      "confident keypoint(s)",
                      prefix, index, total, component_info["n_kept"], component_info["n_components"],
                      component_info["n_keypoints"])
+
+        if protected_norm:
+            to_crop = lambda bx: (bx[0] * img_w - px1, bx[1] * img_h - py1, bx[2] * img_w - px1, bx[3] * img_h - py1)  # noqa: E731
+            crop_h, crop_w = crop.shape[:2]
+            protected_px = []
+            for p_box, p_kps in protected_norm:
+                cb = to_crop(p_box)
+                if cb[2] <= 0 or cb[3] <= 0 or cb[0] >= crop_w or cb[1] >= crop_h:
+                    continue
+                protected_px.append((cb, [(kx * img_w - px1, ky * img_h - py1, kc) for kx, ky, kc in p_kps]))
+            if protected_px:
+                keep = _protected_keep_mask(crop.shape[:2], to_crop((x1, y1, x2, y2)), keypoints_px, protected_px)
+                if keep is not None:
+                    before = float((mask > 0.5).mean())
+                    mask = mask * keep
+                    log.info("%s  box %d/%d: excluded %d unselected overlapping player(s); person "
+                             "%.1f%% -> %.1f%% of crop",
+                             prefix, index, total, len(protected_px), before * 100,
+                             float((mask > 0.5).mean()) * 100)
 
         person_coverage = float((mask > 0.5).mean())
         if person_coverage < BODY_SHARPEN_MIN_PERSON_COVERAGE:
@@ -1077,7 +1415,7 @@ class EditContext:
     # algo.models.Box's own convention — for the players detected in this
     # photo. Populated from --boxes-file (see main()); callers are expected to
     # list only the players that should be sharpened (culling_app.py passes
-    # just the album's teammates). None/empty means "no boxes available for
+    # just the players the user selected in edit mode). None/empty means "no boxes available for
     # this image", in which case AiSharpenPipeline falls back to whole-frame
     # sharpening regardless of AI_SHARPEN_SCOPE.
     body_boxes: list[tuple[float, float, float, float]] | None = None
@@ -1088,6 +1426,13 @@ class EditContext:
     # from a neighbour's (see _select_body_component()). None/empty just
     # means no keypoint-assisted selection for any box.
     body_keypoints: list[list[tuple[float, float, float]]] | None = None
+    # Explicit settings for the "tone" pipeline (--highlights/--midtones/
+    # --shadows/--contrast); None means "use propose_tone()'s auto values".
+    tone: ToneParams | None = None
+    # Players that must NOT be sharpened, as (normalised box, normalised
+    # keypoints) pairs — --boxes-file entries marked "protect" (see
+    # sharpen_bodies()'s protected_norm).
+    protected_bodies: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None
 
 
 class EditPipeline(ABC):
@@ -1097,6 +1442,21 @@ class EditPipeline(ABC):
     @abstractmethod
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         ...
+
+
+class TonePipeline(EditPipeline):
+    name = "tone"
+    description = (
+        "Highlights/midtones/shadows exposure + contrast (--highlights etc.; auto if none given)"
+    )
+
+    def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
+        params = ctx.tone if ctx.tone is not None else propose_tone(image)
+        log.info(
+            "[%s] tone: highlights %+.2f, midtones %+.2f, shadows %+.2f EV, contrast %+.0f",
+            ctx.source.name, params.highlights, params.midtones, params.shadows, params.contrast,
+        )
+        return apply_tone(image, params)
 
 
 class LevelPipeline(EditPipeline):
@@ -1124,7 +1484,7 @@ class AiSharpenPipeline(EditPipeline):
         if AI_SHARPEN_SCOPE == "bodies" and ctx.body_boxes:
             return sharpen_bodies(
                 image, ctx.body_boxes, ctx.dispatcher, label=ctx.source.name,
-                keypoints_norm=ctx.body_keypoints,
+                keypoints_norm=ctx.body_keypoints, protected_norm=ctx.protected_bodies,
             )
         reason = (
             f"AI_SHARPEN_SCOPE={AI_SHARPEN_SCOPE!r}" if AI_SHARPEN_SCOPE != "bodies"
@@ -1159,8 +1519,10 @@ class OpenAiInstagramPipeline(EditPipeline):
 # Levels sets the black/white endpoints first and brightness then corrects the
 # midtone against an already-normalised histogram (Photoshop Levels semantics);
 # sharpening follows all tonal work; the generative stages run last so they see
-# the best possible local edit.
+# the best possible local edit. "tone" is the manual alternative to
+# level+brightness (the culling app uses it on its own) and runs first.
 PIPELINE_ORDER: tuple[type[EditPipeline], ...] = (
+    TonePipeline,
     LevelPipeline,
     BrightnessPipeline,
     AiSharpenPipeline,
@@ -1169,6 +1531,10 @@ PIPELINE_ORDER: tuple[type[EditPipeline], ...] = (
 )
 
 PIPELINES_BY_NAME: dict[str, type[EditPipeline]] = {cls.name: cls for cls in PIPELINE_ORDER}
+
+# Never pulled in by "all": the openai_* stages are billed, and "tone" would
+# double up with level+brightness.
+_EXCLUDED_FROM_ALL: frozenset[str] = frozenset({"tone"})
 
 
 def resolve_pipelines(tokens: list[str]) -> list[EditPipeline]:
@@ -1181,7 +1547,8 @@ def resolve_pipelines(tokens: list[str]) -> list[EditPipeline]:
                 continue
             if key == "all":
                 requested.update(
-                    n for n in PIPELINES_BY_NAME if not n.startswith("openai")
+                    n for n in PIPELINES_BY_NAME
+                    if not n.startswith("openai") and n not in _EXCLUDED_FROM_ALL
                 )
             elif key in PIPELINES_BY_NAME:
                 requested.add(key)
@@ -1221,6 +1588,8 @@ def process_one(
     out_file: Path | None = None,
     body_boxes: list[tuple[float, float, float, float]] | None = None,
     body_keypoints: list[list[tuple[float, float, float]]] | None = None,
+    tone: ToneParams | None = None,
+    protected_bodies: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None,
 ) -> Path | None:
     image = read_image(source)
     if image is None:
@@ -1229,7 +1598,8 @@ def process_one(
 
     ctx = EditContext(
         source=source, dispatcher=dispatcher, openai_client=openai_client,
-        body_boxes=body_boxes, body_keypoints=body_keypoints,
+        body_boxes=body_boxes, body_keypoints=body_keypoints, tone=tone,
+        protected_bodies=protected_bodies,
     )
     for pipeline in pipelines:
         try:
@@ -1251,28 +1621,39 @@ def process_one(
 def _parse_boxes_file(raw: dict) -> tuple[
     dict[str, list[tuple[float, float, float, float]]],
     dict[str, list[list[tuple[float, float, float]]]],
+    dict[str, list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]]],
 ]:
     """Parses --boxes-file's JSON (see its --help) into (boxes_by_name,
-    keypoints_by_name), both keyed by file name with same-length, same-order
-    lists — index i in each belongs to the same body. Each raw entry is
-    either a plain [x1, y1, x2, y2] box (no keypoints) or a {"box": [...],
-    "keypoints": [[x, y, conf], ...]} object (see culling_app.py's
-    _teammate_body_entries(), the one real caller of this format)."""
+    keypoints_by_name, protected_by_name), all keyed by file name.
+    boxes_by_name/keypoints_by_name are same-length, same-order lists of the
+    bodies to sharpen — index i in each belongs to the same body. Each raw
+    entry is either a plain [x1, y1, x2, y2] box (no keypoints) or a
+    {"box": [...], "keypoints": [[x, y, conf], ...]} object (see
+    culling_app.py's _selected_body_entries(), the one real caller of this
+    format); an object with "protect": true is instead a body that must not
+    be sharpened and goes to protected_by_name as (box, keypoints)."""
     boxes_by_name: dict[str, list[tuple[float, float, float, float]]] = {}
     keypoints_by_name: dict[str, list[list[tuple[float, float, float]]]] = {}
+    protected_by_name: dict[str, list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]]] = {}
     for name, entries in raw.items():
         boxes: list[tuple[float, float, float, float]] = []
         keypoints: list[list[tuple[float, float, float]]] = []
+        protected: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] = []
         for entry in entries:
             if isinstance(entry, dict):
+                kps = [tuple(kp) for kp in entry.get("keypoints", [])]
+                if entry.get("protect"):
+                    protected.append((tuple(entry["box"]), kps))
+                    continue
                 boxes.append(tuple(entry["box"]))
-                keypoints.append([tuple(kp) for kp in entry.get("keypoints", [])])
+                keypoints.append(kps)
             else:
                 boxes.append(tuple(entry))
                 keypoints.append([])
         boxes_by_name[name] = boxes
         keypoints_by_name[name] = keypoints
-    return boxes_by_name, keypoints_by_name
+        protected_by_name[name] = protected
+    return boxes_by_name, keypoints_by_name, protected_by_name
 
 
 def main() -> None:
@@ -1356,22 +1737,42 @@ def main() -> None:
             "additionally carrying that body's 17 COCO keypoints (also normalised; "
             "conf in [0, 1]) so segmentation can tell this player's own silhouette apart "
             "from a neighbour's (see _select_body_component in this file) — keypoints are "
-            "optional per entry. Images with no entry (or no --boxes-file at all) fall "
+            "optional per entry. An object with \"protect\": true is a body that must NOT "
+            "be sharpened: where it overlaps a sharpened body, its own pixels are left "
+            "untouched. Images with no entry (or no --boxes-file at all) fall "
             "back to whole-frame sharpening."
         ),
     )
+    for zone in ("highlights", "midtones", "shadows"):
+        parser.add_argument(
+            f"--{zone}", type=float, default=None, metavar="EV",
+            help=(
+                f"tone pipeline: {zone} exposure in EV (-{TONE_EV_LIMIT:g}..+{TONE_EV_LIMIT:g}). "
+                "If none of --highlights/--midtones/--shadows/--contrast is given, the tone "
+                "pipeline uses its own auto values; otherwise unspecified ones are 0."
+            ),
+        )
+    parser.add_argument(
+        "--contrast", type=float, default=None, metavar="AMOUNT",
+        help=f"tone pipeline: contrast (-{TONE_CONTRAST_LIMIT:g}..+{TONE_CONTRAST_LIMIT:g}, 0 = unchanged).",
+    )
     args = parser.parse_args()
 
-    boxes_by_name, keypoints_by_name = {}, {}
+    tone = None
+    tone_args = (args.highlights, args.midtones, args.shadows, args.contrast)
+    if any(v is not None for v in tone_args):
+        tone = ToneParams(*(v or 0.0 for v in tone_args)).clamped()
+    boxes_by_name, keypoints_by_name, protected_by_name = {}, {}, {}
     if args.boxes_file is not None:
         try:
             raw = json.loads(args.boxes_file.read_text(encoding="utf-8-sig"))
-            boxes_by_name, keypoints_by_name = _parse_boxes_file(raw)
+            boxes_by_name, keypoints_by_name, protected_by_name = _parse_boxes_file(raw)
         except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
             log.warning("Could not read --boxes-file %s: %s", args.boxes_file, exc)
         else:
             log.info("Loaded --boxes-file %s: %s", args.boxes_file,
-                     ", ".join(f"{name}: {len(boxes)} box(es)" for name, boxes in boxes_by_name.items())
+                     ", ".join(f"{name}: {len(boxes)} box(es), {len(protected_by_name.get(name, []))} protected"
+                               for name, boxes in boxes_by_name.items())
                      or "no entries")
 
     try:
@@ -1424,6 +1825,8 @@ def main() -> None:
                     dispatcher, openai_client, out_file=args.out_file,
                     body_boxes=boxes_by_name.get(source.name),
                     body_keypoints=keypoints_by_name.get(source.name),
+                    protected_bodies=protected_by_name.get(source.name),
+                    tone=tone,
                 ),
                 sources,
             )

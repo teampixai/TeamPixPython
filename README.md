@@ -46,6 +46,8 @@ The app walks through five pages (top nav):
 | **Faces** | Tag detected face clusters with player names. |
 | **Summary** | Export the kept, tagged photos to a destination folder. |
 
+**AI edit** (Culling page, next to the file path; Faces page, in the photo preview) opens an editor: a before/after split view with a panel on the right for **Brightness** (Highlights / Midtones / Shadows, −2…+2 EV), **Contrast** (−100…+100) — each with an **Auto** checkbox that fills in suggested values and locks the sliders — and **Sharpen players**, which draws a box around every detected player (teammates start selected; click a box to toggle it, the smallest box wins where boxes overlap). The preview is rendered by the same code as the final image (`apply_tone()` in `autoedit.py`; sharpening isn't previewed). **Apply** renders the full-resolution result via `autoedit.py -pipelines tone [aisharpen]`, then you **Accept** or **Reject** it. The three checkboxes are remembered (in a browser cookie) only when you accept.
+
 ---
 
 ## How it works
@@ -368,6 +370,6 @@ landmarks) is effectively a pass-through under `--engine mediapipe`.
 | `jersey_lab_match` | `True` | Match team colour by weighted L\*a\*b\* distance (brightness-forgiving) |
 | `jersey_lab_l_weight` | `0.15` | Weight on the L\* (brightness) axis when matching jersey colour |
 | `jersey_lab_max_dist` | `28.0` | Max weighted L\*a\*b\* distance to count as the team colour |
-| `extended_threshold_offset` | `0.3` | Faces scoring above *sharp threshold − this* (floored at 0) get their jersey identified and a per-body `is_teammate` flag, even if they miss the sharp threshold. Verdicts/stars are unaffected. Overridable per album via `run_settings["extended_threshold_offset"]` in `album.json`. AI edit's body-only sharpening uses only `is_teammate` bodies (albums imported before this need a quick regrade to get the flag) |
+| `extended_threshold_offset` | `0.3` | Faces scoring above *sharp threshold − this* (floored at 0) get their jersey identified and a per-body `is_teammate` flag, even if they miss the sharp threshold. Verdicts/stars are unaffected. Overridable per album via `run_settings["extended_threshold_offset"]` in `album.json`. AI edit's **Sharpen players** pre-selects only `is_teammate` bodies (albums imported before this need a quick regrade to get the flag) |
 | `jersey_binary_lightness` | `True` | Fallback Light/Dark bucketing when `jersey_lab_match` is off |
 

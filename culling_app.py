@@ -46,7 +46,7 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
@@ -242,6 +242,19 @@ class AiEditRequest(BaseModel):
     file: str
 
 
+class AiEditApplyRequest(BaseModel):
+    """Everything the edit-mode panel collected; see api_ai_edit_apply()."""
+
+    file: str
+    # autoedit.ToneParams fields: EV per zone (-2..2) and contrast (-100..100).
+    highlights: float = 0.0
+    midtones: float = 0.0
+    shadows: float = 0.0
+    contrast: float = 0.0
+    sharpen: bool = False
+    # Indexes into the photo's bodies, as returned by /api/edit/ai-edit/session.
+    bodyIds: list[int] = Field(default_factory=list)
+
 # --------------------------------------------------------------------------- #
 # Processing (1_prep_review.py) — run in a background thread, buffer combined
 # stdout/stderr lines so the browser can poll for them.
@@ -389,6 +402,48 @@ class AiEditState:
 
 ai_edit_state = AiEditState()
 
+
+# --------------------------------------------------------------------------- #
+# Edit mode session — the photo currently open in the edit-mode panel (before
+# the user hits Apply). Holds a downscaled copy of the exact pixels
+# autoedit.py will read, so live previews run autoedit.apply_tone() — the same
+# code the final render uses — without re-decoding the file every time.
+# --------------------------------------------------------------------------- #
+EDIT_PREVIEW_LONG_EDGE = 1600
+_EDIT_PREVIEW_JPEG_QUALITY = 88
+
+
+class EditSessionState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.album_dir: Optional[Path] = None
+        self.key: Optional[str] = None
+        self.base = None  # BGR uint8 numpy array, long edge <= EDIT_PREVIEW_LONG_EDGE
+        self.before_jpeg: Optional[bytes] = None
+
+    def open(self, album_dir: Path, key: str, base, before_jpeg: bytes) -> None:
+        with self.lock:
+            self.album_dir = album_dir
+            self.key = key
+            self.base = base
+            self.before_jpeg = before_jpeg
+
+    def snapshot(self) -> Optional[dict]:
+        with self.lock:
+            if self.key is None:
+                return None
+            return {"album_dir": self.album_dir, "key": self.key, "base": self.base,
+                    "before_jpeg": self.before_jpeg}
+
+    def clear(self) -> None:
+        with self.lock:
+            self.album_dir = None
+            self.key = None
+            self.base = None
+            self.before_jpeg = None
+
+
+edit_session_state = EditSessionState()
 
 # --------------------------------------------------------------------------- #
 # BackgroundJobState — shared bookkeeping for a background job that writes
@@ -780,14 +835,31 @@ def _album_sharpness_threshold(run_settings: dict) -> float:
     return threshold
 
 
-def _teammate_body_entries(bodies) -> list[dict]:
+def _edit_session_bodies(bodies) -> list[dict]:
+    """Bodies the edit-mode panel draws as selectable boxes: every body with
+    a stored box, ``id`` being its index in *bodies* (what the panel sends
+    back as bodyIds) and ``isTeammate`` whether the album marked it as
+    wearing the team's jersey of the day (see algo/thresholds.py) — those
+    start selected. Albums that predate the flag count as not teammates."""
+    out = []
+    for index, body in enumerate(bodies):
+        box = body.body_bbox
+        if box is None:
+            continue
+        out.append({
+            "id": index,
+            "box": [box.x1, box.y1, box.x2, box.y2],
+            "isTeammate": bool(body.is_teammate),
+        })
+    return out
+
+
+def _selected_body_entries(bodies, body_ids) -> list[dict]:
     """Per-body payload for autoedit.py's --boxes-file: the normalised
-    [x1, y1, x2, y2] box of each body AI edit's body-only sharpening should
-    touch — only those the album marked ``is_teammate`` (wearing the team's
-    jersey of the day, evaluated for every body above the extended sharpness
-    threshold — see algo/thresholds.py); everyone else stays exactly as in
-    the original. Albums that predate the flag, and bodies never evaluated,
-    count as not teammates.
+    [x1, y1, x2, y2] box of each body (by index into *bodies*, see
+    _edit_session_bodies) the user selected for sharpening; everyone else
+    stays exactly as in the original. Unknown ids and bodies without a box
+    are skipped.
 
     Also includes each body's 17 COCO keypoints (normalised x, y,
     confidence; empty list if the album never stored them) — autoedit.py's
@@ -795,9 +867,10 @@ def _teammate_body_entries(bodies) -> list[dict]:
     apart from a neighbour's when both land in the same padded crop (see its
     _select_body_component() and BODY_SHARPEN_* constants)."""
     entries = []
-    for body in bodies:
-        if not body.is_teammate:
+    for index in sorted(set(body_ids)):
+        if not 0 <= index < len(bodies):
             continue
+        body = bodies[index]
         box = body.body_bbox
         if box is None:
             continue
@@ -808,10 +881,37 @@ def _teammate_body_entries(bodies) -> list[dict]:
     return entries
 
 
-def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Path, final_path: Path) -> None:
-    """Run autoedit.py's default (non-generative) pipeline set against a
+def _protected_body_entries(bodies, body_ids) -> list[dict]:
+    """--boxes-file entries ("protect": true) for every boxed body the user
+    did NOT select, so autoedit.py's sharpen_bodies() keeps them untouched
+    even where they overlap a selected player (see its protected_norm)."""
+    selected = set(body_ids)
+    return [
+        {
+            "box": [body.body_bbox.x1, body.body_bbox.y1, body.body_bbox.x2, body.body_bbox.y2],
+            "keypoints": [[kp.point.x, kp.point.y, kp.confidence] for kp in body.body_keypoints],
+            "protect": True,
+        }
+        for index, body in enumerate(bodies)
+        if index not in selected and body.body_bbox is not None
+    ]
+
+
+def _run_ai_edit(
+    album_dir: Path,
+    key: str,
+    source_path: Path,
+    pending_path: Path,
+    final_path: Path,
+    req: AiEditApplyRequest,
+) -> None:
+    """Run autoedit.py with the edit-mode panel's settings (*req*) against a
     single photo, writing to *pending_path* (editedimages/.pending/<key
-    stem>.jpg — RAW originals are rasterized to JPEG in the process).
+    stem>.jpg — RAW originals are rasterized to JPEG in the process): the
+    "tone" pipeline with the exact brightness/contrast values the user
+    previewed, then — if Sharpen players is on and at least one player is
+    selected — body-only "aisharpen" (with GFPGAN face enhance) on just
+    those players.
 
     Nothing is recorded on the Album entry here: the result stays
     parked in the pending folder until the user accepts it in the
@@ -832,27 +932,34 @@ def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Pat
         log.warning("AI edit: could not prepare the 'before' image for %s: %s", key, exc)
         before_path = source_path
 
+    image = album_for(album_dir).image(key)
+    bodies = image.bodies if image is not None else []
+    entries = _selected_body_entries(bodies, req.bodyIds) if req.sharpen else []
+
+    pipelines = ["tone"] + (["aisharpen"] if entries else [])
     cmd = [
         sys.executable,
         str(REPO_ROOT / "autoedit.py"),
         str(source_path),
-        "-pipelines", "all",
+        "-pipelines", " ".join(pipelines),
         "--out-file", str(pending_path),
-        "--face-enhance",
+        "--highlights", f"{req.highlights:g}",
+        "--midtones", f"{req.midtones:g}",
+        "--shadows", f"{req.shadows:g}",
+        "--contrast", f"{req.contrast:g}",
     ]
 
     # Feeds autoedit.py's aisharpen pipeline the boxes (+ keypoints) of the
-    # players to sharpen (see _teammate_body_entries) so it can sharpen+blend
-    # just those players instead of the whole frame. Keyed by
-    # source_path.name (the exact file autoedit.py reads) so it can look
-    # itself up without any other album context. No entry/empty list ->
-    # that script's own whole-frame fallback takes over.
-    image = album_for(album_dir).image(key)
-    entries = _teammate_body_entries(image.bodies if image is not None else [])
+    # selected players (see _selected_body_entries) so it sharpens+blends
+    # just those players instead of the whole frame, plus every unselected
+    # player as "protect" so none of them is sharpened where they overlap a
+    # selected one. Keyed by source_path.name (the exact file autoedit.py
+    # reads) so it can look itself up without any other album context.
     if entries:
         boxes_file = pending_path.parent / "boxes.json"
-        boxes_file.write_text(json.dumps({source_path.name: entries}), encoding="utf-8")
-        cmd += ["--boxes-file", str(boxes_file)]
+        payload = entries + _protected_body_entries(bodies, req.bodyIds)
+        boxes_file.write_text(json.dumps({source_path.name: payload}), encoding="utf-8")
+        cmd += ["--face-enhance", "--boxes-file", str(boxes_file)]
 
     log.info("Starting AI edit for %s: %s", key, " ".join(cmd))
     returncode = processing_state.run_subprocess(cmd)
@@ -1376,7 +1483,7 @@ def _has_active_album() -> bool:
 # --------------------------------------------------------------------------- #
 # Categories and the info.json buckets behind them now live in
 # algo/album_info.py (imported above as CULLING_CATEGORIES).
-# Where autoedit.py's output for a photo is kept — see api_ai_edit()/
+# Where autoedit.py's output for a photo is kept — see api_ai_edit_apply()/
 # _run_ai_edit() below. Sibling of previews/ under the album directory.
 _EDITEDIMAGES_SUBDIR = EDITEDIMAGES_SUBDIR
 # Freshly generated edits land here first and are only promoted into
@@ -2608,22 +2715,127 @@ def api_rerun_facereco() -> dict:
     return {"ok": True}
 
 
-@app.post("/api/edit/ai-edit")
-def api_ai_edit(req: AiEditRequest) -> dict:
-    """Launch autoedit.py against one photo (Review/Faces page "AI edit"
-    button). Reuses the same processing_state/polling machinery as every
-    other background job here — only one can run at a time. The result is
-    parked as a pending edit for the before/after compare view; it does not
-    become the photo's edited_image until accepted."""
+def _encode_jpeg(image, quality: int = _EDIT_PREVIEW_JPEG_QUALITY) -> bytes:
+    import cv2  # lazy: pulls in the CV stack
+
+    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not encode preview")
+    return buf.tobytes()
+
+
+def _open_edit_session(key: str):
+    """Decode *key*'s editable source (an already accepted edit if there is
+    one, else the original — RAW decoded exactly as autoedit.py does) and
+    cache a downscaled copy as the edit session. Returns (album_dir,
+    full-size (width, height), autoedit.propose_tone() values)."""
+    import cv2  # lazy: pulls in the CV stack
+    import autoedit
+
+    album_dir = _current_album_path()
+    source_path, _pending, _final = _resolve_ai_edit_paths(album_dir, key)
+    full = autoedit.read_image(source_path)
+    if full is None:
+        raise HTTPException(status_code=422, detail=f"Could not read {source_path.name}")
+
+    proposed = autoedit.propose_tone(full)
+    height, width = full.shape[:2]
+    scale = EDIT_PREVIEW_LONG_EDGE / max(height, width)
+    base = full
+    if scale < 1.0:
+        base = cv2.resize(full, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+    del full
+    edit_session_state.open(album_dir, key, base, _encode_jpeg(base))
+    return album_dir, (width, height), proposed
+
+
+def _require_edit_session(key: Optional[str]) -> dict:
+    """The open edit session for *key*, transparently reopening it if the
+    server lost it (restart) or another tab opened a different photo since."""
+    session = edit_session_state.snapshot()
+    if key and (session is None or session["key"] != key):
+        _open_edit_session(key)
+        session = edit_session_state.snapshot()
+    if session is None:
+        raise HTTPException(status_code=404, detail="No photo is open for editing")
+    return session
+
+
+@app.post("/api/edit/ai-edit/session")
+def api_ai_edit_session(req: AiEditRequest) -> dict:
+    """Open *req.file* in edit mode (Review/Faces page "AI edit" button):
+    caches a downscaled copy of the exact pixels autoedit.py will edit for
+    live previews (see _open_edit_session), and returns the auto
+    ("suggested") tone values plus every detected body for the Sharpen
+    players overlay."""
+    import autoedit
+
+    album_dir, (width, height), proposed = _open_edit_session(req.file)
+    image = album_for(album_dir).image(req.file)
+    return {
+        "file": req.file,
+        "width": width,
+        "height": height,
+        "proposed": {
+            "highlights": proposed.highlights,
+            "midtones": proposed.midtones,
+            "shadows": proposed.shadows,
+            "contrast": proposed.contrast,
+        },
+        "limits": {"ev": autoedit.TONE_EV_LIMIT, "contrast": autoedit.TONE_CONTRAST_LIMIT},
+        "bodies": _edit_session_bodies(image.bodies if image is not None else []),
+    }
+
+
+@app.get("/api/edit/ai-edit/session/before")
+def api_ai_edit_session_before(file: Optional[str] = None) -> Response:
+    """The open photo (*file*), unedited, at preview size."""
+    session = _require_edit_session(file)
+    return Response(session["before_jpeg"], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/edit/ai-edit/session/preview")
+def api_ai_edit_session_preview(
+    file: Optional[str] = None,
+    highlights: float = 0.0, midtones: float = 0.0, shadows: float = 0.0, contrast: float = 0.0,
+) -> Response:
+    """The open photo (*file*) at preview size with the given
+    brightness/contrast, rendered by autoedit.apply_tone() — the same
+    function the final render runs. Sharpening is not previewed."""
+    import autoedit
+
+    session = _require_edit_session(file)
+    params = autoedit.ToneParams(highlights=highlights, midtones=midtones, shadows=shadows, contrast=contrast)
+    out = autoedit.apply_tone(session["base"], params)
+    return Response(_encode_jpeg(out), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/edit/ai-edit/session")
+def api_ai_edit_session_close() -> dict:
+    """Close edit mode without applying anything (Cancel)."""
+    edit_session_state.clear()
+    return {"ok": True}
+
+
+@app.post("/api/edit/ai-edit/apply")
+def api_ai_edit_apply(req: AiEditApplyRequest) -> dict:
+    """Render the edit-mode panel's settings at full resolution via
+    autoedit.py (see _run_ai_edit). Reuses the same processing_state/polling
+    machinery as every other background job here — only one can run at a
+    time. The result is parked as a pending edit for the before/after
+    compare view; it does not become the photo's edited_image until
+    accepted."""
     album_dir = _current_album_path()
     source_path, pending_path, final_path = _resolve_ai_edit_paths(album_dir, req.file)
 
     if not processing_state.claim():
         raise HTTPException(status_code=409, detail="Processing is already running.")
+    edit_session_state.clear()
 
     thread = threading.Thread(
         target=_run_ai_edit,
-        args=(album_dir, req.file, source_path, pending_path, final_path),
+        args=(album_dir, req.file, source_path, pending_path, final_path, req),
         daemon=True,
     )
     thread.start()

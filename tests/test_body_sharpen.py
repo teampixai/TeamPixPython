@@ -27,35 +27,47 @@ def _box(x1, y1, x2, y2) -> dict:
     return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
 
-def test_teammate_body_entries_keeps_only_teammates():
+def test_edit_session_bodies_lists_every_boxed_body_with_its_index_and_flag():
+    bodies = [
+        _person(_box(0.1, 0.1, 0.3, 0.9), teammate=True),
+        _person(None, teammate=True),
+        _person(_box(0.5, 0.1, 0.7, 0.9), teammate=False),
+        _person(_box(0.8, 0.2, 0.9, 0.8)),  # older album: no flag
+    ]
+    assert culling_app._edit_session_bodies(bodies) == [
+        {"id": 0, "box": [0.1, 0.1, 0.3, 0.9], "isTeammate": True},
+        {"id": 2, "box": [0.5, 0.1, 0.7, 0.9], "isTeammate": False},
+        {"id": 3, "box": [0.8, 0.2, 0.9, 0.8], "isTeammate": False},
+    ]
+
+
+def test_selected_body_entries_keeps_only_selected_bodies():
     bodies = [
         _person(_box(0.1, 0.1, 0.3, 0.9), teammate=True),
         _person(_box(0.5, 0.1, 0.7, 0.9), teammate=False),
         _person(_box(0.8, 0.2, 0.9, 0.8), teammate=True),
     ]
-    assert culling_app._teammate_body_entries(bodies) == [
-        {"box": [0.1, 0.1, 0.3, 0.9], "keypoints": []},
+    # Selection, not the teammate flag, decides — and order/duplicates don't matter.
+    assert culling_app._selected_body_entries(bodies, [2, 1, 2]) == [
+        {"box": [0.5, 0.1, 0.7, 0.9], "keypoints": []},
         {"box": [0.8, 0.2, 0.9, 0.8], "keypoints": []},
     ]
+    assert culling_app._selected_body_entries(bodies, []) == []
 
 
-def test_teammate_body_entries_treats_a_missing_flag_as_not_a_teammate():
-    # Albums that predate is_teammate, and bodies never evaluated.
-    assert culling_app._teammate_body_entries([_person(_box(0.1, 0.1, 0.3, 0.9))]) == []
-    assert culling_app._teammate_body_entries([]) == []
+def test_selected_body_entries_skips_unknown_ids_and_bodies_without_a_box():
+    bodies = [_person(None, teammate=True), _person(_box(0.1, 0.1, 0.3, 0.9))]
+    assert culling_app._selected_body_entries(bodies, [-1, 0, 5]) == []
+    assert culling_app._selected_body_entries(bodies, [1]) == [{"box": [0.1, 0.1, 0.3, 0.9], "keypoints": []}]
 
 
-def test_teammate_body_entries_skips_a_teammate_with_no_box():
-    assert culling_app._teammate_body_entries([_person(None, teammate=True)]) == []
-
-
-def test_teammate_body_entries_includes_keypoints_when_stored():
+def test_selected_body_entries_includes_keypoints_when_stored():
     wire = {
         "body_bbox": _box(0.1, 0.1, 0.3, 0.9),
         "is_teammate": True,
         "body_keypoints": [{"x": 0.2, "y": 0.2, "conf": 0.9}],
     }
-    assert culling_app._teammate_body_entries([PersonRecord(wire)]) == [
+    assert culling_app._selected_body_entries([PersonRecord(wire)], [0]) == [
         {"box": [0.1, 0.1, 0.3, 0.9], "keypoints": [[0.2, 0.2, 0.9]]},
     ]
 
@@ -252,3 +264,68 @@ def test_sharpen_bodies_keypoints_exclude_neighbour_blob_inside_the_box(monkeypa
     neighbour_px = result[200, 485]
     assert target_px.min() > 240  # target still fully sharpened
     assert neighbour_px.max() == 0  # neighbour's blob now fully excluded
+
+
+# --- unselected ("protected") players -------------------------------------- #
+
+def _standing_keypoints(cx: float, top: float, bottom: float, w: int, h: int) -> list[list[float]]:
+    """17 confident COCO keypoints of a person standing upright at column
+    *cx* (px) between rows *top* and *bottom* (px), normalised to w x h."""
+    ys = np.linspace(top, bottom, 17)
+    return [[cx / w, y / h, 0.95] for y in ys]
+
+
+def test_sharpen_bodies_leaves_protected_neighbour_inside_the_box_untouched(monkeypatch):
+    import algo.segmentation as segmentation
+
+    # Everything is "person": a single merged blob, like two touching players.
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _EverythingIsPerson())
+    w, h = 1000, 400
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    target = (0.40, 0.25, 0.60, 0.75)            # x 400..600
+    neighbour = (0.52, 0.30, 0.70, 0.75)         # x 520..700, overlaps the target's right side
+    target_kps = _standing_keypoints(440, 110, 290, w, h)
+    neighbour_kps = _standing_keypoints(600, 130, 290, w, h)
+
+    result = autoedit.sharpen_bodies(
+        image, [target], _FakeDispatcher(), keypoints_norm=[target_kps],
+        protected_norm=[(neighbour, neighbour_kps)],
+    )
+
+    assert result[200, 440].min() > 240   # the selected player is sharpened
+    assert result[200, 590].max() < 20    # neighbour's body, inside the target box: untouched
+    # Without protection the same pixel would have been sharpened.
+    unprotected = autoedit.sharpen_bodies(image, [target], _FakeDispatcher(), keypoints_norm=[target_kps])
+    assert unprotected[200, 590].min() > 240
+
+
+def test_protected_keep_mask_is_none_when_nobody_overlaps():
+    keep = autoedit._protected_keep_mask(
+        (100, 100), (10, 10, 50, 90), [], [((200, 10, 260, 90), [])],
+    )
+    assert keep is None
+
+
+def test_parse_boxes_file_splits_protected_entries():
+    raw = {"a.jpg": [
+        [0.1, 0.1, 0.2, 0.2],
+        {"box": [0.3, 0.3, 0.4, 0.4], "keypoints": [[0.35, 0.35, 0.9]]},
+        {"box": [0.5, 0.5, 0.6, 0.6], "keypoints": [], "protect": True},
+    ]}
+    boxes, kps, protected = autoedit._parse_boxes_file(raw)
+    assert boxes == {"a.jpg": [(0.1, 0.1, 0.2, 0.2), (0.3, 0.3, 0.4, 0.4)]}
+    assert kps == {"a.jpg": [[], [(0.35, 0.35, 0.9)]]}
+    assert protected == {"a.jpg": [((0.5, 0.5, 0.6, 0.6), [])]}
+
+
+def test_protected_body_entries_lists_every_unselected_boxed_body():
+    bodies = [
+        _person(_box(0.1, 0.1, 0.3, 0.9), teammate=True),
+        _person(None),
+        _person(_box(0.5, 0.1, 0.7, 0.9), teammate=True),
+        _person(_box(0.8, 0.2, 0.9, 0.8)),
+    ]
+    assert culling_app._protected_body_entries(bodies, [0]) == [
+        {"box": [0.5, 0.1, 0.7, 0.9], "keypoints": [], "protect": True},
+        {"box": [0.8, 0.2, 0.9, 0.8], "keypoints": [], "protect": True},
+    ]

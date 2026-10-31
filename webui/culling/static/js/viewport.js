@@ -158,6 +158,7 @@ const Viewport = (function () {
       // underneath zoom/pan) can do the math themselves.
       get zoom() { return zoom; },
       get tx() { return tx; },
+      get ty() { return ty; },
     };
   }
 
@@ -322,8 +323,9 @@ const Viewport = (function () {
     function onKeydown(e) {
       // Let normal typing/selection (e.g. Ctrl+A/Ctrl+C on the readonly path
       // box) work while focus is in the toolbar, instead of closing the
-      // window on the very first keystroke.
-      if ($(e.target).closest(".image-window-toolbar").length) return;
+      // window on the very first keystroke. Same for keys aimed at a compare
+      // / edit window opened on top of this one (e.g. its sliders).
+      if ($(e.target).closest(".image-window-toolbar, .compare-window-backdrop").length) return;
       e.stopPropagation();
       if (e.key === "1") {
         zoomCtl.zoomToActual(imgs(), $img[0]);
@@ -372,10 +374,26 @@ const Viewport = (function () {
   // `opts`: { title, beforeUrl, afterUrl, beforeLabel, afterLabel,
   //           acceptLabel, rejectLabel, onAccept, onReject } — the two
   // handlers may return a promise; the window closes once it settles.
+  //
+  // Optional extras (used by the edit mode in static/js/ai-edit.js):
+  //   sidePanel      — element shown to the right of the viewport; the
+  //                    Accept/Reject buttons are then omitted and the
+  //                    caller closes the window via the returned close().
+  //   overlay        — element laid over the images that zooms/pans with
+  //                    them (fill it with %-positioned children). It never
+  //                    receives pointer events itself; use the two hooks
+  //                    below instead.
+  //   onImageClick(x, y)  — click on the image at normalised (0-1) image
+  //                    coordinates; return true if handled, which skips the
+  //                    usual fit/actual zoom toggle.
+  //   onImageHover(x, y)  — pointer moved over the image (x/y null when it
+  //                    left); return true to show a pointer cursor.
+  // Returns { close, setAfterUrl }.
   function showCompareWindow(opts) {
     opts = opts || {};
     const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
     let sliderPct = 50;
+    const hasPanel = !!opts.sidePanel;
 
     const $beforeImg = $("<img>", { src: opts.beforeUrl, alt: opts.beforeLabel || "Before", class: "compare-slider-before" });
     const $afterImg = $("<img>", { src: opts.afterUrl, alt: opts.afterLabel || "After", class: "compare-slider-after" });
@@ -389,23 +407,36 @@ const Viewport = (function () {
       $("<div>", { class: "compare-slider-badge compare-slider-badge-after" }).text(opts.afterLabel || "After"),
       $handle
     );
+    const $overlay = opts.overlay ? $(opts.overlay).addClass("compare-window-overlay") : $();
+    $handle.before($overlay);
 
     const $reject = $("<button>", { type: "button", class: "btn btn-danger" }).text(opts.rejectLabel || "Reject");
     const $accept = $("<button>", { type: "button", class: "btn btn-primary" }).text(opts.acceptLabel || "Accept");
     const $toolbar = $("<div>", { class: "compare-window-toolbar" }).append(
-      $("<span>", { class: "compare-window-hint" }).text("Drag the handle to compare \u2014 scroll to zoom, drag image to pan"),
-      $reject,
-      $accept
+      $("<span>", { class: "compare-window-hint" }).text("Drag the handle to compare \u2014 scroll to zoom, drag image to pan")
     );
+    if (!hasPanel) $toolbar.append($reject, $accept);
+    const $body = $("<div>", { class: "compare-window-body" }).append($viewport);
+    if (hasPanel) $body.append($(opts.sidePanel).addClass("compare-window-panel"));
     const $backdrop = $("<div>", { class: "image-window-backdrop compare-window-backdrop" }).append(
       $("<div>", { class: "compare-window-title" }).text(opts.title || "Compare"),
-      $viewport,
+      $body,
       $toolbar
     );
     $("body").append($backdrop).addClass("image-window-open");
 
+    // Everything that follows the shared zoom/pan transform.
     function imgs() {
-      return $viewport.find("img");
+      return $viewport.find("img").add($overlay);
+    }
+
+    // Client point -> normalised (0-1) image coordinates, undoing zoom/pan.
+    function toImageCoords(clientX, clientY) {
+      const rect = $viewport[0].getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      const x = (clientX - rect.left - zoomCtl.tx) / zoomCtl.zoom / rect.width;
+      const y = (clientY - rect.top - zoomCtl.ty) / zoomCtl.zoom / rect.height;
+      return { x, y };
     }
 
     // Moves the handle to `pct` (0-100) of the box width and re-clips the
@@ -444,7 +475,14 @@ const Viewport = (function () {
     function lock() {
       const ref = [$beforeImg[0], $afterImg[0]].find((el) => el.naturalWidth);
       if (!ref) return;
-      const box = computeContainFit(ref.naturalWidth, ref.naturalHeight, window.innerWidth * 0.9, window.innerHeight * 0.74);
+      let availW = window.innerWidth * 0.9;
+      let availH = window.innerHeight * 0.74;
+      if (hasPanel) {
+        const panelW = $body.children(".compare-window-panel").outerWidth() || 0;
+        availW = window.innerWidth * 0.94 - panelW - 16;
+        availH = window.innerHeight * 0.8;
+      }
+      const box = computeContainFit(ref.naturalWidth, ref.naturalHeight, availW, availH);
       if (!box) return;
       $viewport.css({ width: box.width + "px", height: box.height + "px" });
       zoomCtl.apply(imgs());
@@ -509,9 +547,24 @@ const Viewport = (function () {
         dragMoved = false;
         return;
       }
+      if (opts.onImageClick) {
+        const pt = toImageCoords(e.clientX, e.clientY);
+        if (pt && opts.onImageClick(pt.x, pt.y)) return;
+      }
       zoomCtl.toggleClick(imgs(), this, e.clientX, e.clientY);
       syncClip();
     });
+    if (opts.onImageHover) {
+      $viewport.on("mousemove", "img", function (e) {
+        if (dragging) return;
+        const pt = toImageCoords(e.clientX, e.clientY);
+        $viewport.toggleClass("compare-window-pointer", !!(pt && opts.onImageHover(pt.x, pt.y)));
+      });
+      $viewport.on("mouseleave", function () {
+        opts.onImageHover(null, null);
+        $viewport.removeClass("compare-window-pointer");
+      });
+    }
 
     // Swallow page-level keyboard shortcuts (e.g. the review page's star
     // hotkeys) while the window is up; '1' still zooms to actual size.
@@ -542,7 +595,12 @@ const Viewport = (function () {
     $accept.on("click", () => decide(opts.onAccept));
     $reject.on("click", () => decide(opts.onReject));
 
-    return { close };
+    // Swaps the after image in place, keeping zoom/pan and slider position.
+    function setAfterUrl(url) {
+      $afterImg.attr("src", url);
+    }
+
+    return { close, setAfterUrl };
   }
 
   return { computeContainFit, createZoomController, showImageWindow, showCompareWindow };

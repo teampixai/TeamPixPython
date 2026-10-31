@@ -104,9 +104,10 @@ class MediaPipeSelfieSegmenter(PersonSegmenter):
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = segmenter.segment(mp_image)
         # Single-category model: confidence_masks[0] is the person-confidence
-        # map directly (no separate background channel to pick between).
+        # map directly (no separate background channel to pick between). Some
+        # MediaPipe builds return it as (H, W, 1); callers expect (H, W).
         mask = result.confidence_masks[0].numpy_view()
-        return mask.astype(np.float32, copy=True)
+        return np.squeeze(mask, axis=-1).astype(np.float32) if mask.ndim == 3 else mask.astype(np.float32, copy=True)
 
 
 # Registry mapping a backend name to its class, plus one lazily-constructed
