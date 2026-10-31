@@ -151,6 +151,13 @@ const Viewport = (function () {
       get min() { return min; },
       get max() { return max; },
       get step() { return step; },
+      // Current zoom level and pan offset (screen px), so callers that need
+      // to translate between on-screen position and an image's own local
+      // coordinate space (e.g. the compare-window slider handle, which
+      // stays at a fixed container-relative position while the images
+      // underneath zoom/pan) can do the math themselves.
+      get zoom() { return zoom; },
+      get tx() { return tx; },
     };
   }
 
@@ -350,12 +357,14 @@ const Viewport = (function () {
   }
 
 
-  // A modal "compare" window: two labelled viewports side by side sharing a
-  // SINGLE zoom controller, so zooming/panning either pane moves both in
-  // lockstep (the two panes are always laid out at identical pixel sizes,
-  // which is what makes one shared transform valid for both). Used by the
-  // AI-edit flow to review a generated image against what it was made from
-  // (see static/js/ai-edit.js).
+  // A modal "compare" window: a single viewport overlaying the before/after
+  // images, with a draggable vertical handle that clips the "after" image to
+  // reveal more or less of it over the "before" image underneath (the
+  // classic before/after slider pattern). Both images share a SINGLE zoom
+  // controller, so zooming/panning stays in lockstep between them (they're
+  // always laid out at identical pixel sizes, which is what makes one
+  // shared transform valid for both). Used by the AI-edit flow to review a
+  // generated image against what it was made from (see static/js/ai-edit.js).
   //
   // Unlike showImageWindow this window is deliberately NOT dismissable by
   // clicking away, Esc, or any other key: the caller needs an explicit
@@ -366,63 +375,115 @@ const Viewport = (function () {
   function showCompareWindow(opts) {
     opts = opts || {};
     const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
+    let sliderPct = 50;
 
-    const $panes = $("<div>", { class: "compare-window-panes" });
-    const cells = [
-      { url: opts.beforeUrl, label: opts.beforeLabel || "Before" },
-      { url: opts.afterUrl, label: opts.afterLabel || "After" },
-    ].map((cell) => {
-      const $img = $("<img>", { src: cell.url, alt: cell.label });
-      const $viewport = $("<div>", { class: "image-window-viewport" }).append($img);
-      $panes.append(
-        $("<div>", { class: "compare-pane" }).append(
-          $("<div>", { class: "compare-pane-label" }).text(cell.label),
-          $viewport
-        )
-      );
-      return { $img, $viewport };
-    });
+    const $beforeImg = $("<img>", { src: opts.beforeUrl, alt: opts.beforeLabel || "Before", class: "compare-slider-before" });
+    const $afterImg = $("<img>", { src: opts.afterUrl, alt: opts.afterLabel || "After", class: "compare-slider-after" });
+    const $handle = $("<div>", { class: "compare-slider-handle", tabindex: "0", role: "slider",
+      "aria-label": "Before/after position", "aria-valuemin": "0", "aria-valuemax": "100" })
+      .append($("<div>", { class: "compare-slider-handle-grip" }).text("\u276e\u276f"));
+    const $viewport = $("<div>", { class: "compare-window-viewport" }).append(
+      $beforeImg,
+      $afterImg,
+      $("<div>", { class: "compare-slider-badge compare-slider-badge-before" }).text(opts.beforeLabel || "Before"),
+      $("<div>", { class: "compare-slider-badge compare-slider-badge-after" }).text(opts.afterLabel || "After"),
+      $handle
+    );
 
     const $reject = $("<button>", { type: "button", class: "btn btn-danger" }).text(opts.rejectLabel || "Reject");
     const $accept = $("<button>", { type: "button", class: "btn btn-primary" }).text(opts.acceptLabel || "Accept");
     const $toolbar = $("<div>", { class: "compare-window-toolbar" }).append(
-      $("<span>", { class: "compare-window-hint" }).text("Scroll to zoom, drag to pan \u2014 both panes stay in sync"),
+      $("<span>", { class: "compare-window-hint" }).text("Drag the handle to compare \u2014 scroll to zoom, drag image to pan"),
       $reject,
       $accept
     );
     const $backdrop = $("<div>", { class: "image-window-backdrop compare-window-backdrop" }).append(
       $("<div>", { class: "compare-window-title" }).text(opts.title || "Compare"),
-      $panes,
+      $viewport,
       $toolbar
     );
     $("body").append($backdrop).addClass("image-window-open");
 
     function imgs() {
-      return $panes.find("img");
+      return $viewport.find("img");
     }
 
-    // Both viewports are sized from the FIRST image that reports a natural
-    // size, so the panes stay pixel-identical even if the two images differ
-    // slightly in dimensions (the odd one out just letterboxes).
-    function lock() {
-      const ref = cells.map((c) => c.$img[0]).find((el) => el.naturalWidth);
-      if (!ref) return;
-      const availW = (window.innerWidth * 0.94 - 24) / 2;
-      const availH = window.innerHeight * 0.72;
-      const box = computeContainFit(ref.naturalWidth, ref.naturalHeight, availW, availH);
-      if (!box) return;
-      cells.forEach((c) => c.$viewport.css({ width: box.width + "px", height: box.height + "px" }));
-      zoomCtl.apply(imgs());
+    // Moves the handle to `pct` (0-100) of the box width and re-clips the
+    // after-image so its clip boundary lines up with the handle on screen
+    // (see syncClip() below) — the before-image is the full, unclipped base
+    // layer underneath, so it shows through to the left of the boundary.
+    function setSlider(pct) {
+      sliderPct = Math.min(100, Math.max(0, pct));
+      $handle.css("left", sliderPct + "%");
+      $handle.attr("aria-valuenow", Math.round(sliderPct));
+      syncClip();
     }
-    cells.forEach((c) => {
-      if (c.$img[0].complete) lock();
-      else c.$img.on("load", lock);
+
+    // The handle itself is a plain sibling element, not subject to the
+    // images' zoom/pan transform, so it always sits at a fixed
+    // container-relative position (sliderPct% of the box). But clip-path
+    // percentages on the after-image are resolved against the image's OWN
+    // (untransformed) border box, and that clipped result is what then gets
+    // zoomed/panned — so a naive `inset(0 0 0 sliderPct%)` clip boundary
+    // drifts away from the handle as soon as zoom/pan changes. This inverts
+    // the image's current transform to find which fraction of the image's
+    // own box currently projects onto the handle's fixed screen position,
+    // and clips there instead, keeping the visible before/after boundary
+    // pinned under the handle at any zoom level or pan offset.
+    function syncClip() {
+      const width = $viewport.width();
+      if (!width) return;
+      const handlePx = (sliderPct / 100) * width;
+      const localPct = ((handlePx - zoomCtl.tx) / zoomCtl.zoom / width) * 100;
+      $afterImg.css("clip-path", `inset(0 0 0 ${Math.min(100, Math.max(0, localPct))}%)`);
+    }
+
+    // The viewport box is sized from whichever image reports a natural size
+    // first, so before/after stay pixel-identical even if they differ
+    // slightly (the odd one out just letterboxes).
+    function lock() {
+      const ref = [$beforeImg[0], $afterImg[0]].find((el) => el.naturalWidth);
+      if (!ref) return;
+      const box = computeContainFit(ref.naturalWidth, ref.naturalHeight, window.innerWidth * 0.9, window.innerHeight * 0.74);
+      if (!box) return;
+      $viewport.css({ width: box.width + "px", height: box.height + "px" });
+      zoomCtl.apply(imgs());
+      setSlider(sliderPct);
+    }
+    [$beforeImg, $afterImg].forEach(($img) => {
+      if ($img[0].complete) lock();
+      else $img.on("load", lock);
     });
     $(window).on("resize.compareWindow", lock);
 
+    // Handle drag: tracks the viewport box's rect at drag-start and
+    // recomputes sliderPct from the pointer's X position on every move.
+    // Kept entirely separate from the zoom/pan drag below (different
+    // element, different flag) so the two never interfere with each other.
+    let handleDragging = false;
+    $handle.on("mousedown", function (e) {
+      e.preventDefault();
+      handleDragging = true;
+    });
+    $(document).on("mousemove.compareSliderDrag", function (e) {
+      if (!handleDragging) return;
+      const rect = $viewport[0].getBoundingClientRect();
+      setSlider(((e.clientX - rect.left) / rect.width) * 100);
+    });
+    $(document).on("mouseup.compareSliderDrag", function () {
+      handleDragging = false;
+    });
+    $handle.on("keydown", function (e) {
+      if (e.key === "ArrowLeft") { e.preventDefault(); setSlider(sliderPct - 2); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); setSlider(sliderPct + 2); }
+    });
+
+    // Zoom/pan drag (scroll-to-zoom, drag-to-pan while zoomed, click to
+    // toggle fit/actual) — identical to showImageWindow, just wired to both
+    // images at once so they stay in lockstep.
     let dragging = false;
     let dragMoved = false;
-    $panes.on("mousedown", "img", function (e) {
+    $viewport.on("mousedown", "img", function (e) {
       e.preventDefault();
       dragMoved = false;
       dragging = zoomCtl.dragStart(this, e.clientX, e.clientY);
@@ -431,38 +492,43 @@ const Viewport = (function () {
       if (!dragging) return;
       dragMoved = true;
       zoomCtl.dragMove(imgs(), e.clientX, e.clientY);
+      syncClip();
     });
     $(document).on("mouseup.compareWindowDrag", function () {
       dragging = false;
     });
-    $panes.on("wheel", "img", function (e) {
+    $viewport.on("wheel", "img", function (e) {
       e.preventDefault();
       const oe = e.originalEvent;
       const delta = oe.deltaY < 0 ? zoomCtl.step : -zoomCtl.step;
       zoomCtl.adjustByStep(imgs(), delta, this, oe.clientX, oe.clientY);
+      syncClip();
     });
-    $panes.on("click", "img", function (e) {
+    $viewport.on("click", "img", function (e) {
       if (dragMoved) {
         dragMoved = false;
         return;
       }
       zoomCtl.toggleClick(imgs(), this, e.clientX, e.clientY);
+      syncClip();
     });
 
     // Swallow page-level keyboard shortcuts (e.g. the review page's star
     // hotkeys) while the window is up; '1' still zooms to actual size.
     function onKeydown(e) {
+      if ($(e.target).is($handle)) return;
       e.stopPropagation();
       if (e.key === "1") {
         e.preventDefault();
-        zoomCtl.zoomToActual(imgs(), cells[0].$img[0]);
+        zoomCtl.zoomToActual(imgs(), $beforeImg[0]);
+        syncClip();
       }
     }
     document.addEventListener("keydown", onKeydown, true);
 
     function close() {
       document.removeEventListener("keydown", onKeydown, true);
-      $(document).off("mousemove.compareWindowDrag mouseup.compareWindowDrag");
+      $(document).off("mousemove.compareWindowDrag mouseup.compareWindowDrag mousemove.compareSliderDrag mouseup.compareSliderDrag");
       $(window).off("resize.compareWindow");
       $("body").removeClass("image-window-open");
       $backdrop.remove();

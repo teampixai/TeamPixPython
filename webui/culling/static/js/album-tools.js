@@ -11,7 +11,7 @@
 // into a modal -> react when done" UX via LogDialog (see common.js) —
 // each `*Job` below is created once in the init block at the bottom of
 // this file.
-let deepRegradeJob, jerseyColorJob, exportJob, importMoreJob, rerunFacerecoJob;
+let deepRegradeJob, quickRegradeJob, jerseyColorJob, exportJob, importMoreJob, rerunFacerecoJob;
 let burstVideoJob, faceTaggingCsvJob, playerVideoJob;
 
 let lastStarBreakdown = null;
@@ -269,6 +269,14 @@ $(function () {
     dialogOptions: { width: 720 },
     label: "deep regrade",
   });
+  // No markup in the page for this one: LogDialog builds the dialog itself.
+  quickRegradeJob = LogDialog.create({
+    dialogId: "quickRegradeDialog",
+    outputId: "quickRegradeOutput",
+    statusUrl: (since) => `/api/processing-output?since=${since}`,
+    dialogOptions: { width: 720 },
+    label: "quick regrade",
+  });
   jerseyColorJob = LogDialog.create({
     dialogId: "jerseyColorDialog",
     outputId: "jerseyColorOutput",
@@ -386,32 +394,68 @@ $(function () {
     $("#regradeSensitivityValue").text(Number($(this).val()).toFixed(2));
   });
 
+  // Shown in a job's log when it ends without a usable result, so the page says
+  // what it actually saw instead of only "see the log".
+  function describeMissingResult(job, data) {
+    job.appendLines([
+      `The job finished with exit code ${data.returnCode ?? "none"} and returned no result.`,
+      "If the app was just updated, restart the culling server: it may still be running the old code.",
+    ]);
+  }
+
   $("#regradeBtn").on("click", async () => {
     setRegradeUIEnabled(false);
     $("#regradeStatus").text("Regrading…");
+    quickRegradeJob.reset();
+    quickRegradeJob.open("Quick regrade…");
     const { mode, customValue } = readRegradeSensitivityFromUI();
+    const finish = (data) => {
+      setRegradeUIEnabled(true);
+      const res = data.result;
+      if (data.returnCode === 0 && res) {
+        const parts = [];
+        if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
+        if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
+        if (res.teamColor) parts.push(`team colour ${res.teamColor}`);
+        if (res.teammates) parts.push(`${res.teammates} teammate(s) (+${res.teammatesAdded} / −${res.teammatesRemoved})`);
+        if (res.previewsRegenFailed) parts.push(`${res.previewsRegenFailed} preview(s) could not be refreshed (source photo unreadable)`);
+        $("#regradeStatus").text(
+          parts.length
+            ? `Regraded ${res.imagesConsidered} image(s) — ${parts.join(", ")}.`
+            : `Regraded ${res.imagesConsidered} image(s) — no changes.`
+        );
+        quickRegradeJob.close();
+        loadSummary();
+      } else {
+        $("#regradeStatus").text("Regrade failed — see the log.");
+        if (!res) describeMissingResult(quickRegradeJob, data);
+        quickRegradeJob.setFinished("Quick regrade failed");
+      }
+    };
+    let started;
     try {
-      const res = await apiPost("/api/album-tools/regrade-sensitivity", {
+      started = await apiPost("/api/album-tools/regrade-sensitivity", {
         sensitivityMode: mode,
         sensitivityCustomValue: customValue,
         mode: "shallow",
       });
-      const parts = [];
-      if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
-      if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
-      if (res.teamColor) parts.push(`team colour ${res.teamColor}`);
-      if (res.previewsRegenFailed) parts.push(`${res.previewsRegenFailed} preview(s) could not be refreshed (source photo unreadable)`);
-      $("#regradeStatus").text(
-        parts.length
-          ? `Regraded ${res.imagesConsidered} image(s) — ${parts.join(", ")}.`
-          : `Regraded ${res.imagesConsidered} image(s) — no changes.`
-      );
-      await loadSummary();
     } catch (err) {
-      $("#regradeStatus").text("Regrade failed: " + err.message);
-    } finally {
+      $("#regradeStatus").text("Regrade failed to start: " + err.message);
+      quickRegradeJob.appendLines(["Error: " + err.message]);
+      quickRegradeJob.setFinished("Quick regrade failed");
       setRegradeUIEnabled(true);
+      return;
     }
+    // A server that predates background regrades answers with the finished
+    // summary right away instead of starting a job: accept that as the result.
+    if (!started.started) {
+      finish({ running: false, returnCode: 0, result: started });
+      return;
+    }
+    quickRegradeJob.startPolling((data) => {
+      if (data.running) return;
+      finish(data);
+    });
   });
 
   $("#deepRegradeBtn").on("click", async () => {
@@ -447,6 +491,12 @@ $(function () {
   $("#jerseyColorBtn").on("click", async () => {
     const teamColor = selectedJerseyColor;
     const rerunLlmCulling = $("#jerseyRerunLlmInput").is(":checked");
+    const reenable = () => {
+      $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
+      jerseyColorControlsDisabled = false;
+      renderJerseyColorChips();
+      setRegradeUIEnabled(true);
+    };
     $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", true);
     jerseyColorControlsDisabled = true;
     renderJerseyColorChips();
@@ -454,51 +504,53 @@ $(function () {
     $("#jerseyColorStatus").text("Applying…");
     jerseyColorJob.reset();
     jerseyColorJob.open("Applying jersey colour…");
+    let started;
     try {
-      const res = await apiPost("/api/album-tools/jersey-color", { teamColor, rerunLlmCulling });
-      const parts = [];
-      if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
-      if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
-      if (res.starsRebaselined) parts.push(`${res.starsRebaselined} star rating(s) reset`);
-      const summary =
-        `Team colour: ${res.teamColor || "none detected"} (${res.pinned ? "pinned" : "auto"})` +
-        (parts.length ? ` — ${parts.join(", ")}.` : " — no changes.");
-      $("#jerseyColorStatus").text(summary);
-      jerseyColorJob.appendLines([summary]);
-      await loadSummary();
-      await loadJerseyOptions();
-      if (res.llmRerunStarted) {
-        $("#jerseyColorStatus").append(" LLM re-cull running…");
-        jerseyColorJob.appendLines(["Re-running LLM burst ranking…"]);
-        jerseyColorJob.startPolling((data) => {
-          if (data.running) return;
-          $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
-          jerseyColorControlsDisabled = false;
-          renderJerseyColorChips();
-          setRegradeUIEnabled(true);
-          if (data.returnCode === 0) {
-            $("#jerseyColorStatus").text("Team colour applied; LLM re-cull complete.");
-            jerseyColorJob.close();
-          } else {
-            const msg = `LLM re-cull exited with code ${data.returnCode}.`;
-            $("#jerseyColorStatus").text(msg);
-            jerseyColorJob.appendLines([msg]);
-            jerseyColorJob.setFinished("Jersey colour apply failed");
-          }
-          loadSummary();
-        });
-        return; // dialog + buttons stay until the background job finishes
-      }
-      jerseyColorJob.close();
+      started = await apiPost("/api/album-tools/jersey-color", { teamColor, rerunLlmCulling });
     } catch (err) {
       $("#jerseyColorStatus").text("Failed: " + err.message);
       jerseyColorJob.appendLines(["Error: " + err.message]);
       jerseyColorJob.setFinished("Jersey colour apply failed");
+      reenable();
+      return;
     }
-    $("#jerseyColorBtn, #jerseyRerunLlmInput").prop("disabled", false);
-    jerseyColorControlsDisabled = false;
-    renderJerseyColorChips();
-    setRegradeUIEnabled(true);
+    const finish = async (data) => {
+      reenable();
+      const res = data.result;
+      if (data.returnCode === 0 && res) {
+        const parts = [];
+        if (res.recovered) parts.push(`${res.recovered} moved to Sharp`);
+        if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
+        if (res.starsRebaselined) parts.push(`${res.starsRebaselined} star rating(s) reset`);
+        const summary =
+          `Team colour: ${res.teamColor || "none detected"} (${res.pinned ? "pinned" : "auto"})` +
+          (parts.length ? ` — ${parts.join(", ")}.` : " — no changes.") +
+          (res.llmRerun ? " LLM re-cull complete." : "");
+        $("#jerseyColorStatus").text(summary);
+        jerseyColorJob.close();
+      } else {
+        const msg = res && res.llmRerun
+          ? `LLM re-cull exited with code ${data.returnCode}.`
+          : "Jersey colour apply failed — see the log.";
+        $("#jerseyColorStatus").text(msg);
+        if (!res) describeMissingResult(jerseyColorJob, data);
+        jerseyColorJob.setFinished("Jersey colour apply failed");
+      }
+      loadSummary();
+      await loadJerseyOptions();
+    };
+    // A server that predates background jobs answers with the finished summary
+    // right away (no "started"): accept that as the result.
+    if (!started.started) {
+      await finish({ running: false, returnCode: 0, result: started });
+      return;
+    }
+    // The regrade (and the optional LLM re-rank after it) runs as one
+    // background job; its log streams into the dialog until it is done.
+    jerseyColorJob.startPolling(async (data) => {
+      if (data.running) return;
+      await finish(data);
+    });
   });
 
   $("#importMoreBtn").on("click", async () => {

@@ -65,7 +65,7 @@ def test_entry_shape_and_key_order_are_unchanged():
     assert list(entry["annotation_data"]["evaluated"][0]) == [
         "body_bbox", "body_keypoints", "face_bbox", "narrow_face_bbox", "face_kps",
         "sharpness_score", "lap_var", "ten", "is_blurry", "rejection_reason",
-        "cloth_color", "cloth_color_detail",
+        "cloth_color", "cloth_color_detail", "is_teammate",
     ]
 
     assert entry["status"] == "sharp"
@@ -93,6 +93,7 @@ def test_entry_shape_and_key_order_are_unchanged():
     assert body["rejection_reason"] == ""
     assert body["cloth_color"] == "Blue:Royal"
     assert body["cloth_color_detail"]["mean_lab"] == [40.0, 8.0, -30.0]
+    assert body["is_teammate"] is False
 
 
 def test_a_frame_with_no_bodies_is_skipped_with_no_annotation_data():

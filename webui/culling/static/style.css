@@ -1176,9 +1176,10 @@ input.image-window-path {
 input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255, 0.6); }
 
 /* ------------------------------------------------------------------ *
- * Compare window (before/after) — reuses the image-window backdrop and
- * viewport rules above, with two equally sized panes driven by a single
- * shared zoom controller (static/js/viewport.js::showCompareWindow).
+ * Compare window (before/after) — reuses the image-window backdrop rules
+ * above, with a single overlay viewport driven by a shared zoom controller
+ * plus a draggable slider handle that clips the "after" layer
+ * (static/js/viewport.js::showCompareWindow).
  * ------------------------------------------------------------------ */
 .compare-window-backdrop { gap: 10px; z-index: 1200; }
 .compare-window-title {
@@ -1190,25 +1191,90 @@ input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.compare-window-panes {
+.compare-window-viewport {
+  position: relative;
+  overflow: hidden;
+  border-radius: 4px;
+}
+.compare-window-viewport img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  cursor: zoom-in;
+  user-select: none;
+}
+.compare-window-viewport img.zoomed { cursor: grab; }
+.compare-window-viewport img.zoomed:active { cursor: grabbing; }
+.compare-slider-before,
+.compare-slider-after {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+/* The after-image is clipped with clip-path (set inline, as a % of the box,
+ * by setSlider()) rather than resized, so it stays pixel-aligned with the
+ * before-image underneath and never visually squishes as the handle moves. */
+.compare-slider-after { will-change: clip-path; }
+/* Draggable handle: a thin vertical line (::before) plus a round grip,
+ * centered on its `left` position (set inline, as a % of the box, by
+ * setSlider()) via the translateX(-50%) below. */
+.compare-slider-handle {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  height: 100%;
+  width: 24px;
+  margin-left: -12px;
+  cursor: ew-resize;
+  z-index: 3;
+}
+.compare-slider-handle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  background: #fff;
+  transform: translateX(-50%);
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+}
+.compare-slider-handle-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #fff;
+  color: #222;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: center;
-  gap: 24px;
+  font-size: 11px;
+  letter-spacing: -2px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
 }
-.compare-pane {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.compare-pane-label {
-  color: rgba(255, 255, 255, 0.75);
+.compare-slider-handle:focus { outline: none; }
+.compare-slider-handle:focus .compare-slider-handle-grip { box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.5); }
+.compare-slider-badge {
+  position: absolute;
+  top: 10px;
+  color: #fff;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 1px;
   text-transform: uppercase;
-  text-align: center;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 3px 10px;
+  border-radius: 999px;
+  pointer-events: none;
+  z-index: 2;
 }
+.compare-slider-badge-before { left: 10px; }
+.compare-slider-badge-after { right: 10px; }
 .compare-window-toolbar {
   display: flex;
   align-items: center;

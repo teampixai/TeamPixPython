@@ -25,6 +25,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import logging
@@ -252,6 +253,9 @@ class ProcessingState:
         self.running = False
         self.return_code: Optional[int] = None
         self.process: Optional[subprocess.Popen] = None
+        # Structured outcome of in-process jobs (e.g. regrade summaries), served
+        # next to the log lines so the page can show more than "exit code 0".
+        self.result: Optional[dict] = None
 
     def claim(self) -> bool:
         """Atomically claim the single shared processing slot (only one of
@@ -263,8 +267,22 @@ class ProcessingState:
                 return False
             self.running = True
             self.return_code = None
+            self.result = None
             self.lines = []
             return True
+
+    def append(self, line: str) -> None:
+        """Adds one line to the output the browser polls."""
+        with self.lock:
+            self.lines.append(line)
+
+    def finish(self, return_code: int, result: Optional[dict] = None) -> None:
+        """Ends an in-process job: records its outcome, THEN frees the slot,
+        so the browser never sees "not running" without the result."""
+        with self.lock:
+            self.return_code = return_code
+            self.result = result
+            self.running = False
 
     def run_subprocess(self, cmd: list[str], cwd: Optional[Path] = None) -> int:
         """Runs *cmd*, streaming its combined stdout/stderr into self.lines
@@ -748,6 +766,48 @@ def _prepare_before_image(source_path: Path, pending_dir: Path) -> Path:
     return out
 
 
+def _album_sharpness_threshold(run_settings: dict) -> float:
+    """The album's face-sharpness threshold from its stored ``sensitivity``,
+    which is either a preset name ("medium") or a number written by a
+    regrade ("0.55"). Falls back to the medium preset if it is unreadable."""
+    raw = str(run_settings.get("sensitivity", "medium"))
+    threshold = SENSITIVITY_PRESETS.get(raw)
+    if threshold is None:
+        try:
+            threshold = float(raw)
+        except ValueError:
+            threshold = SENSITIVITY_PRESETS["medium"]
+    return threshold
+
+
+def _teammate_body_entries(bodies) -> list[dict]:
+    """Per-body payload for autoedit.py's --boxes-file: the normalised
+    [x1, y1, x2, y2] box of each body AI edit's body-only sharpening should
+    touch — only those the album marked ``is_teammate`` (wearing the team's
+    jersey of the day, evaluated for every body above the extended sharpness
+    threshold — see algo/thresholds.py); everyone else stays exactly as in
+    the original. Albums that predate the flag, and bodies never evaluated,
+    count as not teammates.
+
+    Also includes each body's 17 COCO keypoints (normalised x, y,
+    confidence; empty list if the album never stored them) — autoedit.py's
+    sharpen_bodies() uses them to tell this player's own segmentation blob
+    apart from a neighbour's when both land in the same padded crop (see its
+    _select_body_component() and BODY_SHARPEN_* constants)."""
+    entries = []
+    for body in bodies:
+        if not body.is_teammate:
+            continue
+        box = body.body_bbox
+        if box is None:
+            continue
+        entries.append({
+            "box": [box.x1, box.y1, box.x2, box.y2],
+            "keypoints": [[kp.point.x, kp.point.y, kp.confidence] for kp in body.body_keypoints],
+        })
+    return entries
+
+
 def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Path, final_path: Path) -> None:
     """Run autoedit.py's default (non-generative) pipeline set against a
     single photo, writing to *pending_path* (editedimages/.pending/<key
@@ -780,6 +840,19 @@ def _run_ai_edit(album_dir: Path, key: str, source_path: Path, pending_path: Pat
         "--out-file", str(pending_path),
         "--face-enhance",
     ]
+
+    # Feeds autoedit.py's aisharpen pipeline the boxes (+ keypoints) of the
+    # players to sharpen (see _teammate_body_entries) so it can sharpen+blend
+    # just those players instead of the whole frame. Keyed by
+    # source_path.name (the exact file autoedit.py reads) so it can look
+    # itself up without any other album context. No entry/empty list ->
+    # that script's own whole-frame fallback takes over.
+    image = album_for(album_dir).image(key)
+    entries = _teammate_body_entries(image.bodies if image is not None else [])
+    if entries:
+        boxes_file = pending_path.parent / "boxes.json"
+        boxes_file.write_text(json.dumps({source_path.name: entries}), encoding="utf-8")
+        cmd += ["--boxes-file", str(boxes_file)]
 
     log.info("Starting AI edit for %s: %s", key, " ".join(cmd))
     returncode = processing_state.run_subprocess(cmd)
@@ -816,10 +889,8 @@ def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
     log.info("Deep regrade finished (exit code %s)", returncode)
 
 
-def _run_rerun_llm_culling(album_dir: Path) -> None:
-    """Re-rank the album's bursts with the LLM (RerunLLMCulling.py) after a
-    change that moved photos between sharp and blurry -- burst membership,
-    keep flags, grades and star tiers are all derived from the sharp set."""
+def _llm_recull_command(album_dir: Path) -> tuple[list[str], Optional[str]]:
+    """(command, openai key) for RerunLLMCulling.py against *album_dir*."""
     team = _resolve_team(_album_team_id(album_dir))
     cmd = [
         sys.executable,
@@ -828,11 +899,104 @@ def _run_rerun_llm_culling(album_dir: Path) -> None:
     ]
     if team.openaiApiKey:
         cmd += ["--openaikey", team.openaiApiKey]
+    return cmd, team.openaiApiKey
 
-    log.info("Starting LLM re-cull: %s", " ".join("***" if a == team.openaiApiKey else a for a in cmd))
+
+def _run_rerun_llm_culling(album_dir: Path) -> None:
+    """Re-rank the album's bursts with the LLM (RerunLLMCulling.py) after a
+    change that moved photos between sharp and blurry -- burst membership,
+    keep flags, grades and star tiers are all derived from the sharp set."""
+    cmd, api_key = _llm_recull_command(album_dir)
+    log.info("Starting LLM re-cull: %s", " ".join("***" if a == api_key else a for a in cmd))
     returncode = processing_state.run_subprocess(cmd)
     processing_state.mark_stopped()
     log.info("LLM re-cull finished (exit code %s)", returncode)
+
+
+class _JobLogHandler(logging.Handler):
+    """Copies log records emitted by ONE thread into the job output the
+    browser polls, so an in-process job (the quick regrade) streams the same
+    lines its logger already writes to the server console."""
+
+    def __init__(self, thread_id: int) -> None:
+        super().__init__(level=logging.INFO)
+        self._thread_id = thread_id
+        self.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread == self._thread_id:
+            processing_state.append(self.format(record))
+
+
+@contextlib.contextmanager
+def _stream_logs_to_job():
+    """While active, INFO+ lines logged by the current thread under the app's
+    loggers also appear in the polled job output. The loggers are lowered to
+    INFO for the duration (uvicorn leaves them at WARNING), then restored."""
+    handler = _JobLogHandler(threading.get_ident())
+    loggers = [logging.getLogger(name) for name in ("BlurPictureDetector", "CullingApp")]
+    saved = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.addHandler(handler)
+        if lg.getEffectiveLevel() > logging.INFO:
+            lg.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        for lg, level in zip(loggers, saved):
+            lg.removeHandler(handler)
+            lg.setLevel(level)
+
+
+def _regrade_result(summary) -> dict:
+    """The fields the Album Tools page shows after a quick regrade."""
+    return {
+        "threshold": summary.threshold,
+        "teamColor": summary.team_color,
+        "pinned": summary.team_color_pinned,
+        "imagesConsidered": summary.images_considered,
+        "recovered": summary.recovered,
+        "demoted": summary.demoted,
+        "starsRebaselined": summary.stars_rebaselined,
+        "jerseyRechecked": summary.jersey_rechecked,
+        "jerseyRecheckUnreadable": summary.jersey_recheck_unreadable,
+        "previewsRegenerated": summary.previews_regenerated,
+        "previewsRegenFailed": summary.previews_regen_failed,
+        "teammates": summary.teammates,
+        "teammatesAdded": summary.teammates_added,
+        "teammatesRemoved": summary.teammates_removed,
+    }
+
+
+def _run_quick_regrade(
+    album_dir: Path, threshold: float, team_color_override: Optional[str] = None, rerun_llm: bool = False,
+) -> None:
+    """Quick regrade (algo/regrade.py) as a background job on the shared slot,
+    streaming its log into the polled output. Used by both "Quick Regrade"
+    and "Apply Jersey Colour" (which passes *team_color_override* and may ask
+    for an LLM burst re-rank afterwards, in the same job)."""
+    return_code, result = 1, None
+    try:
+        with _stream_logs_to_job():
+            summary = regrade_sensitivity(album_dir, threshold, team_color_override=team_color_override)
+            log.info(
+                "Regrade finished: %s (threshold=%.2f) — recovered=%d demoted=%d stars_rebaselined=%d team_colour=%s",
+                album_dir.resolve(), threshold, summary.recovered, summary.demoted,
+                summary.stars_rebaselined, summary.team_color,
+            )
+        result = _regrade_result(summary)
+        return_code = 0
+        if rerun_llm:
+            processing_state.append("Re-running LLM burst ranking…")
+            cmd, api_key = _llm_recull_command(album_dir)
+            log.info("Starting LLM re-cull: %s", " ".join("***" if a == api_key else a for a in cmd))
+            return_code = processing_state.run_subprocess(cmd)
+            result["llmRerun"] = True
+    except Exception as exc:  # noqa: BLE001 — surfaced to the page, never lost in a thread
+        log.exception("Quick regrade failed for %s", album_dir)
+        processing_state.append(f"Error: {type(exc).__name__}: {exc}")
+    finally:
+        processing_state.finish(return_code, result)
 
 
 # --------------------------------------------------------------------------- #
@@ -2542,6 +2706,7 @@ def api_processing_output(since: int = 0) -> dict:
             "next": since + len(new_lines),
             "running": processing_state.running,
             "returnCode": processing_state.return_code,
+            "result": processing_state.result,
         }
 
 
@@ -2643,16 +2808,18 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
     """Re-grade the current album's Blur/Sharp verdicts at a NEW sensitivity.
 
     ``mode="shallow"`` re-buckets from the per-body sharpness scores already
-    stored on the Album (see algo/regrade.py) and returns its result
-    synchronously — near-instant, no pixel decoding.
+    stored on the Album (see algo/regrade.py). It re-reads a source photo only
+    to measure a jersey colour that was never recorded, which can take a
+    while on a big album, so it runs as a background job like the deep one.
 
     ``mode="deep"`` re-runs the FULL analysis pipeline over the album's
-    source photos (1_prep_review.py --regrade-only) in a background thread,
-    streaming progress through the shared processing_state that
-    /api/processing-output already serves.
+    source photos (1_prep_review.py --regrade-only) in a background thread.
 
-    Either way this mutates the Album + info.json, so it's blocked while
-    any other operation touching the same album is running."""
+    Either way progress streams through the shared processing_state that
+    /api/processing-output serves (a shallow regrade's summary arrives as
+    that endpoint's ``result``), and this mutates the Album + info.json, so
+    it's blocked while any other operation touching the same album is
+    running."""
     album_path = _current_album_path()
     with processing_state.lock:
         if processing_state.running:
@@ -2663,9 +2830,10 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
 
     threshold = _sensitivity_threshold(req.sensitivityMode, req.sensitivityCustomValue)
 
+    if not processing_state.claim():
+        raise HTTPException(status_code=409, detail="Processing is already running.")
+
     if req.mode == "deep":
-        if not processing_state.claim():
-            raise HTTPException(status_code=409, detail="Processing is already running.")
         threading.Thread(
             target=_run_deep_regrade,
             args=(album_path, _sensitivity_arg(req.sensitivityMode, req.sensitivityCustomValue)),
@@ -2673,24 +2841,8 @@ def api_regrade_sensitivity(req: RegradeSensitivityRequest) -> dict:
         ).start()
         return {"mode": "deep", "started": True, "threshold": threshold}
 
-    summary = regrade_sensitivity(album_path, threshold)
-    log.info(
-        "Regraded sensitivity: %s (threshold=%.2f) — recovered=%d demoted=%d team_colour=%s",
-        album_path.resolve(), threshold, summary.recovered, summary.demoted, summary.team_color,
-    )
-    return {
-        "mode": "shallow",
-        "started": False,
-        "threshold": summary.threshold,
-        "imagesConsidered": summary.images_considered,
-        "recovered": summary.recovered,
-        "demoted": summary.demoted,
-        "jerseyRechecked": summary.jersey_rechecked,
-        "jerseyRecheckUnreadable": summary.jersey_recheck_unreadable,
-        "teamColor": summary.team_color,
-        "previewsRegenerated": summary.previews_regenerated,
-        "previewsRegenFailed": summary.previews_regen_failed,
-    }
+    threading.Thread(target=_run_quick_regrade, args=(album_path, threshold), daemon=True).start()
+    return {"mode": "shallow", "started": True, "threshold": threshold}
 
 
 @app.get("/api/album-tools/jersey-options")
@@ -2722,7 +2874,9 @@ def api_set_jersey_color(req: JerseyColorRequest) -> dict:
     purely on sharpness_score, so jersey filtering cannot change its input.
 
     When ``rerunLlmCulling`` is set, LLM burst ranking is re-run afterwards
-    as a background job (burst membership follows the sharp set)."""
+    in the same background job (burst membership follows the sharp set).
+    Runs as a background job so its log streams to the page; the summary
+    arrives as /api/processing-output's ``result``."""
     album_path = _current_album_path()
     with processing_state.lock:
         if processing_state.running:
@@ -2738,38 +2892,16 @@ def api_set_jersey_color(req: JerseyColorRequest) -> dict:
             detail="This album was imported with jersey-colour filtering disabled.",
         )
 
-    raw = str(run_settings.get("sensitivity", "medium"))
-    threshold = SENSITIVITY_PRESETS.get(raw)
-    if threshold is None:
-        try:
-            threshold = float(raw)
-        except ValueError:
-            threshold = SENSITIVITY_PRESETS["medium"]
+    threshold = _album_sharpness_threshold(run_settings)
 
-    summary = regrade_sensitivity(album_path, threshold, team_color_override=req.teamColor)
-    log.info(
-        "Jersey colour set on %s: %s (%s) — recovered=%d demoted=%d stars_rebaselined=%d",
-        album_path.resolve(), summary.team_color, "pinned" if summary.team_color_pinned else "auto",
-        summary.recovered, summary.demoted, summary.stars_rebaselined,
-    )
-
-    llm_started = False
-    if req.rerunLlmCulling:
-        llm_started = processing_state.claim()
-        if llm_started:
-            threading.Thread(target=_run_rerun_llm_culling, args=(album_path,), daemon=True).start()
-
-    return {
-        "teamColor": summary.team_color,
-        "pinned": summary.team_color_pinned,
-        "imagesConsidered": summary.images_considered,
-        "recovered": summary.recovered,
-        "demoted": summary.demoted,
-        "starsRebaselined": summary.stars_rebaselined,
-        "previewsRegenerated": summary.previews_regenerated,
-        "previewsRegenFailed": summary.previews_regen_failed,
-        "llmRerunStarted": llm_started,
-    }
+    if not processing_state.claim():
+        raise HTTPException(status_code=409, detail="Processing is already running.")
+    threading.Thread(
+        target=_run_quick_regrade,
+        args=(album_path, threshold, req.teamColor, req.rerunLlmCulling),
+        daemon=True,
+    ).start()
+    return {"started": True, "threshold": threshold, "llmRerunQueued": bool(req.rerunLlmCulling)}
 
 
 @app.post("/api/album-tools/export")

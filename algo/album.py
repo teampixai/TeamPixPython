@@ -215,6 +215,18 @@ class PersonRecord:
     def cloth_color_detail(self, value: dict) -> None:
         self._d["cloth_color_detail"] = value
 
+    @property
+    def is_teammate(self) -> bool:
+        """The jersey check's verdict: True when this person wears the album's
+        team colour (by the album's own rule). Evaluated for everyone above
+        the extended sharpness threshold, so it is independent of `passed`.
+        False when absent — older albums, or a person never evaluated."""
+        return bool(self._d.get("is_teammate", False))
+
+    @is_teammate.setter
+    def is_teammate(self, value: bool) -> None:
+        self._d["is_teammate"] = bool(value)
+
     # -- roster tagging -------------------------------------------------- #
     @property
     def player_name(self) -> str:
@@ -277,6 +289,7 @@ class PersonRecord:
             ten=self.ten,
             cloth_color=self.cloth_color,
             cloth_color_detail=self.cloth_color_detail,
+            is_teammate=self.is_teammate,
         )
 
     @classmethod
@@ -300,6 +313,7 @@ class PersonRecord:
             "rejection_reason":   body.rejection_reason,
             "cloth_color":        body.cloth_color,
             "cloth_color_detail": body.cloth_color_detail,
+            "is_teammate":        body.is_teammate,
         })
 
 

@@ -56,11 +56,15 @@ from algo.stages.jersey_counting import (
     _lightness_class,
     classify_body_jersey,
 )
+from algo.thresholds import RUN_SETTINGS_KEY as EXTENDED_OFFSET_KEY, ExtendedThreshold
 from algo.album import Album, AlbumImage, PersonRecord
 from algo.album_info import AlbumInfo, category_for_status
 from algo.utils import _color_from_label
 
 log = logging.getLogger("BlurPictureDetector")
+
+# run_settings entries a regrade rewrites (and so reports when they change).
+_WATCHED_SETTINGS = ("sensitivity", "team_color_override", EXTENDED_OFFSET_KEY)
 
 
 @dataclass
@@ -76,6 +80,9 @@ class RegradeSummary:
     stars_rebaselined: int = 0         # flipped photos whose star rating was reset
     previews_regenerated: int = 0      # verdict flipped -> preview/thumbnail redrawn
     previews_regen_failed: int = 0     # ...of which the source photo couldn't be re-read
+    teammates: int = 0                 # bodies flagged is_teammate after this regrade
+    teammates_added: int = 0           # ...that were not teammates before
+    teammates_removed: int = 0         # bodies that were teammates before and no longer are
 
 
 def _parse_jersey_colors(jerseycolor_arg: str | None) -> tuple[frozenset[str], frozenset[str]]:
@@ -209,6 +216,32 @@ def _poll_jersey(candidates: list[PersonRecord], config, pinned_label: str | Non
     return our_label, team_target_lab, team_bucket
 
 
+def _log_setting_changes(before: dict, after: dict, team_color_before, team_color_after) -> None:
+    """Logs every album setting this regrade changed (old -> new), or that
+    none did. An absent value and an empty one are the same for the colour pin."""
+    def show(value) -> str:
+        return "(not set)" if value is None else repr(value)
+
+    changes = []
+    for key in _WATCHED_SETTINGS:
+        old, new = before.get(key), after.get(key)
+        if key == "team_color_override":
+            old, new = old or "", new or ""
+        if old != new:
+            note = ""
+            if key == "sensitivity" and old in ("low", "medium", "high"):
+                note = " (the preset name is now stored as its numeric value)"
+            changes.append(f"{key}: {show(old)} -> {show(new)}{note}")
+    if team_color_after is not None and team_color_before != team_color_after:
+        changes.append(f"our_jersey_color: {show(team_color_before)} -> {show(team_color_after)}")
+
+    if changes:
+        for change in changes:
+            log.info("[regrade] setting changed - %s", change)
+    else:
+        log.info("[regrade] no settings changed")
+
+
 def regrade_sensitivity(
     album_path: Path,
     new_threshold: float,
@@ -226,6 +259,10 @@ def regrade_sensitivity(
     run_settings: dict = payload.get("run_settings") or {}
     no_team = bool(run_settings.get("noteam"))
     summary = RegradeSummary(threshold=new_threshold)
+    # Snapshot what this regrade is about to rewrite, so every change can be
+    # reported once it is applied.
+    settings_before = {key: run_settings.get(key) for key in _WATCHED_SETTINGS}
+    team_color_before = payload.get("our_jersey_color")
 
     # An explicit argument wins; otherwise fall back to whatever pin the
     # album already carries, so a plain sensitivity regrade doesn't silently
@@ -237,13 +274,15 @@ def regrade_sensitivity(
     forced_colors, regular_colors = _parse_jersey_colors(run_settings.get("jerseycolor"))
     forced_labs = _allowed_reference_labs(forced_colors)
     allowed_labs = _allowed_reference_labs(regular_colors)
+    extended = ExtendedThreshold.for_album(new_threshold, run_settings)
 
     # Entries worth re-grading at all, paired with per-body flags captured
     # BEFORE anything is mutated: whether the body cleared the
-    # threshold-independent grading gates, and whether it clears the new
-    # threshold. Eligible bodies are exactly the population
-    # JerseyCountingStage evaluates.
-    gradable: list[tuple[AlbumImage, list[PersonRecord], list[bool], list[bool]]] = []
+    # threshold-independent grading gates, whether it clears the new
+    # threshold (eligible: decides the blurry/sharp verdict), and whether it
+    # clears the lower EXTENDED threshold (in_range: decides who gets a
+    # colour and an is_teammate verdict). Eligible is a subset of in_range.
+    gradable: list[tuple[AlbumImage, list[PersonRecord], list[bool], list[bool], list[bool]]] = []
     candidates: list[PersonRecord] = []
     for image in album.image_list:
         if image.status not in ("blurry", "sharp"):
@@ -257,8 +296,19 @@ def regrade_sensitivity(
             c and b.sharpness_score > new_threshold
             for b, c in zip(bodies, cleared)
         ]
-        gradable.append((image, bodies, cleared, eligible))
-        candidates.extend(b for b, e in zip(bodies, eligible) if e)
+        in_range = [
+            c and extended.passes(b.sharpness_score)
+            for b, c in zip(bodies, cleared)
+        ]
+        gradable.append((image, bodies, cleared, eligible, in_range))
+        candidates.extend(b for b, r in zip(bodies, in_range) if r)
+
+    log.info(
+        "[regrade] sharpness threshold %.2f, extended threshold %.2f: %d photo(s), %d body(ies) "
+        "above the extended threshold, %d of them above the sharp threshold",
+        new_threshold, extended.value, summary.images_considered, len(candidates),
+        sum(sum(e) for _i, _b, _c, e, _r in gradable),
+    )
 
     # ---- Pass 1: make sure every candidate has a measured cloth colour ----
     # Bodies rejected for sharpness at import time never reached the colour
@@ -266,24 +316,31 @@ def regrade_sensitivity(
     # measured from pixels now. Bodies that got as far as the jersey check
     # already carry one and are reused as-is.
     if not no_team:
-        for image, bodies, _cleared, eligible in gradable:
-            needs_color = [
-                b for b, e in zip(bodies, eligible)
-                if e and b.cloth_color in ("N/A", None)
-            ]
-            if not needs_color:
-                continue
+        pending = [
+            (image, [b for b, r in zip(bodies, in_range) if r and b.cloth_color in ("N/A", None)])
+            for image, bodies, _cleared, _eligible, in_range in gradable
+        ]
+        pending = [(image, needs) for image, needs in pending if needs]
+        total_reads = len(pending)
+        if total_reads:
+            log.info("[regrade] measuring jersey colour for %d body(ies) in %d photo(s) "
+                     "(re-reading the source photos; this is the slow part)",
+                     sum(len(n) for _i, n in pending), total_reads)
+        progress_step = max(1, total_reads // 20)
+        for done, (image, needs_color) in enumerate(pending, start=1):
             file_path = image.source_file
             decoded = _read_source_image(file_path)
             if decoded is None:
                 summary.jersey_recheck_unreadable += len(needs_color)
                 log.warning("[regrade] cannot re-read source photo for jersey colour: %s", file_path)
-                continue
-            for record in needs_color:
-                body = record.to_body()
-                body.set_normalized_crop(cloth_color_predictor.torso_crop(body, decoded))
-                record.cloth_color, record.cloth_color_detail = cloth_color_predictor.predict(body)
-                summary.jersey_rechecked += 1
+            else:
+                for record in needs_color:
+                    body = record.to_body()
+                    body.set_normalized_crop(cloth_color_predictor.torso_crop(body, decoded))
+                    record.cloth_color, record.cloth_color_detail = cloth_color_predictor.predict(body)
+                    summary.jersey_rechecked += 1
+            if done % progress_step == 0 or done == total_reads:
+                log.info("[regrade] jersey colour: %d/%d photo(s) read", done, total_reads)
 
     # ---- Pass 2: re-poll the team's jersey colour from those candidates ----
     our_label: str | None = None
@@ -300,11 +357,42 @@ def regrade_sensitivity(
     summary.team_color = our_label
     apply_jersey_filter = our_color is not None
 
+    def team_verdict(record: PersonRecord, image: AlbumImage) -> bool:
+        """The album's jersey rule applied to *record*, independent of its
+        blurry/sharp verdict (which it neither reads nor changes)."""
+        if not apply_jersey_filter:
+            return True  # nothing is filtered out, so everyone in range counts
+        body = record.to_body()
+        body.passed, body.rejection_reason = True, ""
+        classify_body_jersey(
+            body, forced_colors, regular_colors, forced_labs, allowed_labs,
+            team_target_lab, team_bucket, our_color, app_config,
+            log_prefix=Path(image.source_file).name,
+        )
+        return body.passed
+
     # ---- Pass 3: final verdicts, info.json bookkeeping, previews ----
-    for image, bodies, cleared, eligible in gradable:
+    log.info("[regrade] applying verdicts and teammate flags; saving the album")
+
+    def set_teammate(record: PersonRecord, image: AlbumImage, index: int, count: int, value: bool) -> None:
+        """Writes is_teammate and logs it when it changes (absent counts as False)."""
+        before = record.is_teammate
+        record.is_teammate = value
+        if before == value:
+            return
+        if value:
+            summary.teammates_added += 1
+        else:
+            summary.teammates_removed += 1
+        log.info("[regrade] %s body %d/%d: is_teammate %s -> %s (face score %.2f, cloth %s)",
+                 image.key, index, count, before, value, record.sharpness_score, record.cloth_color)
+
+    for image, bodies, cleared, eligible, in_range in gradable:
         old_status = image.status
 
-        for record, was_cleared, is_eligible in zip(bodies, cleared, eligible):
+        for index, (record, was_cleared, is_eligible, is_in_range) in enumerate(
+            zip(bodies, cleared, eligible, in_range), start=1
+        ):
             score = record.sharpness_score
             if not is_eligible:
                 record.is_blurry = True
@@ -313,11 +401,14 @@ def regrade_sensitivity(
                     record.rejection_reason = (
                         f"sharpness score {score:.4f} <= threshold {new_threshold:.2f}"
                     )
+                # Too blurry to pass, but possibly still a teammate.
+                set_teammate(record, image, index, len(bodies), is_in_range and team_verdict(record, image))
                 continue
 
             if not apply_jersey_filter:
                 record.is_blurry = False
                 record.rejection_reason = ""
+                set_teammate(record, image, index, len(bodies), True)
                 continue
 
             body = record.to_body()
@@ -328,8 +419,10 @@ def regrade_sensitivity(
             )
             record.passed = body.passed
             record.rejection_reason = body.rejection_reason
+            set_teammate(record, image, index, len(bodies), record.passed)
 
         new_overall_blurry = all(b.is_blurry for b in bodies)
+        summary.teammates += sum(b.is_teammate for b in bodies)
         new_status = "blurry" if new_overall_blurry else "sharp"
 
         passing_scores = [b.sharpness_score for b in bodies if not b.is_blurry]
@@ -366,6 +459,8 @@ def regrade_sensitivity(
 
     # The team colour (polled or pinned) can move, so persist it alongside
     # the verdicts it just produced.
+    log.info("[regrade] teammates: %d total (%d newly flagged, %d no longer teammates; extended threshold %.2f)",
+             summary.teammates, summary.teammates_added, summary.teammates_removed, extended.value)
     if summary.team_color is not None:
         payload["our_jersey_color"] = summary.team_color
         info.our_jersey_color = summary.team_color
@@ -375,8 +470,11 @@ def regrade_sensitivity(
     # grades newly-added photos the same way instead of silently reverting
     # to whatever sensitivity was used on the very first import. The colour
     # pin rides along for the same reason ("" clears it back to auto).
-    payload.setdefault("run_settings", {})["sensitivity"] = str(new_threshold)
-    payload["run_settings"]["team_color_override"] = pinned or ""
+    settings = payload.setdefault("run_settings", {})
+    settings["sensitivity"] = str(new_threshold)
+    settings.setdefault(EXTENDED_OFFSET_KEY, extended.offset)
+    settings["team_color_override"] = pinned or ""
+    _log_setting_changes(settings_before, settings, team_color_before, payload.get("our_jersey_color"))
 
     album.save()
     info.save()

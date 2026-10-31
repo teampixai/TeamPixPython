@@ -187,6 +187,17 @@ class AppConfig:
     jersey_lab_max_dist: float = 28.0
 
     # ------------------------------------------------------------------
+    # Extended sharpness threshold
+    # ------------------------------------------------------------------
+    # Players whose face score is above (sharp threshold - this offset) get
+    # their jersey identified (cloth colour measured, album team rule applied,
+    # result persisted as the per-body ``is_teammate``) even when they miss
+    # the real sharp threshold. The blurry/sharp verdict, stars and previews
+    # are NOT affected; this only decides who gets a colour and a team flag.
+    # An album can override it through run_settings["extended_threshold_offset"]
+    # (see algo/thresholds.py).
+    extended_threshold_offset: float = 0.3
+    # ------------------------------------------------------------------
     # Auto adjustment (exposure / brightness)
     # ------------------------------------------------------------------
     # Target mean brightness (0-1 gray level) the auto-exposure correction

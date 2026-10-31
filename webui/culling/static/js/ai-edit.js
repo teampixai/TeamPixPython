@@ -11,7 +11,7 @@
 // first use since no #aiEditDialog markup exists on the page), so this
 // file has zero footprint on pages that never use it.
 //
-// On success the log modal gives way to a side-by-side before/after compare
+// On success the log modal gives way to a before/after slider compare
 // window (Viewport.showCompareWindow) whose Accept/Reject buttons decide
 // whether the generated image is kept — see openCompare() below.
 const AiEdit = (function () {

@@ -304,6 +304,9 @@ Models are downloaded automatically on first run:
   [MediaPipe model zoo](https://storage.googleapis.com/mediapipe-models/) (Apache-2.0 licensed).
 - **yolo engine (`--engine yolo`):** `yolov8n-pose.pt` via Ultralytics, and `yolov8n-face.pt` from the
   [akanametov/yolo-face](https://github.com/akanametov/yolo-face) release.
+- **autoedit.py's body-only sharpening** (`algo/segmentation.py`): `selfie_segmenter.tflite`, also from the
+  MediaPipe model zoo (Apache-2.0). Used to mask out just the detected players so Real-ESRGAN sharpening blends
+  onto them alone, leaving the rest of the frame untouched — see `AI_SHARPEN_SCOPE` in `autoedit.py`.
 
 ### Licensing
 
@@ -312,7 +315,7 @@ recognition path:
 
 | Component | Used for | License |
 |---|---|---|
-| mediapipe (BlazePose / BlazeFace / FaceMesh-V2) | default pose/face engine | Apache-2.0 |
+| mediapipe (BlazePose / BlazeFace / FaceMesh-V2 / Image Segmenter "selfie" model) | default pose/face engine, autoedit.py's body-only sharpen mask | Apache-2.0 |
 | torch / torchvision | hybrid engine's person-box detector (`fasterrcnn_resnet50_fpn_v2`) | BSD-3-Clause |
 | facenet-pytorch | face embedding (default provider) | MIT |
 | dlib | optional face embedding provider | Boost Software License 1.0 |
@@ -365,5 +368,6 @@ landmarks) is effectively a pass-through under `--engine mediapipe`.
 | `jersey_lab_match` | `True` | Match team colour by weighted L\*a\*b\* distance (brightness-forgiving) |
 | `jersey_lab_l_weight` | `0.15` | Weight on the L\* (brightness) axis when matching jersey colour |
 | `jersey_lab_max_dist` | `28.0` | Max weighted L\*a\*b\* distance to count as the team colour |
+| `extended_threshold_offset` | `0.3` | Faces scoring above *sharp threshold − this* (floored at 0) get their jersey identified and a per-body `is_teammate` flag, even if they miss the sharp threshold. Verdicts/stars are unaffected. Overridable per album via `run_settings["extended_threshold_offset"]` in `album.json`. AI edit's body-only sharpening uses only `is_teammate` bodies (albums imported before this need a quick regrade to get the flag) |
 | `jersey_binary_lightness` | `True` | Fallback Light/Dark bucketing when `jersey_lab_match` is off |
 

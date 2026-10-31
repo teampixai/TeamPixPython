@@ -54,15 +54,26 @@ def _body_lightness_bucket(body: Body, config: AppConfig) -> str | None:
     return _lightness_class(lab, config.jersey_light_l_min, config.jersey_light_chroma_max)
 
 
-def _poll_lightness_bucket(frames: list[Frame], config: AppConfig) -> str | None:
-    """Tally Light/Dark buckets across all passing bodies and return the most common.
+def _is_jersey_candidate(body: Body) -> bool:
+    """A body whose jersey is up for evaluation: one that passed grading, or
+    one rejected ONLY for sharpness that was above the extended threshold
+    (GradingStage measured its colour; a body that failed an earlier gate
+    never has one). These are the bodies that vote on the team colour and
+    receive an ``is_teammate`` verdict."""
+    return body.cloth_color != "N/A" and (
+        body.passed or body.rejection_reason.startswith("sharpness score")
+    )
 
-    Returns None when no passing body has a usable colour.
+
+def _poll_lightness_bucket(frames: list[Frame], config: AppConfig) -> str | None:
+    """Tally Light/Dark buckets across all jersey candidates and return the most common.
+
+    Returns None when no candidate has a usable colour.
     """
     counts: dict[str, int] = {}
     for frame in frames:
         for body in frame.bodies:
-            if body.passed:
+            if _is_jersey_candidate(body):
                 bucket = _body_lightness_bucket(body, config)
                 if bucket is not None:
                     counts[bucket] = counts.get(bucket, 0) + 1
@@ -176,14 +187,14 @@ def _poll_team_target_lab(
 ) -> tuple[float, float, float] | None:
     """Compute the team's target L*a*b* anchor for distance matching.
 
-    Averages the measured mean LAB of every passing body that shares the polled
+    Averages the measured mean LAB of every jersey candidate that shares the polled
     dominant label *our_label* (so the opponent's colour cannot skew it); falls
     back to that label's canonical reference LAB when no measurements exist.
     """
     samples: list[tuple[float, float, float]] = []
     for frame in frames:
         for body in frame.bodies:
-            if body.passed and body.cloth_color == our_label:
+            if _is_jersey_candidate(body) and body.cloth_color == our_label:
                 mean = (body.cloth_color_detail or {}).get("mean_lab")
                 if mean and len(mean) == 3:
                     samples.append((float(mean[0]), float(mean[1]), float(mean[2])))
@@ -200,7 +211,7 @@ def _poll_team_target_lab(
 
 
 def _poll_jersey_color(frames: list[Frame]) -> ColorLab | None:
-    """Tally cloth colors across all passing bodies and return the most common as a ColorLab.
+    """Tally cloth colors across all jersey candidates and return the most common as a ColorLab.
 
     Colors labeled 'Unknown' or 'N/A' are excluded.
     Returns None when no body has a usable color.
@@ -208,7 +219,7 @@ def _poll_jersey_color(frames: list[Frame]) -> ColorLab | None:
     counts: dict[str, int] = {}
     for frame in frames:
         for body in frame.bodies:
-            if body.passed and body.cloth_color not in ("N/A", "Unknown"):
+            if _is_jersey_candidate(body) and body.cloth_color not in ("N/A", "Unknown"):
                 counts[body.cloth_color] = counts.get(body.cloth_color, 0) + 1
     if not counts:
         return None
@@ -299,10 +310,14 @@ def classify_body_jersey(
 class JerseyCountingStage(ProcessStage):
     """Determine the dominant jersey colour and invalidate non-matching bodies.
 
-    1. Tally cloth colours across all currently-passing bodies to find
-       "our" team colour.
-    2. Mark any body whose colour does not match the allow-list or the
+    1. Tally cloth colours across every jersey candidate (bodies that passed
+       grading, plus bodies that missed only the sharp threshold but are above
+       the extended one — see algo/thresholds.py) to find "our" team colour.
+    2. Mark any passing body whose colour does not match the allow-list or the
        polled team colour as ``passed=False``.
+    3. Record the same verdict for every candidate as ``is_teammate``. A body
+       that missed only on sharpness keeps its blurry verdict; only
+       ``is_teammate`` is set for it.
 
     *forced_colors* are always accepted regardless of the polled team colour
     (e.g. goalies wearing a distinct colour).  *allowed_colors* are the
@@ -346,6 +361,7 @@ class JerseyCountingStage(ProcessStage):
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         if self.no_team:
+            self._mark_every_candidate_a_teammate(frames)
             return frames
 
         if self.team_color_override:
@@ -355,6 +371,7 @@ class JerseyCountingStage(ProcessStage):
             our_color = _poll_jersey_color(frames)
             if our_color is None:
                 log.warning("[JerseyCountingStage] no usable cloth colour found — skipping team-colour filter")
+                self._mark_every_candidate_a_teammate(frames)
                 return frames
             log.info("[JerseyCountingStage] polled team colour: %s", our_color.label)
         self.our_color = our_color
@@ -392,15 +409,41 @@ class JerseyCountingStage(ProcessStage):
         if self.allowed_colors:
             log.info("[JerseyCountingStage] allowed colors: %s", ", ".join(sorted(self.allowed_colors)))
 
+        teammates = 0
         for frame in frames:
             for body in frame.bodies:
-                if not body.passed:
-                    continue
-                classify_body_jersey(
-                    body, self.forced_colors, self.allowed_colors,
-                    forced_labs, allowed_labs, team_target_lab, team_bucket, our_color,
-                    config, log_prefix=frame.path.name,
-                )
+                if body.passed:
+                    classify_body_jersey(
+                        body, self.forced_colors, self.allowed_colors,
+                        forced_labs, allowed_labs, team_target_lab, team_bucket, our_color,
+                        config, log_prefix=frame.path.name,
+                    )
+                    body.is_teammate = body.passed
+                elif _is_jersey_candidate(body):
+                    # Missed only the sharp threshold but is above the extended
+                    # one: run the same rule on it, then put its blurry verdict
+                    # back exactly as the scorers left it.
+                    kept_reason = body.rejection_reason
+                    body.passed, body.rejection_reason = True, ""
+                    classify_body_jersey(
+                        body, self.forced_colors, self.allowed_colors,
+                        forced_labs, allowed_labs, team_target_lab, team_bucket, our_color,
+                        config, log_prefix=frame.path.name,
+                    )
+                    body.is_teammate = body.passed
+                    body.passed, body.rejection_reason = False, kept_reason
+                teammates += body.is_teammate
+        log.info("[JerseyCountingStage] %d body(ies) identified as teammates", teammates)
 
         return frames
+
+    @staticmethod
+    def _mark_every_candidate_a_teammate(frames: list[Frame]) -> None:
+        """No colour filtering applies (jersey filtering disabled, or no team
+        colour could be determined): every body above the extended threshold
+        counts as a teammate, mirroring that nothing is filtered out."""
+        for frame in frames:
+            for body in frame.bodies:
+                if _is_jersey_candidate(body):
+                    body.is_teammate = True
 

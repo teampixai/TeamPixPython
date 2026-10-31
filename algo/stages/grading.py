@@ -16,6 +16,7 @@ from algo.scorers import (
     MatchedFaceScorer,
 )
 from algo.stage import ProcessStage
+from algo.thresholds import ExtendedThreshold
 
 log = logging.getLogger("BlurPictureDetector")
 
@@ -156,12 +157,16 @@ class GradingStage(ProcessStage):
     """Run all body scorers against every Frame and predict cloth colours.
 
     Scorers are applied in order; a body that fails early is short-circuited.
-    Cloth colour is predicted only for bodies that pass all scorers.
+    Cloth colour is predicted for bodies that pass all scorers AND, when an
+    *extended* threshold is given, for bodies that missed only the sharpness
+    gate but scored above it (so their jersey can be checked too; their
+    blurry verdict is left exactly as the scorers set it).
     All Frame/Body mutations are in-place (shallow — no deep copies).
     """
 
-    def __init__(self, threshold: float) -> None:
+    def __init__(self, threshold: float, extended: ExtendedThreshold | None = None) -> None:
         self.threshold = threshold
+        self.extended = extended
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         scorer = BodyArrayScorer([
@@ -176,6 +181,7 @@ class GradingStage(ProcessStage):
         progress_step = max(1, total // 20)
         width = len(str(total))
         passed_bodies = 0
+        extended_bodies = 0
         total_bodies = 0
 
         for idx, frame in enumerate(frames, 1):
@@ -185,6 +191,9 @@ class GradingStage(ProcessStage):
                 for body in frame.bodies:
                     total_bodies += 1
                     if not body.passed:
+                        if self._in_extended_range(body):
+                            extended_bodies += 1
+                            body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(body)
                         continue
                     passed_bodies += 1
                     body.cloth_color, body.cloth_color_detail = cloth_color_predictor.predict(body)
@@ -202,6 +211,17 @@ class GradingStage(ProcessStage):
             if idx % progress_step == 0 or idx == total:
                 log.info("[GradingStage] [%*d/%d] frame(s) graded", width, idx, total)
 
-        log.info("[GradingStage] done: %d/%d body(ies) passed across %d frame(s)",
-                 passed_bodies, total_bodies, total)
+        log.info("[GradingStage] done: %d/%d body(ies) passed across %d frame(s)"
+                 "; %d more above the extended threshold had their jersey measured",
+                 passed_bodies, total_bodies, total, extended_bodies)
         return frames
+
+    def _in_extended_range(self, body: Body) -> bool:
+        """A body rejected ONLY for sharpness whose face score is above the
+        extended threshold. Earlier-gate failures (no face, face too small,
+        ...) never qualify: their score is meaningless."""
+        return (
+            self.extended is not None
+            and body.rejection_reason.startswith("sharpness score")
+            and self.extended.passes(body.sharpness_score)
+        )

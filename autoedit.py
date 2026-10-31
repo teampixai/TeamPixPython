@@ -19,6 +19,9 @@ Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     aisharpen        Real-ESRGAN (realesr-general-x4v3, compact) detail
                      restoration at input resolution. Optional GFPGAN
                      face-enhance pass via --face-enhance (off by default).
+                     With --boxes-file, sharpens+blends only the detected
+                     players instead of the whole frame — see
+                     AI_SHARPEN_SCOPE/sharpen_bodies() below.
     openai_autoedit  Generative retouch via the OpenAI image model.
     openai_ig        Generative heroic 4:5 Instagram reframe.
 
@@ -37,6 +40,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import json
 import logging
 import math
 import queue
@@ -143,6 +147,49 @@ SHARPEN_MODELS: dict[str, SharpenModelSpec] = {
     ),
 }
 DEFAULT_SHARPEN_MODEL = "compact"
+
+# ---------------------------------------------------------------------------
+# Body-only sharpening (see sharpen_bodies() below)
+# ---------------------------------------------------------------------------
+# Code-only switch (deliberately not exposed via CLI/UI — edit this constant
+# directly to change it): "bodies" sharpens+blends just the detected players'
+# boxes, leaving the rest of the frame pixel-identical to the source; "full"
+# restores the old whole-frame behaviour. Falls back to "full" automatically
+# per-image when no body boxes are supplied (see AiSharpenPipeline.apply()),
+# so photos with nothing detected are unaffected either way.
+AI_SHARPEN_SCOPE = "bodies"  # "bodies" | "full"
+
+# Extra margin added around each detected body box before cropping, as a
+# fraction of that box's own width/height. Gives the segmentation model
+# background context around the player and keeps the blended region's edge
+# away from the (often tight) detection box boundary. Tune freely.
+BODY_SHARPEN_PADDING_PCT = 0.20
+
+# Extra Gaussian blur (pixels) applied to the segmentation confidence mask
+# before using it as the alpha-blend weight, on top of the model's own
+# confidence gradient — cheap insurance against a visible seam at the
+# player's silhouette. 0 disables it.
+BODY_SHARPEN_MASK_BLUR_PX = 3
+
+# The segmentation mask covers every person in a crop, so a blurry neighbour
+# standing inside the padded crop would otherwise be sharpened too. The mask
+# is therefore clipped to the target's own body box, grown by this fraction
+# of the box's width/height (so arms/legs poking a little outside the
+# detector's box aren't cut off) and softened by this Gaussian sigma (px).
+BODY_SHARPEN_CLIP_MARGIN_PCT = 0.05
+BODY_SHARPEN_CLIP_FEATHER_PX = 6
+
+# A segmentation counts as successful only if it marks at least this
+# fraction of the padded crop as person (confidence > 0.5). Below it the
+# model effectively found nobody, so the box is skipped and left untouched.
+BODY_SHARPEN_MIN_PERSON_COVERAGE = 0.01
+
+# Minimum per-keypoint confidence before a body's own 17 COCO keypoint may
+# "vote" for a connected component in the segmentation mask — see
+# _select_body_component() below. Caller-supplied keypoints are optional
+# (see sharpen_bodies()'s keypoints_norm param); this only affects boxes
+# whose caller did pass them.
+BODY_SHARPEN_KEYPOINT_CONF_MIN = 0.3
 
 # Peak-VRAM-per-output-pixel at tile=0/half precision, measured on a real GPU
 # (Titan V) across 512-1600px square images: compact ~407-494 B/px, rrdbnet
@@ -736,6 +783,207 @@ class SharpenDispatcher:
 
 
 # ---------------------------------------------------------------------------
+# Body-only sharpening
+# ---------------------------------------------------------------------------
+
+def _box_clip_mask(
+    shape_hw: tuple[int, int],
+    box_px: tuple[float, float, float, float],
+) -> np.ndarray:
+    """Float32 [0, 1] mask of *shape_hw* that is 1 inside *box_px*
+    (x1, y1, x2, y2 in the mask's own pixel coordinates), grown by
+    BODY_SHARPEN_CLIP_MARGIN_PCT and feathered by BODY_SHARPEN_CLIP_FEATHER_PX."""
+    height, width = shape_hw
+    x1, y1, x2, y2 = box_px
+    margin_x = (x2 - x1) * BODY_SHARPEN_CLIP_MARGIN_PCT
+    margin_y = (y2 - y1) * BODY_SHARPEN_CLIP_MARGIN_PCT
+    cx1 = max(0, int(round(x1 - margin_x)))
+    cy1 = max(0, int(round(y1 - margin_y)))
+    cx2 = min(width, int(round(x2 + margin_x)))
+    cy2 = min(height, int(round(y2 + margin_y)))
+    clip = np.zeros((height, width), dtype=np.float32)
+    clip[cy1:cy2, cx1:cx2] = 1.0
+    if BODY_SHARPEN_CLIP_FEATHER_PX > 0:
+        clip = cv2.GaussianBlur(clip, (0, 0), sigmaX=BODY_SHARPEN_CLIP_FEATHER_PX)
+    return clip
+
+
+def _select_body_component(
+    mask: np.ndarray,
+    keypoints_px: list[tuple[float, float, float]],
+) -> tuple[np.ndarray, dict | None]:
+    """When a body's own 17 COCO keypoints (*keypoints_px*: (x, y,
+    confidence) in the mask's own pixel coordinates) land on more than one
+    disconnected blob in the segmentation *mask* — i.e. a neighbouring
+    player's blob also falls inside this body's padded crop, touching or
+    overlapping the rectangular box-clip without actually being this body's
+    silhouette — keeps only the blob(s) the keypoints sit on and zeroes the
+    rest, so the neighbour doesn't get sharpened too. This is a much
+    tighter, silhouette-shaped alternative to the box-clip above (which is
+    still applied afterwards regardless, as a backstop).
+
+    Falls back to returning *mask* unchanged (second element None) when
+    there are no confident-enough keypoints to vote with, or when none of
+    them land on any foreground blob (pose missed/occluded) — the box-clip
+    is still the fallback in both cases, matching the behaviour before this
+    function existed. Returns (new_mask, info) where info is a dict with
+    vote-count details for logging, or None when the mask was left as-is.
+    """
+    confident = [
+        (x, y) for x, y, conf in keypoints_px if conf >= BODY_SHARPEN_KEYPOINT_CONF_MIN
+    ]
+    if not confident:
+        return mask, None
+    binary = (mask > 0.5).astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(binary)
+    if num_labels <= 1:  # nothing but background — nothing to select between
+        return mask, None
+    height, width = labels.shape
+    voted: set[int] = set()
+    for x, y in confident:
+        px, py = int(round(x)), int(round(y))
+        if 0 <= px < width and 0 <= py < height:
+            label = int(labels[py, px])
+            if label != 0:
+                voted.add(label)
+    if not voted:
+        return mask, None
+    keep = np.isin(labels, list(voted))
+    info = {
+        "n_keypoints": len(confident), "n_components": num_labels - 1, "n_kept": len(voted),
+    }
+    return mask * keep.astype(np.float32), info
+
+
+def sharpen_bodies(
+    image: np.ndarray,
+    boxes_norm: list[tuple[float, float, float, float]],
+    dispatcher: SharpenDispatcher,
+    label: str = "",
+    keypoints_norm: list[list[tuple[float, float, float]]] | None = None,
+) -> np.ndarray:
+    """Sharpen only the given players, leaving the rest of *image*
+    pixel-identical to the source.
+
+    For each normalised (x1, y1, x2, y2) box: pad it for context, crop,
+    run the crop through Real-ESRGAN (via *dispatcher* — the same model
+    used for whole-frame sharpening, just on a much smaller input), get a
+    person-confidence mask for the crop from the segmentation backend (see
+    algo/segmentation.py), narrow that mask down to just this player's own
+    silhouette (using their 17 COCO keypoints if *keypoints_norm* supplied
+    them — see _select_body_component()), clip it to the player's own box so
+    other people in the padded crop stay untouched, and alpha-blend the
+    sharpened crop over the original crop using it before pasting it back.
+    Overlapping boxes are blended in order, each on top of whatever is
+    already there.
+
+    The caller decides who is sharpened: culling_app.py only passes boxes of
+    the teammates the album marked is_teammate (see its
+    _teammate_body_entries()).
+
+    *keypoints_norm*, if given, must be the same length as *boxes_norm*:
+    keypoints_norm[i] is boxes_norm[i]'s own normalised (x, y, confidence)
+    17 COCO keypoints (empty list if that body has none). None, or an empty
+    list for a given box, just skips keypoint-assisted component selection
+    for it — the box-clip alone is still applied.
+
+    Logs every box it was given and, per box, whether segmentation worked
+    (and how much of the crop it marked as person) or why the box was skipped.
+    *label* (usually the photo's file name) prefixes those lines.
+    """
+    from algo.segmentation import DEFAULT_SEGMENTER_BACKEND, get_segmenter
+
+    segmenter = get_segmenter(DEFAULT_SEGMENTER_BACKEND)
+    img_h, img_w = image.shape[:2]
+    result = image.copy()
+    prefix = f"[{label}] " if label else ""
+    total = len(boxes_norm)
+    sharpened = 0
+
+    log.info("%sBody sharpen: %d box(es) passed in (image %dx%d, segmenter=%s)",
+             prefix, total, img_w, img_h, DEFAULT_SEGMENTER_BACKEND)
+
+    for index, (x1, y1, x2, y2) in enumerate(boxes_norm, start=1):
+        box_w_px = (x2 - x1) * img_w
+        box_h_px = (y2 - y1) * img_h
+        pad_x = box_w_px * BODY_SHARPEN_PADDING_PCT
+        pad_y = box_h_px * BODY_SHARPEN_PADDING_PCT
+        px1 = max(0, int(round(x1 * img_w - pad_x)))
+        py1 = max(0, int(round(y1 * img_h - pad_y)))
+        px2 = min(img_w, int(round(x2 * img_w + pad_x)))
+        py2 = min(img_h, int(round(y2 * img_h + pad_y)))
+        log.info("%s  box %d/%d: norm=(%.3f, %.3f, %.3f, %.3f) body_px=(%d, %d)-(%d, %d) "
+                 "padded_crop_px=(%d, %d)-(%d, %d) [%dx%d]",
+                 prefix, index, total, x1, y1, x2, y2,
+                 round(x1 * img_w), round(y1 * img_h), round(x2 * img_w), round(y2 * img_h),
+                 px1, py1, px2, py2, px2 - px1, py2 - py1)
+        if px2 - px1 < 2 or py2 - py1 < 2:
+            log.warning("%s  box %d/%d: skipped - degenerate (outside the frame or a sliver)",
+                        prefix, index, total)
+            continue
+
+        crop = image[py1:py2, px1:px2]
+        # Segment first: it is cheap, and a failed mask means the (much more
+        # expensive) sharpen pass for this box would be wasted.
+        try:
+            mask = segmenter.segment(crop)
+        except Exception as exc:
+            log.warning("%s  box %d/%d: segmentation FAILED (%s: %s) - box left untouched",
+                        prefix, index, total, type(exc).__name__, exc)
+            continue
+        if mask.shape[:2] != crop.shape[:2]:
+            mask = cv2.resize(mask, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+        kps = keypoints_norm[index - 1] if keypoints_norm and index - 1 < len(keypoints_norm) else []
+        keypoints_px = [(kx * img_w - px1, ky * img_h - py1, kconf) for kx, ky, kconf in kps]
+        mask, component_info = _select_body_component(mask, keypoints_px)
+        if component_info is not None:
+            log.info("%s  box %d/%d: keypoint-selected %d/%d segmentation blob(s) using %d "
+                     "confident keypoint(s)",
+                     prefix, index, total, component_info["n_kept"], component_info["n_components"],
+                     component_info["n_keypoints"])
+
+        person_coverage = float((mask > 0.5).mean())
+        if person_coverage < BODY_SHARPEN_MIN_PERSON_COVERAGE:
+            log.warning("%s  box %d/%d: segmentation FAILED - no person found in the crop "
+                        "(%.1f%% of pixels, need >= %.1f%%) - box left untouched",
+                        prefix, index, total, person_coverage * 100,
+                        BODY_SHARPEN_MIN_PERSON_COVERAGE * 100)
+            continue
+
+        try:
+            sharpened_crop = dispatcher.submit(crop)
+        except Exception as exc:
+            log.warning("%s  box %d/%d: segmentation OK (person %.1f%% of crop) but sharpening "
+                        "FAILED (%s: %s) - box left untouched",
+                        prefix, index, total, person_coverage * 100, type(exc).__name__, exc)
+            continue
+
+        if sharpened_crop.shape[:2] != crop.shape[:2]:
+            sharpened_crop = cv2.resize(
+                sharpened_crop, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_LANCZOS4
+            )
+        if BODY_SHARPEN_MASK_BLUR_PX > 0:
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=BODY_SHARPEN_MASK_BLUR_PX)
+        mask = mask * _box_clip_mask(
+            crop.shape[:2],
+            (x1 * img_w - px1, y1 * img_h - py1, x2 * img_w - px1, y2 * img_h - py1),
+        )
+
+        alpha = np.clip(mask, 0.0, 1.0)[..., None]
+        blended = sharpened_crop.astype(np.float32) * alpha + crop.astype(np.float32) * (1.0 - alpha)
+        result[py1:py2, px1:px2] = np.clip(blended, 0, 255).astype(np.uint8)
+        sharpened += 1
+        log.info("%s  box %d/%d: segmentation OK - person %.1f%% of crop, %.1f%% after clipping "
+                 "to the body box; sharpened and blended",
+                 prefix, index, total, person_coverage * 100, float((mask > 0.5).mean()) * 100)
+
+    log.info("%sBody sharpen: %d/%d box(es) sharpened, %d skipped",
+             prefix, sharpened, total, total - sharpened)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # OpenAI helpers
 # ---------------------------------------------------------------------------
 
@@ -825,6 +1073,21 @@ class EditContext:
     source: Path
     dispatcher: SharpenDispatcher | None = None
     openai_client: object | None = None
+    # Normalised (x1, y1, x2, y2) boxes — fractions of width/height, matching
+    # algo.models.Box's own convention — for the players detected in this
+    # photo. Populated from --boxes-file (see main()); callers are expected to
+    # list only the players that should be sharpened (culling_app.py passes
+    # just the album's teammates). None/empty means "no boxes available for
+    # this image", in which case AiSharpenPipeline falls back to whole-frame
+    # sharpening regardless of AI_SHARPEN_SCOPE.
+    body_boxes: list[tuple[float, float, float, float]] | None = None
+    # Same length/order as body_boxes when given: body_keypoints[i] is
+    # body_boxes[i]'s own normalised (x, y, confidence) 17 COCO keypoints
+    # (empty list for a box with none). Also populated from --boxes-file;
+    # lets sharpen_bodies() tell this player's own segmentation blob apart
+    # from a neighbour's (see _select_body_component()). None/empty just
+    # means no keypoint-assisted selection for any box.
+    body_keypoints: list[list[tuple[float, float, float]]] | None = None
 
 
 class EditPipeline(ABC):
@@ -858,6 +1121,16 @@ class AiSharpenPipeline(EditPipeline):
 
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         assert ctx.dispatcher is not None
+        if AI_SHARPEN_SCOPE == "bodies" and ctx.body_boxes:
+            return sharpen_bodies(
+                image, ctx.body_boxes, ctx.dispatcher, label=ctx.source.name,
+                keypoints_norm=ctx.body_keypoints,
+            )
+        reason = (
+            f"AI_SHARPEN_SCOPE={AI_SHARPEN_SCOPE!r}" if AI_SHARPEN_SCOPE != "bodies"
+            else "no body boxes were passed in for this photo"
+        )
+        log.info("[%s] Sharpening the whole frame (%s)", ctx.source.name, reason)
         return ctx.dispatcher.submit(image)
 
 
@@ -946,13 +1219,18 @@ def process_one(
     dispatcher: SharpenDispatcher | None,
     openai_client,
     out_file: Path | None = None,
+    body_boxes: list[tuple[float, float, float, float]] | None = None,
+    body_keypoints: list[list[tuple[float, float, float]]] | None = None,
 ) -> Path | None:
     image = read_image(source)
     if image is None:
         return None
     log.info("[%s] %dx%d", source.name, image.shape[1], image.shape[0])
 
-    ctx = EditContext(source=source, dispatcher=dispatcher, openai_client=openai_client)
+    ctx = EditContext(
+        source=source, dispatcher=dispatcher, openai_client=openai_client,
+        body_boxes=body_boxes, body_keypoints=body_keypoints,
+    )
     for pipeline in pipelines:
         try:
             image = pipeline.apply(image, ctx)
@@ -968,6 +1246,33 @@ def process_one(
         return None
     log.info("[%s] wrote %s (%dx%d)", source.name, destination, image.shape[1], image.shape[0])
     return destination
+
+
+def _parse_boxes_file(raw: dict) -> tuple[
+    dict[str, list[tuple[float, float, float, float]]],
+    dict[str, list[list[tuple[float, float, float]]]],
+]:
+    """Parses --boxes-file's JSON (see its --help) into (boxes_by_name,
+    keypoints_by_name), both keyed by file name with same-length, same-order
+    lists — index i in each belongs to the same body. Each raw entry is
+    either a plain [x1, y1, x2, y2] box (no keypoints) or a {"box": [...],
+    "keypoints": [[x, y, conf], ...]} object (see culling_app.py's
+    _teammate_body_entries(), the one real caller of this format)."""
+    boxes_by_name: dict[str, list[tuple[float, float, float, float]]] = {}
+    keypoints_by_name: dict[str, list[list[tuple[float, float, float]]]] = {}
+    for name, entries in raw.items():
+        boxes: list[tuple[float, float, float, float]] = []
+        keypoints: list[list[tuple[float, float, float]]] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                boxes.append(tuple(entry["box"]))
+                keypoints.append([tuple(kp) for kp in entry.get("keypoints", [])])
+            else:
+                boxes.append(tuple(entry))
+                keypoints.append([])
+        boxes_by_name[name] = boxes
+        keypoints_by_name[name] = keypoints
+    return boxes_by_name, keypoints_by_name
 
 
 def main() -> None:
@@ -1039,7 +1344,35 @@ def main() -> None:
         help="Run a GFPGAN face-restoration pass after Real-ESRGAN in the aisharpen "
              "pipeline (off by default).",
     )
+    parser.add_argument(
+        "--boxes-file", type=Path, default=None, metavar="PATH",
+        help=(
+            "JSON file mapping each input file's NAME (e.g. \"photo.jpg\", not a full "
+            "path) to a list of body entries for the aisharpen pipeline's body-only mode "
+            "(see AI_SHARPEN_SCOPE in this file) to sharpen+blend just the detected "
+            "players instead of the whole frame. Each entry is either a plain "
+            "[x1, y1, x2, y2] normalised box (fractions of width/height), or a "
+            "{\"box\": [x1, y1, x2, y2], \"keypoints\": [[x, y, conf], ...]} object "
+            "additionally carrying that body's 17 COCO keypoints (also normalised; "
+            "conf in [0, 1]) so segmentation can tell this player's own silhouette apart "
+            "from a neighbour's (see _select_body_component in this file) — keypoints are "
+            "optional per entry. Images with no entry (or no --boxes-file at all) fall "
+            "back to whole-frame sharpening."
+        ),
+    )
     args = parser.parse_args()
+
+    boxes_by_name, keypoints_by_name = {}, {}
+    if args.boxes_file is not None:
+        try:
+            raw = json.loads(args.boxes_file.read_text(encoding="utf-8-sig"))
+            boxes_by_name, keypoints_by_name = _parse_boxes_file(raw)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+            log.warning("Could not read --boxes-file %s: %s", args.boxes_file, exc)
+        else:
+            log.info("Loaded --boxes-file %s: %s", args.boxes_file,
+                     ", ".join(f"{name}: {len(boxes)} box(es)" for name, boxes in boxes_by_name.items())
+                     or "no entries")
 
     try:
         sources = collect_inputs(args.inputPath)
@@ -1089,6 +1422,8 @@ def main() -> None:
                 lambda source: process_one(
                     source, pipelines, args.output, args.ext, args.compression,
                     dispatcher, openai_client, out_file=args.out_file,
+                    body_boxes=boxes_by_name.get(source.name),
+                    body_keypoints=keypoints_by_name.get(source.name),
                 ),
                 sources,
             )

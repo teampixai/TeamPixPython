@@ -45,6 +45,7 @@ from algo.frame import Frame
 from algo.image_cache import ImageCache
 from algo.results import baseline_stars, build_result_entries
 from algo.stage import ProcessStage
+from algo.thresholds import RUN_SETTINGS_KEY as EXTENDED_OFFSET_KEY, ExtendedThreshold
 from algo.stages.annotation import AnnotationStage
 from algo.stages.auto_adjust import AutoAdjustStage
 from algo.stages.face_reco import FaceRecoStage
@@ -925,6 +926,11 @@ def main() -> None:
     # later "import more"/regrade runs and reflected back in the album-tools
     # "Team Jersey Colour" picker.
     run_settings_out["team_color_override"] = team_color_override
+    # Face-score cut-off below the real sharp threshold: bodies above it get
+    # their jersey identified (see algo/thresholds.py). Recorded per album so
+    # the album states which offset its is_teammate flags were produced with.
+    extended_threshold = ExtendedThreshold.for_album(sensitivity_threshold, run_settings_out)
+    run_settings_out.setdefault(EXTENDED_OFFSET_KEY, extended_threshold.offset)
     working_album = None if args.regrade_only else Album.create(
         working_dir, team_id=team_id, run_settings=run_settings_out, import_status="in_progress",
     )
@@ -985,7 +991,7 @@ def main() -> None:
         team_color_override=team_color_override,
     )
     stages: list[ProcessStage] = [
-        GradingStage(sensitivity_threshold),
+        GradingStage(sensitivity_threshold, extended_threshold),
         jersey_stage,
     ]
     if args.autoadjust:
@@ -1000,6 +1006,7 @@ def main() -> None:
         run_settings_out = dict(run_settings)
         run_settings_out["sensitivity"] = args.sensitivity
         run_settings_out["team_color_override"] = team_color_override
+        run_settings_out.setdefault(EXTENDED_OFFSET_KEY, extended_threshold.offset)
         # Preserved fields (stars, keep, edited_image, ...) are merged into
         # the freshly-built entries before the single Album write below --
         # a deep regrade never needs more than one write.

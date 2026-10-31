@@ -208,6 +208,11 @@ class Body:
     ten:               float       = 0.0         # Tenengrad of best face crop
     cloth_color:       str         = "N/A"       # predicted jersey/cloth color
     cloth_color_detail: dict       = field(default_factory=dict)  # votes + mean LAB
+    # Result of the jersey check against the album's team rule, evaluated for
+    # every body above the extended sharpness threshold (see
+    # algo/thresholds.py). Independent of `passed`: a body that is too blurry
+    # to pass can still be a teammate.
+    is_teammate:       bool        = False
     # Mean grey level [0,1] of this body's face crop, measured during analysis
     # so AutoAdjustStage never needs the pixels again.
     crop_brightness:   float       = 0.0
