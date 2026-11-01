@@ -8,7 +8,7 @@ Runs two YOLO models (body pose + face detection) on a folder of images, filters
 
 ## Getting started (Windows, no git/download-zip needed)
 
-Anaconda or Miniconda must already be installed ([Miniconda download](https://docs.conda.io/en/latest/miniconda.html)) — everything else is handled for you. Open a plain Command Prompt (an "Anaconda Prompt" is not required) and paste these two commands:
+Nothing needs to be installed first — not Anaconda, Python or git. The setup script downloads its own private copy of [Miniconda](https://docs.conda.io/en/latest/miniconda.html) into the app folder, so the app keeps working no matter what other Anaconda/Miniconda/Python you install, change or remove on the PC, and it doesn't affect them either. Open a plain Command Prompt and paste these two commands:
 
 1. Create a working folder and switch into it:
 
@@ -22,7 +22,18 @@ Anaconda or Miniconda must already be installed ([Miniconda download](https://do
    curl -L -o InitPhotoProcessing.bat https://raw.githubusercontent.com/asingc/BlurPictureDetector/main/InitPhotoProcessing.bat && InitPhotoProcessing.bat
    ```
 
-   (`curl` is built into Windows 10/11 by default.) This installs a dedicated Python environment, downloads the app, and writes a `RunPhotoProcessing.bat` launcher in the same folder. Double-click `RunPhotoProcessing.bat` any time afterwards to open the web app — see below. Re-run the same command above any time to update everything to the latest version.
+   (`curl` is built into Windows 10/11 by default.) On the first run you're asked to accept Anaconda's [Terms of Service](https://www.anaconda.com/legal) before Miniconda is downloaded. Add `/y` after `InitPhotoProcessing.bat` to accept them without the prompt. The script then installs everything into this folder:
+
+   | Folder / file | Contents |
+   |---|---|
+   | `miniconda3\` | Private Miniconda (not added to PATH or the registry) |
+   | `envs\blurpicturedetector\` | The app's Python and all its dependencies |
+   | `app\` | The app source |
+   | `RunPhotoProcessing.bat` | The launcher |
+
+   It also adds a **BlurPictureDetector** entry to the Start Menu. Use it, or double-click `RunPhotoProcessing.bat`, to open the web app — see below. Re-run the same command above any time to update everything to the latest version. A path without spaces is recommended. Windows on ARM64 is supported through the x64 build of Miniconda, which runs under emulation.
+
+   To uninstall, delete the folder and the `BlurPictureDetector` folder in the Start Menu (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\BlurPictureDetector`).
 
 ---
 
@@ -34,7 +45,7 @@ The easiest way to use this tool day-to-day is the built-in web app — it wraps
 python culling_app.py
 ```
 
-This starts a local web server and opens a browser tab automatically (use `--no-browser` to skip that, `--port <n>` to change the port). If you set the project up with `InitPhotoProcessing.bat`, just double-click the generated `RunPhotoProcessing.bat` instead.
+This starts a local web server and opens a browser tab automatically (use `--no-browser` to skip that, `--port <n>` to change the port). If you set the project up with `InitPhotoProcessing.bat`, just open **BlurPictureDetector** from the Start Menu (or double-click the generated `RunPhotoProcessing.bat`) instead.
 
 The app walks through five pages (top nav):
 
