@@ -9,7 +9,7 @@ from algo.frame import Frame
 from algo.models import AutoAdjustment, Body
 from algo.stage import ProcessStage
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 def _main_body(frame: Frame) -> Body | None:

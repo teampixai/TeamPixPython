@@ -63,7 +63,7 @@ from algo.stages.llm_culling import (
     load_qualifying_bursts,
 )
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # Burst sizes shown in the no-args pricing preview (no Album to measure real
 # bursts from yet).

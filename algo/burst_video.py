@@ -25,7 +25,7 @@ import rawpy
 from algo.album import album_for
 from algo.utils import cap_long_edge, image_capture_timestamp
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # Mirrors culling_app.py's BURST_GAP_SECONDS so both features agree on what
 # a "burst" is.

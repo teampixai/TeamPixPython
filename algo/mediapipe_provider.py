@@ -52,7 +52,7 @@ from algo.facereco_provider import Box as FRBox
 from algo.models import Body, Box, Face, Point, PredictedKeyPoint
 from algo.utils import _narrow_face_box
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # ---------------------------------------------------------------------------
 # Model bootstrap

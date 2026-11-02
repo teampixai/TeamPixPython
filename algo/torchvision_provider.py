@@ -24,7 +24,7 @@ import torch
 
 from algo.models import Box
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 _COCO_PERSON_LABEL = 1
 

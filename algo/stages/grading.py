@@ -18,7 +18,7 @@ from algo.scorers import (
 from algo.stage import ProcessStage
 from algo.thresholds import ExtendedThreshold
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 # ---------------------------------------------------------------------------

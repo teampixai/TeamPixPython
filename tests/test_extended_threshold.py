@@ -271,7 +271,7 @@ def _regrade_log(album_dir, caplog, threshold=0.5):
     import logging
 
     caplog.clear()
-    with caplog.at_level(logging.INFO, logger="BlurPictureDetector"):
+    with caplog.at_level(logging.INFO, logger="TeamPixPython"):
         summary = regrade_sensitivity(album_dir, threshold)
     return summary, caplog.text
 
@@ -334,6 +334,6 @@ def test_regrade_logs_a_pinned_colour_change(album_dir, caplog):
 
     _write_regrade_album(album_dir)
     caplog.clear()
-    with caplog.at_level(logging.INFO, logger="BlurPictureDetector"):
+    with caplog.at_level(logging.INFO, logger="TeamPixPython"):
         regrade_sensitivity(album_dir, 0.5, team_color_override="White:Bright")
     assert "setting changed - team_color_override: '' -> 'White:Bright'" in caplog.text

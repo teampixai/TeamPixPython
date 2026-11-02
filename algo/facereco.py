@@ -17,7 +17,7 @@ from algo.album import Album, PersonRecord
 from algo.album_info import AlbumInfo
 from algo.models import Box as ModelBox
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 @dataclass

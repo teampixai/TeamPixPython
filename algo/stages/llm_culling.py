@@ -16,7 +16,7 @@ from algo.stage import ProcessStage
 from algo.stages.image_analysis import _read_image
 from algo.utils import cap_long_edge, image_capture_timestamp
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # Consecutive sharp photos within this many seconds of each other are treated
 # as the same "burst" — mirrors culling_app.py's review-page grouping

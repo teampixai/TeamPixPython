@@ -12,7 +12,7 @@ from algo.models import Box, Face
 from algo.stage import ProcessStage
 from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR, apply_auto_adjustment, write_cover_thumbnail
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # COCO 17-keypoint skeleton: pairs of indices to connect with a line.
 _COCO_SKELETON: tuple[tuple[int, int], ...] = (

@@ -7,7 +7,7 @@ from algo.config import AppConfig
 from algo.frame import Frame
 from algo.stage import ProcessStage
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 try:
     from algo.facereco import FaceRecoConfig, FaceRecoPipeline

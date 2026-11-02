@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BlurPictureDetector
+TeamPixPython
 -------------------
 Detect blurry sport images by analysing the sharpness of the main subject.
 
@@ -114,7 +114,7 @@ _COCO_SKELETON: tuple[tuple[int, int], ...] = (
 # Logging
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 def _build_album_dir_name(ts: str, stem: str) -> str:

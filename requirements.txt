@@ -1,4 +1,4 @@
-# BlurPictureDetector – Python dependencies
+# TeamPixPython – Python dependencies
 #
 # Install order matters: install PyTorch with CUDA first (see README below),
 # then install the packages listed here. facenet-pytorch (below) requires

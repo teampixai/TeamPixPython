@@ -26,7 +26,7 @@ from algo.models import Box as ModelBox
 from algo.models import Face, PredictedKeyPoint, Point
 from algo.utils import _narrow_face_box
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 _YOLO_FACE_MODEL_URL = (
     "https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov8n-face.pt"

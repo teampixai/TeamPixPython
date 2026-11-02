@@ -10,7 +10,7 @@ from algo.stage import ProcessStage
 from algo.stages.grading import ClothColorPredictor
 from algo.utils import _color_from_label, _colors_match, _matches_allowed_jersey_color
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 # Reference L*a*b* values for every predicted Hue:Shade label, used as a

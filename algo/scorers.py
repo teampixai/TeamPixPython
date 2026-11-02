@@ -11,7 +11,7 @@ from algo.models import Body, Box, Face
 from algo.sharpness import sharpness_evaluator
 from algo.utils import _HEAD_KP_INDICES, _color_from_label, _matches_allowed_jersey_color, clamp_long_edge
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 # ---------------------------------------------------------------------------

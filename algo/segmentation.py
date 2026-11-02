@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 _MODEL_DIR = Path(__file__).resolve().parent.parent
 

@@ -1041,7 +1041,7 @@ def _stream_logs_to_job():
     loggers also appear in the polled job output. The loggers are lowered to
     INFO for the duration (uvicorn leaves them at WARNING), then restored."""
     handler = _JobLogHandler(threading.get_ident())
-    loggers = [logging.getLogger(name) for name in ("BlurPictureDetector", "CullingApp")]
+    loggers = [logging.getLogger(name) for name in ("TeamPixPython", "CullingApp")]
     saved = [lg.level for lg in loggers]
     for lg in loggers:
         lg.addHandler(handler)

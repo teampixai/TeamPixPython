@@ -92,7 +92,7 @@ def test_quick_regrade_failure_is_reported_not_lost(client, monkeypatch):
 def test_log_streaming_restores_the_loggers(client):
     import logging
 
-    names = ("BlurPictureDetector", "CullingApp")
+    names = ("TeamPixPython", "CullingApp")
     before = [(logging.getLogger(n).level, list(logging.getLogger(n).handlers)) for n in names]
     client.post("/api/album-tools/regrade-sensitivity", json={
         "sensitivityMode": "medium", "sensitivityCustomValue": 0.5, "mode": "shallow",

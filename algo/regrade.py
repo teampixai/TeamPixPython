@@ -61,7 +61,7 @@ from algo.album import Album, AlbumImage, PersonRecord
 from algo.album_info import AlbumInfo, category_for_status
 from algo.utils import _color_from_label
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # run_settings entries a regrade rewrites (and so reports when they change).
 _WATCHED_SETTINGS = ("sensitivity", "team_color_override", EXTENDED_OFFSET_KEY)

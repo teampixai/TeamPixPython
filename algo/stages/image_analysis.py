@@ -16,7 +16,7 @@ from algo.models import Body, Box, Face, Point, PredictedKeyPoint
 from algo.stage import ProcessStage
 from algo.utils import _HEAD_KP_INDICES, _narrow_face_box, cap_long_edge
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 # ---------------------------------------------------------------------------
 # Supported extensions

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from algo.llm import prompts
 
-log = logging.getLogger("BlurPictureDetector")
+log = logging.getLogger("TeamPixPython")
 
 
 @dataclass
