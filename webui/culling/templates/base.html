@@ -17,11 +17,14 @@
     <nav id="steps" class="stepper">
       {% set step_labels = [("team", "Team"), ("select-album", "Select Album"), ("culling", "Culling"), ("faces", "Faces"), ("album-tools", "Album Tools")] %}
       {% set gated_steps = ("culling", "faces", "album-tools") %}
+      {% set no_team = not has_teams() %}
       {% for key, label in step_labels %}
-      {% set is_disabled = key in gated_steps and not has_active_album() %}
+      {% set needs_team = key == "select-album" and no_team %}
+      {% set is_disabled = needs_team or (key in gated_steps and not has_active_album()) %}
       <a class="step {{ 'active' if active_step == key else '' }} {{ 'disabled' if is_disabled else '' }}"
+         data-step="{{ key }}"
          href="{{ '#' if is_disabled else '/' + key }}"
-         {% if is_disabled %}aria-disabled="true" tabindex="-1" title="Select or import an album first"{% endif %}>
+         {% if is_disabled %}aria-disabled="true" tabindex="-1" title="{{ 'Create a team first' if needs_team else 'Select or import an album first' }}"{% endif %}>
         <span class="step-index">{{ loop.index }}</span>
         <span class="step-label">{{ label }}</span>
       </a>

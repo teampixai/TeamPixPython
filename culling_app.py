@@ -1113,7 +1113,9 @@ def _run_quick_regrade(
 # settings; the Team Setup page can create/update any team by id.u
 # --------------------------------------------------------------------------- #
 def _default_teams_file() -> TeamsFile:
-    return TeamsFile(Teams=[TeamData(name="Team 1")])
+    # No team is ever created implicitly: a first-time user must click "Add
+    # new team" on the Team page, so every install goes through the same flow.
+    return TeamsFile()
 
 
 def _load_teams_file() -> TeamsFile:
@@ -1121,11 +1123,10 @@ def _load_teams_file() -> TeamsFile:
     format (no "Teams" key — the whole file *was* one team's data) into
     {"Teams": [...], "Global": {...}}, and backfilling a stable `id`/`name`
     for any team that predates those fields (re-saved immediately so the
-    generated id doesn't change on the next load)."""
+    generated id doesn't change on the next load). A missing, unreadable or
+    empty file yields no teams (and is never written by a plain load)."""
     if not TEAM_JSON_PATH.is_file():
-        teams_file = _default_teams_file()
-        _save_teams_file(teams_file)
-        return teams_file
+        return _default_teams_file()
     try:
         with open(TEAM_JSON_PATH, encoding="utf-8") as fh:
             payload = json.load(fh)
@@ -1156,14 +1157,11 @@ def _load_teams_file() -> TeamsFile:
                     player["name"] = player.get("name") or ""
                     player["number"] = player.get("number") or ""
         teams_file = TeamsFile.model_validate(payload)
-        if not teams_file.Teams:
-            teams_file.Teams = [TeamData(name="Team 1")]
-            needs_resave = True
         if needs_resave:
             _save_teams_file(teams_file)
         return teams_file
     except (json.JSONDecodeError, OSError, ValueError) as exc:
-        log.warning("Failed to load team.json (%s) — using defaults", exc)
+        log.warning("Failed to load team.json (%s) — treating as no teams", exc)
         return _default_teams_file()
 
 
@@ -1188,10 +1186,16 @@ def _canonical_team_id(team_id: str) -> str:
     return team.id if team is not None else team_id
 
 
+def _has_teams() -> bool:
+    return bool(_load_teams_file().Teams)
+
+
 def _resolve_team(team_id: str) -> TeamData:
     """Resolve a team by id for use by the processing pipeline, falling back
     to the first team on disk if no id was given or it no longer exists."""
     teams_file = _load_teams_file()
+    if not teams_file.Teams:
+        raise HTTPException(status_code=409, detail="No team exists yet — create one on the Team page first.")
     if team_id:
         team = _find_team(teams_file, team_id)
         if team is not None:
@@ -2355,6 +2359,7 @@ def _static_url(path: str) -> str:
 
 templates.env.globals["static_url"] = _static_url
 templates.env.globals["has_active_album"] = _has_active_album
+templates.env.globals["has_teams"] = _has_teams
 
 PAGE_STEPS: tuple[str, ...] = ("team", "select-album", "culling", "faces", "album-tools")
 
@@ -2364,8 +2369,7 @@ def root() -> RedirectResponse:
     # Send first-time users straight to the Team page until at least one
     # team has been created — every other page (Select Album, Review, etc.)
     # assumes a team already exists.
-    teams_file = _load_teams_file()
-    if not teams_file.Teams:
+    if not _has_teams():
         return RedirectResponse(url="/team")
     return RedirectResponse(url="/select-album")
 
@@ -2383,14 +2387,21 @@ def _render_page(step: str, request: Request) -> HTMLResponse:
 
 for _step in PAGE_STEPS:
     def _make_route(step: str):
-        def _route(request: Request) -> HTMLResponse:
+        def _route(request: Request):
+            # Select Album needs a team (every import is tied to one), so
+            # first-time users are sent to the Team page to create one.
+            if step == "select-album" and not _has_teams():
+                return RedirectResponse(url="/team")
             return _render_page(step, request)
         return _route
     app.add_api_route(f"/{_step}", _make_route(_step), methods=["GET"], response_class=HTMLResponse)
 
 
 @app.get("/add-new-album")
-def add_new_album_page(request: Request) -> HTMLResponse:
+def add_new_album_page(request: Request):
+    # Importing needs a team to pick; send first-time users to create one.
+    if not _has_teams():
+        return RedirectResponse(url="/team")
     # Sub-page of "Select Album" (reached via the "+" polaroid card there),
     # not a numbered step of its own — highlight the "Select Album" step.
     return templates.TemplateResponse(request, "add-new-album.html", {"active_step": "select-album"})
@@ -2398,6 +2409,10 @@ def add_new_album_page(request: Request) -> HTMLResponse:
 
 @app.post("/api/team")
 def api_save_team(team: TeamData) -> dict:
+    # A nameless team would later be auto-named "Team N" on load; require one.
+    team.name = team.name.strip()
+    if not team.name:
+        raise HTTPException(status_code=400, detail="Team name is required.")
     saved = _save_team(team)
     return {"ok": True, "team": saved.model_dump()}
 
@@ -2645,6 +2660,8 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
     path = Path(req.path)
     if not path.is_dir():
         raise HTTPException(status_code=400, detail=f"Directory not found: {req.path}")
+    if not _has_teams():
+        raise HTTPException(status_code=409, detail="No team exists yet — create one on the Team page first.")
 
     if not processing_state.claim():
         raise HTTPException(status_code=409, detail="Processing is already running.")

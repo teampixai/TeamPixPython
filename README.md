@@ -51,7 +51,7 @@ The app walks through five pages (top nav):
 
 | Page | Purpose |
 |---|---|
-| **Team** | Create/edit a team: jersey colour(s), roster, optional OpenAI API key for LLM-assisted burst culling. You need at least one team before importing photos — the app takes you here automatically if none exists yet. |
+| **Team** | Create/edit a team: jersey colour(s), roster, optional OpenAI API key for LLM-assisted burst culling. You need at least one team before importing photos. None is created for you: on a first run the app opens this page (Select Album and Add Album redirect here, and Select Album stays disabled in the top nav) and you click **Add new team** to create your own. |
 | **Select Album** | Pick an existing album, or click **+** to import a new folder of photos: choose the team, blur sensitivity, whether to run face recognition, and optionally **Ignore jersey color** to score every person regardless of team colour (handy for practices/non-game shoots). This kicks off `1_prep_review.py` in the background. |
 | **Culling** | Review the scored photos (blurry/sharp/skipped), override any calls, and star-rate keepers. |
 | **Faces** | Tag detected face clusters with player names. |

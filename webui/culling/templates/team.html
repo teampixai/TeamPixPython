@@ -5,9 +5,11 @@
 
 <div class="panel">
   <h3>Teams</h3>
+  <p id="teamWelcome" class="muted" style="display:none">Welcome! Click <strong>Add new team</strong> to create your first team — you need one before you can import photos.</p>
   <div id="teamPicker" class="team-picker"></div>
 </div>
 
+<div id="teamEditor">
 <div class="panel">
   <h3>Team Name</h3>
   <input type="text" id="teamNameInput" placeholder="e.g. U10 Sharks" style="min-width:280px" />
@@ -57,6 +59,7 @@ Sam Rivera"></textarea>
 <div class="row actions">
   <span id="teamSaveStatus" class="muted"></span>
   <button id="saveTeamBtn" class="btn btn-primary">Save</button>
+</div>
 </div>
 {% endblock %}
 {% block extra_scripts %}

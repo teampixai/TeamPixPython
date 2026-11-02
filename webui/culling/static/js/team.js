@@ -6,12 +6,30 @@
 
 let teams = [];
 let selectedTeamId = null; // null => creating a brand-new (unsaved) team
+// With no saved team the editor stays hidden until the user clicks "Add new
+// team", so the first team is created the same way as every later one.
+let creatingTeam = false;
 
 function blankTeam() {
   return { id: "", name: "", jerseyColors: [], players: [], openaiApiKey: "" };
 }
 
 let Team = blankTeam();
+
+function updateEditorVisibility() {
+  const showEditor = teams.length > 0 || creatingTeam;
+  $("#teamEditor").toggle(showEditor);
+  $("#teamWelcome").toggle(!showEditor);
+}
+
+// Select Album is disabled in the (server-rendered) nav until a team exists;
+// enable it as soon as the first team is saved, without needing a reload.
+function enableSelectAlbumStep() {
+  $("#steps a.step[data-step='select-album']")
+    .removeClass("disabled")
+    .attr("href", "/select-album")
+    .removeAttr("aria-disabled tabindex title");
+}
 
 function renderJerseyList() {
   const list = $("#jerseyList").empty();
@@ -61,6 +79,7 @@ function renderPicker() {
       renderPicker();
     },
     onAddNew: () => {
+      creatingTeam = true;
       selectedTeamId = null;
       Team = blankTeam();
       $("#teamSaveStatus").text("");
@@ -69,6 +88,7 @@ function renderPicker() {
     },
     addLabel: "Add new team",
   });
+  updateEditorVisibility();
 }
 
 async function loadTeams() {
@@ -88,6 +108,11 @@ async function loadTeams() {
 async function saveTeam() {
   Team.name = $("#teamNameInput").val().trim();
   Team.openaiApiKey = $("#openaiKeyInput").val();
+  if (!Team.name) {
+    $("#teamSaveStatus").text("Please enter a team name.");
+    $("#teamNameInput").trigger("focus");
+    return;
+  }
   $("#saveTeamBtn").prop("disabled", true);
   $("#teamSaveStatus").text("Saving…");
   try {
@@ -96,6 +121,7 @@ async function saveTeam() {
     selectedTeamId = Team.id;
     const idx = teams.findIndex((t) => t.id === Team.id);
     if (idx >= 0) teams[idx] = Team; else teams.push(Team);
+    enableSelectAlbumStep();
     renderForm();
     renderPicker();
     $("#teamSaveStatus").text("Saved.");
