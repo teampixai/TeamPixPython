@@ -1,10 +1,13 @@
 # BlurPictureDetector – Python dependencies
 #
 # Install order matters: install PyTorch with CUDA first (see README below),
-# then install the packages listed here.
+# then install the packages listed here. facenet-pytorch (below) requires
+# torch<2.3 / torchvision<0.18, and CUDA 12 builds of torch 2.2.2 are only
+# published on the cu121 index, so install exactly these versions first --
+# otherwise installing this file replaces a newer CUDA torch with a CPU one.
 #
 # Quick-start (CUDA 12.x):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
 #   pip install -r requirements.txt
 
 rawpy>=0.18.0

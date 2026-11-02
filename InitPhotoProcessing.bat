@@ -40,14 +40,17 @@ setlocal EnableDelayedExpansion
 ::   3. Pins setuptools<81 right away so pkg_resources stays available for
 ::      face_recognition_models - done before the much slower steps below so
 ::      a broken pip environment is caught fast.
-::   4. Detects an NVIDIA GPU/driver (nvidia-smi) to pick CUDA vs CPU builds.
+::   4. Detects an NVIDIA GPU/driver (nvidia-smi, driver >= 528 for CUDA 12) to
+::      pick CUDA vs CPU builds.
 ::   5. Downloads the latest BlurPictureDetector source as a GitHub ZIP archive
 ::      (no git required) and updates the local app folder in place (existing
 ::      albums\ and other local-only data are never deleted).
 ::   6. Installs dlib via conda-forge (prebuilt binary - no C++ compiler /
 ::      CMake needed) - GPU build + cudnn when an NVIDIA GPU was detected,
 ::      otherwise the CPU build.
-::   7. Installs CUDA-enabled or CPU-only PyTorch.
+::   7. Installs PyTorch 2.2.2 (CUDA 12.1 build or CPU-only; pinned because
+::      facenet-pytorch requires torch<2.3), then checks afterwards that
+::      PyTorch and dlib can really use the GPU (warns if not).
 ::   8. Installs the rest of requirements.txt via pip.
 ::   9. Installs face_recognition_models straight from source (PyPI releases
 ::      of it are unreliable) via a GitHub ZIP archive URL (no git required).
@@ -90,6 +93,14 @@ set "REPO_NAME=BlurPictureDetector"
 set "REPO_BRANCH=main"
 set "ENV_NAME=blurpicturedetector"
 set "PYTHON_VERSION=3.12"
+:: PyTorch versions are pinned because requirements.txt's facenet-pytorch
+:: requires torch<2.3 / torchvision<0.18; installing a newer (e.g. CUDA)
+:: torch first would just get replaced by a CPU-only 2.2.x when
+:: requirements.txt is installed. The newest CUDA 12 index that publishes
+:: torch 2.2.2 wheels is cu121, which needs an NVIDIA driver >= 528 on Windows.
+set "TORCH_SPEC=torch==2.2.2 torchvision==0.17.2"
+set "TORCH_CUDA_TAG=cu121"
+set "MIN_CUDA_DRIVER=528"
 
 set "INSTALL_ROOT=%CD%"
 set "ACCEPT_LICENSE=0"
@@ -338,15 +349,31 @@ if errorlevel 1 goto :fail
 :: [4/11] Detect CUDA / NVIDIA GPU
 :: ----------------------------------------------------------------------------
 echo [4/11] Detecting NVIDIA GPU / CUDA driver...
+set "HAS_NVIDIA_GPU=0"
+set "TORCH_INDEX="
+set "NV_DRIVER="
 where nvidia-smi >nul 2>nul
 if not errorlevel 1 (
-    echo       NVIDIA driver found - will install CUDA-enabled PyTorch ^(cu126^) and GPU-accelerated dlib.
-    set "TORCH_INDEX=--index-url https://download.pytorch.org/whl/cu126"
-    set "HAS_NVIDIA_GPU=1"
+    for /f "usebackq delims=" %%D in (`nvidia-smi "--query-gpu=driver_version" "--format=csv,noheader" 2^>nul`) do if not defined NV_DRIVER set "NV_DRIVER=%%D"
+)
+:: A broken driver makes nvidia-smi print an error sentence instead of a version.
+if defined NV_DRIVER (
+    echo !NV_DRIVER!| findstr /r /c:"^[0-9][0-9]*\.[0-9]" >nul
+    if errorlevel 1 set "NV_DRIVER="
+)
+if defined NV_DRIVER (
+    set "NV_MAJOR=0"
+    for /f "tokens=1 delims=." %%M in ("!NV_DRIVER!") do set /a "NV_MAJOR=%%M" 2>nul
+    if !NV_MAJOR! GEQ %MIN_CUDA_DRIVER% (
+        echo       NVIDIA driver !NV_DRIVER! found - will install CUDA-enabled PyTorch ^(%TORCH_CUDA_TAG%^) and GPU-accelerated dlib.
+        set "TORCH_INDEX=--index-url https://download.pytorch.org/whl/%TORCH_CUDA_TAG%"
+        set "HAS_NVIDIA_GPU=1"
+    ) else (
+        echo       NVIDIA driver !NV_DRIVER! found but it is older than %MIN_CUDA_DRIVER% ^(needed for CUDA 12^) - installing CPU-only
+        echo       PyTorch and dlib. Update the NVIDIA driver and re-run this script to enable the GPU.
+    )
 ) else (
-    echo       No NVIDIA driver detected - will install CPU-only PyTorch and dlib.
-    set "TORCH_INDEX="
-    set "HAS_NVIDIA_GPU=0"
+    echo       No working NVIDIA driver detected - will install CPU-only PyTorch and dlib.
 )
 
 :: ----------------------------------------------------------------------------
@@ -428,10 +455,10 @@ if "%HAS_NVIDIA_GPU%"=="1" (
 :: ----------------------------------------------------------------------------
 :: [7/11] PyTorch
 :: ----------------------------------------------------------------------------
-echo [7/11] Installing PyTorch...
+echo [7/11] Installing PyTorch ^(%TORCH_SPEC%^)...
 "%ENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 goto :fail
-"%ENV_PY%" -m pip install torch torchvision !TORCH_INDEX!
+"%ENV_PY%" -m pip install %TORCH_SPEC% !TORCH_INDEX!
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
@@ -477,6 +504,25 @@ echo       Verifying face_recognition_models imports correctly...
 if errorlevel 1 (
     echo ERROR: face_recognition_models installed but failed to import.
     goto :fail
+)
+
+:: Make sure the GPU path really ended up with a CUDA-enabled PyTorch (a later
+:: pip install can silently swap it for a CPU build) and a CUDA-enabled dlib.
+:: Warnings only - e.g. a driver that needs a reboot shouldn't fail the setup.
+if "%HAS_NVIDIA_GPU%"=="1" (
+    echo       Verifying GPU support...
+    "%ENV_PY%" -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
+    if errorlevel 1 (
+        echo       WARNING: PyTorch cannot use the NVIDIA GPU ^(CPU-only build or driver problem^) - the app will run on the CPU.
+    ) else (
+        echo       PyTorch CUDA: OK
+    )
+    "%ENV_PY%" -c "import sys, dlib; sys.exit(0 if dlib.DLIB_USE_CUDA else 1)" >nul 2>nul
+    if errorlevel 1 (
+        echo       WARNING: dlib is the CPU build - face recognition will run on the CPU.
+    ) else (
+        echo       dlib CUDA: OK
+    )
 )
 
 :: ----------------------------------------------------------------------------

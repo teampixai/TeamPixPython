@@ -304,8 +304,9 @@ Run it whenever the face DB changes meaningfully (new people, new photos) rather
 ### Setup
 
 ```bash
-# 1. Install PyTorch — CUDA 12.x example:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# 1. Install PyTorch — CUDA 12.x example (torch 2.2.x is required by facenet-pytorch,
+#    and cu121 is the newest CUDA 12 index that has it):
+pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
 
 # 2. Install remaining dependencies:
 pip install -r requirements.txt
