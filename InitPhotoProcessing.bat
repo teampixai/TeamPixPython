@@ -73,6 +73,18 @@ setlocal EnableDelayedExpansion
 ::                   is recommended (Miniconda advises against spaces).
 :: ============================================================================
 
+:: Clear settings inherited from the user's environment - e.g. a system-wide
+:: Anaconda activated via `conda init` / cmd AutoRun, a PYTHONPATH pointing at
+:: another Python's packages, or pip/conda options that redirect installs
+:: (PIP_INDEX_URL, PIP_EXTRA_INDEX_URL, CONDA_CHANNELS, CONDA_SUBDIR, ...).
+:: Every CONDA_*/_CE_*/PIP_* variable is dropped; the ones we need are set
+:: further down. Must stay before this script sets any CONDA_* variable of
+:: its own (e.g. CONDA_DIR), or those would be wiped too.
+for %%P in (CONDA_ _CE_ PIP_) do (
+    for /f "delims==" %%V in ('set %%P 2^>nul') do set "%%V="
+)
+for %%V in (VIRTUAL_ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE) do set "%%V="
+
 set "REPO_OWNER=asingc"
 set "REPO_NAME=BlurPictureDetector"
 set "REPO_BRANCH=main"
@@ -119,15 +131,16 @@ set "ENV_MARKER=%ENV_DIR%\.bpd-private-conda"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
 :: ----------------------------------------------------------------------------
-:: Isolate this script from any other Python / conda / pip on the machine.
+:: Isolate this script from any other Python / conda / pip on the machine
+:: (inherited variables were already cleared at the top of this script).
 :: ----------------------------------------------------------------------------
-:: Clear settings inherited from the user's environment - e.g. a system-wide
-:: Anaconda activated via `conda init` / cmd AutoRun, a PYTHONPATH pointing at
-:: another Python's packages, or pip options that redirect installs.
-for %%V in (CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL CONDA_EXE CONDA_PYTHON_EXE CONDA_PROMPT_MODIFIER _CE_CONDA _CE_M VIRTUAL_ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE PIP_USER PIP_TARGET PIP_PREFIX PIP_REQUIRE_VIRTUALENV) do set "%%V="
 :: Ignore the per-user site-packages folder and every pip.ini/pip.conf.
 set "PYTHONNOUSERSITE=1"
 set "PIP_CONFIG_FILE=NUL"
+:: Point conda at the private Miniconda so nothing it spawns (post-link
+:: scripts, `conda` called by name) can resolve to a system-wide conda.
+set "CONDA_EXE=%CONDA_DIR%\Scripts\conda.exe"
+set "CONDA_PYTHON_EXE=%CONDA_DIR%\python.exe"
 :: Keep conda's config, package cache, and env list inside the install root.
 :: Conda still also reads a user-level %USERPROFILE%\.condarc, so every conda
 :: install below passes --override-channels with explicit channels.
