@@ -418,7 +418,6 @@ $(function () {
         if (res.demoted) parts.push(`${res.demoted} moved to Blur`);
         if (res.teamColor) parts.push(`team colour ${res.teamColor}`);
         if (res.teammates) parts.push(`${res.teammates} teammate(s) (+${res.teammatesAdded} / −${res.teammatesRemoved})`);
-        if (res.previewsRegenFailed) parts.push(`${res.previewsRegenFailed} preview(s) could not be refreshed (source photo unreadable)`);
         $("#regradeStatus").text(
           parts.length
             ? `Regraded ${res.imagesConsidered} image(s) — ${parts.join(", ")}.`

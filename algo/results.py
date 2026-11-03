@@ -60,7 +60,7 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
                 "key": key,
                 "status": "skipped",
                 "auto_adjustment": auto_adj_entry,
-                "preview_path": f"previews/{frame.key_stem}.jpg",
+                "preview_path": f"previews/{key}.jpg",
             }
         else:
             overall_blurry = not frame.is_sharp()
@@ -75,7 +75,7 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
                 "laplacian_variance": round(best.lap_var, 2),
                 "tenengrad_score":    round(best.ten, 2),
                 "auto_adjustment":    auto_adj_entry,
-                "preview_path":       f"previews/{frame.key_stem}.jpg",
+                "preview_path":       f"previews/{key}.jpg",
                 "annotation_data": {
                     "processing_shape": [frame.img_h, frame.img_w],
                     "overall_blurry":   overall_blurry,

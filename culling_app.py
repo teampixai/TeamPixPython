@@ -53,7 +53,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
-from algo.album import ALBUM_JSON_NAME, EDITEDIMAGES_SUBDIR, album_for
+from algo.stages.annotation import invalidate_previews, render_album_preview
+from algo.album import ALBUM_JSON_NAME, EDITEDIMAGES_SUBDIR, AlbumImage, PersonRecord, album_for
 from algo.album_info import CATEGORIES as CULLING_CATEGORIES
 from algo.album_info import INFO_JSON_NAME, AlbumInfo
 from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, render_player_videos, summarize_bursts
@@ -1067,8 +1068,7 @@ def _regrade_result(summary) -> dict:
         "starsRebaselined": summary.stars_rebaselined,
         "jerseyRechecked": summary.jersey_rechecked,
         "jerseyRecheckUnreadable": summary.jersey_recheck_unreadable,
-        "previewsRegenerated": summary.previews_regenerated,
-        "previewsRegenFailed": summary.previews_regen_failed,
+        "previewsInvalidated": summary.previews_invalidated,
         "teammates": summary.teammates,
         "teammatesAdded": summary.teammates_added,
         "teammatesRemoved": summary.teammates_removed,
@@ -1799,6 +1799,181 @@ class ClusterOperation(BaseModel):
     name: Optional[str] = None
 
 
+# --------------------------------------------------------------------------- #
+# On-demand annotated previews
+#
+# An album's annotated previews (boxes, scores, names) are a cache rendered
+# the first time one is requested -- not pre-generated at import. Rendering
+# goes through algo/stages/annotation.py::render_album_preview, the same code
+# that has always drawn them, fed from the Album's persisted per-person data
+# plus the CURRENT face-recognition names. Deleting a cached file (see
+# _invalidate_cached_previews) is all it takes to have it redrawn.
+# --------------------------------------------------------------------------- #
+
+# Decoding + drawing one full-size photo costs tens of MB and real CPU, and
+# the browser asks for many previews/thumbnails at once (the culling nav strip,
+# the album cards), so only a few may render concurrently.
+_PREVIEW_RENDER_SLOTS = threading.BoundedSemaphore(max(1, min(4, os.cpu_count() or 2)))
+# One lock per preview file (striped), so concurrent requests for the SAME
+# photo render it once, and an invalidation can't be overwritten by a render
+# that started before it.
+_PREVIEW_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def _preview_lock(preview: Path) -> threading.Lock:
+    return _PREVIEW_LOCKS[hash(str(preview)) % len(_PREVIEW_LOCKS)]
+
+
+def _warm_preview_renderer() -> None:
+    """Import, in the background at startup, the image reader previews are
+    decoded with. It pulls in the whole detection stack (several seconds), and
+    the first preview request shouldn't be the one that pays for it."""
+    try:
+        import algo.stages.image_analysis  # noqa: F401
+    except Exception as exc:  # noqa: BLE001 -- only an optimisation
+        log.debug("Preview renderer warm-up skipped: %s", exc)
+
+
+# album dir -> (signature of its named clusters' face.json files, name index)
+_face_name_index_cache: dict[str, tuple[tuple, dict[str, list[tuple[dict, str]]]]] = {}
+_face_name_index_lock = threading.Lock()
+
+
+def _face_name_index(album_path: Path) -> dict[str, list[tuple[dict, str]]]:
+    """``{photo key: [(body_bbox wire dict, player name), ...]}`` for every face
+    the album's face recognition has put in a NAMED cluster -- automatic
+    database matches and hand-assigned names alike. Unnamed (numeric) clusters
+    contribute nothing.
+
+    Rebuilt only when a named cluster's face.json changes (compared by
+    mtime+size), so rendering many previews doesn't re-read every cluster."""
+    fr = _facereco_dir(album_path)
+    if fr is None:
+        return {}
+
+    clusters: list[tuple[Path, tuple]] = []
+    for child in sorted(fr.iterdir()):
+        if not child.is_dir() or child.name.startswith(".") or _is_pending_cluster(child.name):
+            continue
+        try:
+            stat = (child / "face.json").stat()
+        except OSError:
+            continue
+        clusters.append((child, (child.name, stat.st_mtime_ns, stat.st_size)))
+    signature = tuple(sig for _child, sig in clusters)
+
+    cache_key = str(album_path)
+    with _face_name_index_lock:
+        cached = _face_name_index_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+    index: dict[str, list[tuple[dict, str]]] = {}
+    for child, _sig in clusters:
+        payload = _load_face_json(child)
+        name = (payload.get("name") or child.name).strip()
+        if not name:
+            continue
+        for face in payload.get("faces", []):
+            origin = face.get("origFilename")
+            body_bbox = (face.get("Body") or {}).get("body_bbox")
+            if origin and body_bbox:
+                index.setdefault(origin, []).append((body_bbox, name))
+
+    with _face_name_index_lock:
+        _face_name_index_cache[cache_key] = (signature, index)
+    return index
+
+
+def _player_name_resolver(album_path: Path, image: AlbumImage):
+    """A ``PersonRecord -> name`` lookup for *image*: the name of the
+    face-recognition cluster holding that person's face, "" if none."""
+    faces = _face_name_index(album_path).get(image.key, [])
+
+    def resolve(record: PersonRecord) -> str:
+        bbox = record.body_bbox
+        if bbox is None:
+            return ""
+        wire = bbox.to_wire()
+        return next((name for body_bbox, name in faces if _boxes_match(body_bbox, wire)), "")
+
+    return resolve
+
+
+def _ensure_preview(image: Optional[AlbumImage]) -> Optional[Path]:
+    """The annotated preview file for *image*, rendering and caching it first
+    if it doesn't exist yet. None if the photo is unknown or can't be rendered
+    (its source file is gone or unreadable)."""
+    if image is None:
+        return None
+    preview = image.preview_path
+    if preview is None:
+        return None
+    if preview.is_file():
+        return preview
+
+    album_path = image.album.path
+    with _preview_lock(preview):
+        if preview.is_file():  # another request rendered it while we waited
+            return preview
+        with _PREVIEW_RENDER_SLOTS:
+            try:
+                rendered = render_album_preview(
+                    image, player_name_for=_player_name_resolver(album_path, image),
+                )
+            except Exception:  # noqa: BLE001 -- one bad photo mustn't 500 the whole page
+                log.exception("Could not render the preview for %s", image.key)
+                return None
+    return preview if rendered and preview.is_file() else None
+
+
+def _ensure_thumbnail(image: Optional[AlbumImage]) -> Optional[Path]:
+    """The nav-strip thumbnail for *image*, generating it first if it doesn't
+    exist. A thumbnail already on disk -- written at import, or an older
+    album's own -- is served as is. A missing one is made straight from the
+    source photo, never by rendering the annotated preview. Only when the
+    source is gone does a cached preview serve as the last resort. None if the
+    photo is unknown or no thumbnail can be produced."""
+    if image is None:
+        return None
+    existing = image.existing_thumbnail()
+    if existing is not None:
+        return existing
+
+    thumbnail = image.thumbnail_path
+    # Lazy, like the preview reader: it pulls in the detection stack.
+    from algo.stages.image_analysis import render_album_thumbnail
+
+    with _preview_lock(thumbnail):
+        if thumbnail.is_file():  # another request made it while we waited
+            return thumbnail
+        with _PREVIEW_RENDER_SLOTS:
+            try:
+                made = render_album_thumbnail(image)
+            except Exception:  # noqa: BLE001 -- one bad photo mustn't 500 the whole strip
+                log.exception("Could not generate the thumbnail for %s", image.key)
+                made = False
+    if made and thumbnail.is_file():
+        return thumbnail
+    return image.ensure_thumbnail()
+
+
+def _invalidate_cached_previews(album_path: Path, keys) -> int:
+    """Delete the cached previews of the photos *keys*, so the next request
+    re-renders them from current data. Returns the file count. Thumbnails
+    are kept: they show the plain photo, which these changes don't affect."""
+    album = album_for(album_path)
+    removed = 0
+    for key in sorted(set(keys)):
+        image = album.image(key)
+        preview = image.preview_path if image else None
+        if image is None or preview is None:
+            continue
+        with _preview_lock(preview):
+            removed += invalidate_previews(album_path, [image.preview_stem])
+    return removed
+
+
 class FacesCommitRequest(BaseModel):
     operations: list[ClusterOperation]
 
@@ -1886,12 +2061,15 @@ def _boxes_match(a: Optional[dict], b: Optional[dict]) -> bool:
     )
 
 
-def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
+def _update_results_json(album_path: Path, assignments: list[dict], cleared: Optional[list[dict]] = None) -> None:
     """Write player_name / player_number onto matching Album bodies.
 
     ``assignments`` is a list of {origFilename, body_bbox, name, playernum}.
+    ``cleared`` lists {origFilename, body_bbox} of faces the user removed from
+    a cluster: those people lose any name a previous assignment gave them.
     """
-    if not assignments:
+    cleared = cleared or []
+    if not assignments and not cleared:
         return
     album = album_for(album_path)
     if not album.exists:
@@ -1905,6 +2083,14 @@ def _update_results_json(album_path: Path, assignments: list[dict]) -> None:
         by_name.setdefault(image.key, []).append(image)
 
     changed = False
+    for a in cleared:
+        for image in by_name.get(a["origFilename"], []):
+            for body in image.bodies:
+                bbox = body.body_bbox
+                if bbox and _boxes_match(bbox.to_wire(), a["body_bbox"]) and (body.player_name or body.player_number):
+                    body.player_name = ""
+                    body.player_number = ""
+                    changed = True
     for a in assignments:
         for image in by_name.get(a["origFilename"], []):
             for body in image.bodies:
@@ -1935,6 +2121,11 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
     # second assignment to the same name reuses it.
     target_dirs: dict[str, Path] = {}
     results_updates: list[dict] = []
+    results_cleared: list[dict] = []
+    # Photos whose face-recognition result the user just confirmed (a name
+    # assigned, or a face rejected): their cached previews show the old
+    # result, so they are dropped and re-rendered on next view.
+    touched_keys: set[str] = set()
 
     # Process deletions first, then assignments.
     ops = sorted(req.operations, key=lambda o: 0 if o.type == "delete" else 1)
@@ -1957,6 +2148,11 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
                     "file": entry.get("origFilename", ""),
                     "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
                 })
+                results_cleared.append({
+                    "origFilename": entry.get("origFilename", ""),
+                    "body_bbox": (entry.get("Body") or {}).get("body_bbox"),
+                })
+                touched_keys.add(entry.get("origFilename", ""))
             continue
 
         if op.type == "assign":
@@ -1992,6 +2188,7 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
                     "name": name,
                     "playernum": dst_payload.get("playernum"),
                 })
+                touched_keys.add(entry.get("origFilename", ""))
 
     # Rewrite every touched face.json.
     for cluster_dir, payload in payloads.items():
@@ -2007,7 +2204,10 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
         ):
             shutil.rmtree(cluster_dir, ignore_errors=True)
 
-    _update_results_json(album_path, results_updates)
+    _update_results_json(album_path, results_updates, results_cleared)
+    # After the cluster files and album are written, so a preview re-rendered
+    # from here on sees the confirmed names.
+    _invalidate_cached_previews(album_path, touched_keys - {""})
 
     return {"ok": True, "clusters": _build_clusters(album_path)}
 
@@ -2456,11 +2656,11 @@ def api_select_album(req: AlbumSelectRequest) -> dict:
 @app.get("/api/albums/thumb")
 def api_album_thumb(id: str = Query(...), file: str = Query(...)) -> FileResponse:
     """Annotated preview of one photo in *any* album (not just the current
-    one) — the rotating sample images on the album-picker cards."""
+    one) — the rotating sample images on the album-picker cards. Rendered on
+    first request, then served from the album's preview cache."""
     album_path = _album_dir_by_id(id)
-    image = album_for(album_path).image(file)
-    fp = image.preview_path if image else None
-    if fp is None or not fp.is_file():
+    fp = _ensure_preview(album_for(album_path).image(file))
+    if fp is None:
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(fp)
 
@@ -2524,10 +2724,12 @@ def api_culling_data(stars: str = Query(...), sort: str = Query("size")) -> dict
 
 @app.get("/api/culling/thumb/{file:path}")
 def api_culling_thumb(file: str) -> FileResponse:
-    """Small square thumbnail of *file*'s annotated preview, for the culling
-    page's nav strip."""
-    image = album_for(_current_album_path()).image(file)
-    thumb_fp = image.ensure_thumbnail() if image else None
+    """Small square thumbnail of *file*, for the culling page's nav strip.
+
+    Served from the thumbnail written at import (or an older album's own),
+    and generated from the source photo if it is missing -- never by
+    rendering the annotated preview (see `_ensure_thumbnail`)."""
+    thumb_fp = _ensure_thumbnail(album_for(_current_album_path()).image(file))
     if thumb_fp is None:
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(thumb_fp)
@@ -2537,10 +2739,10 @@ def api_culling_thumb(file: str) -> FileResponse:
 def api_anno_img(file: str) -> FileResponse:
     """Full-resolution annotated preview image — shared by the culling page's
     main pane (toggle-able against /api/original) and any other consumer
-    that wants the annotated (not cropped/resized) version of a photo."""
-    image = album_for(_current_album_path()).image(file)
-    fp = image.preview_path if image else None
-    if fp is None or not fp.is_file():
+    that wants the annotated (not cropped/resized) version of a photo.
+    Rendered on first request, then served from the album's preview cache."""
+    fp = _ensure_preview(album_for(_current_album_path()).image(file))
+    if fp is None:
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(fp)
 
@@ -3364,6 +3566,8 @@ def main() -> None:
         threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
     else:
         log.info("Heartbeat watchdog disabled")
+
+    threading.Thread(target=_warm_preview_renderer, daemon=True).start()
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

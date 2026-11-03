@@ -70,15 +70,13 @@ statuses_before = {r["key"]: r["status"] for r in snapshot["results"]}
 summary = regrade_sensitivity(ALBUM, 0.95)
 print(f"      regrade: considered={summary.images_considered} recovered={summary.recovered} "
       f"demoted={summary.demoted} rebaselined={summary.stars_rebaselined} "
-      f"previews={summary.previews_regenerated}/{summary.previews_regen_failed}")
+      f"previews invalidated={summary.previews_invalidated}")
 
 after = Album(ALBUM)
 statuses_after = {i.key: i.status for i in after.image_list}
 check("regrade considered the graded photos", summary.images_considered > 0)
 check("a strict threshold demotes at least one photo", summary.demoted > 0,
       f"{statuses_before} -> {statuses_after}")
-check("regrade regenerated previews", summary.previews_regen_failed == 0,
-      f"{summary.previews_regenerated} regenerated")
 check("regrade persisted the new threshold", after.run_settings.get("sensitivity") == "0.95")
 check("regrade left the hand-rated photo alone",
       after.image(target.key).stars == 4 and after.image(target.key).keep is False,

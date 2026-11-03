@@ -18,8 +18,8 @@ How it works:
     5. Images whose sharpness_score falls below the sensitivity threshold are
        flagged, given a 1-star rating, and logged in blurry.csv and blur.lst.
        Files are NOT moved — their paths are recorded instead.
-    6. A copy of every processed image is saved to
-       <image_dir>/annotated/ with the subject bounding box drawn (style via app_config).
+    6. Annotated previews (subject boxes, scores, player names) are NOT written
+       here: the web app renders each one on demand, the first time it is shown.
 
 If no person is detected in an image the file is left untouched and skipped.
 """
@@ -46,7 +46,7 @@ from algo.image_cache import ImageCache
 from algo.results import baseline_stars, build_result_entries
 from algo.stage import ProcessStage
 from algo.thresholds import RUN_SETTINGS_KEY as EXTENDED_OFFSET_KEY, ExtendedThreshold
-from algo.stages.annotation import AnnotationStage
+from algo.stages.annotation import invalidate_previews
 from algo.stages.auto_adjust import AutoAdjustStage
 from algo.stages.face_reco import FaceRecoStage
 from algo.stages.grading import GradingStage
@@ -54,7 +54,7 @@ from algo.stages.image_analysis import ImageAnalysisStage, MediaPipeImageAnalysi
 from algo.stages.jersey_counting import JerseyCountingStage
 from algo.stages.llm_culling import LLMCullingStage
 from algo.llm.culling_provider import DEFAULT_OPENAI_MODEL
-from algo.utils import make_unique_import_key
+from algo.imagefiles import images_to_import
 
 from ultralytics import YOLO
 
@@ -488,7 +488,7 @@ def main() -> None:
         "--output",
         default=None,
         help=(
-            "Root directory for all output files (previews/, blurry.csv, "
+            "Root directory for all output files (album.json, blurry.csv, "
             "blur.lst, run.log).  "
             "Defaults to albums/<timestamp>-<input_name>/."
         ),
@@ -513,7 +513,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Skip face recognition clustering. By default, .FaceReco/ is generated "
-            "under the output directory after preview generation completes. "
+            "under the output directory after the photos are scored. "
             "Use this flag to disable it (e.g. if dlib is not installed)."
         ),
     )
@@ -677,7 +677,7 @@ def main() -> None:
         "--rerun-facereco-only",
         action="store_true",
         help=(
-            "Skip image analysis/grading/annotation/LLM-culling entirely and "
+            "Skip image analysis/grading/LLM-culling entirely and "
             "just re-run face recognition clustering against an existing "
             "album's already-written Album (requires --output pointing "
             "at that album; no positional path needed). Re-run reclusters "
@@ -701,8 +701,9 @@ def main() -> None:
         action="store_true",
         help=(
             "Deep regrade: re-run the FULL analysis pipeline (person/pose "
-            "detection, face detection, sharpness scoring, jersey re-poll, "
-            "preview regeneration) over an existing album's already-imported "
+            "detection, face detection, sharpness scoring, jersey re-poll; "
+            "cached previews of the re-analysed photos are dropped and "
+            "re-rendered on demand) over an existing album's already-imported "
             "source photos at the --sensitivity threshold given, without "
             "importing anything new (requires --output pointing at that "
             "album; no positional path needed). Star ratings, keep flags and "
@@ -749,7 +750,6 @@ def main() -> None:
     existing_entries: list[dict] = []
     run_settings: dict = {}
     already_imported: frozenset[Path] = frozenset()
-    used_keys: dict[str, Path] = {}
 
     if merge_mode:
         existing_entries = list(merge_album.results)
@@ -871,6 +871,8 @@ def main() -> None:
             engine=run_settings.get("engine", args.engine),
             sensitivity_threshold=sensitivity_threshold,
         ).process([], app_config)
+        # Clusters (and so names) may have changed for any photo.
+        invalidate_previews(output_dir)
         log.info("Face detection re-run complete.")
         return
 
@@ -880,7 +882,6 @@ def main() -> None:
     # stages an import uses -- only the input file list and the final merge
     # differ.
     regrade_paths: list[Path] | None = None
-    regrade_keys: dict[Path, str] = {}
     if args.regrade_only:
         if not merge_mode:
             log.error("--regrade-only requires an existing Album under --output: %s", output_dir)
@@ -896,7 +897,6 @@ def main() -> None:
                 missing += 1
                 continue
             regrade_paths.append(path)
-            regrade_keys[path.resolve()] = e.get("key") or path.name
         log.info("Deep regrade: re-analysing %d image(s) at sensitivity=%s (threshold=%.2f)%s",
                  len(regrade_paths), args.sensitivity, sensitivity_threshold,
                  f" — {missing} source file(s) missing, skipped" if missing else "")
@@ -931,9 +931,19 @@ def main() -> None:
     # the album states which offset its is_teammate flags were produced with.
     extended_threshold = ExtendedThreshold.for_album(sensitivity_threshold, run_settings_out)
     run_settings_out.setdefault(EXTENDED_OFFSET_KEY, extended_threshold.offset)
+    # The photos this run imports, enumerated once up front, and their album
+    # entries -- each with its bookkeeping key (algo/utils.py::
+    # make_unique_import_key) -- created BEFORE analysis, so the analysis
+    # stage knows every photo's key, and so its thumbnail path, the moment
+    # it decodes it. A deep regrade re-analyses the target album's own
+    # entries, which already have keys.
+    import_paths = None if args.regrade_only else images_to_import(input_path, exclude=already_imported)
     working_album = None if args.regrade_only else Album.create(
-        working_dir, team_id=team_id, run_settings=run_settings_out, import_status="in_progress",
+        working_dir, team_id=team_id, paths=import_paths,
+        run_settings=run_settings_out, import_status="in_progress",
     )
+    analysis_album = merge_album if args.regrade_only else working_album
+    analysis_paths = regrade_paths if args.regrade_only else import_paths
 
     log.info("Loading models … (engine=%s)", args.engine)
     # Per-run scratch store for the pixel regions later stages need, so the
@@ -941,9 +951,6 @@ def main() -> None:
     # album in memory (see algo/image_cache.py). Removed at the end of the run.
     image_cache = ImageCache(working_dir)
     cache_face_originals = not args.skip_facereco and not args.regrade_only
-    # A deep regrade re-analyses an explicit file list and must NOT skip
-    # already-imported paths (those ARE the files it exists to reprocess).
-    analysis_skip = frozenset() if args.regrade_only else already_imported
     if args.engine == "yolo":
         pose_model = YOLO("yolov8n-pose.pt")
         face_model = YOLO(_ensure_face_model())
@@ -952,7 +959,7 @@ def main() -> None:
             face_model.to("cpu")
         analysis_stage: ProcessStage = ImageAnalysisStage(
             input_path, pose_model, face_model,
-            skip_paths=analysis_skip, only_paths=regrade_paths,
+            only_paths=analysis_paths, album=analysis_album,
             cache=image_cache, cache_face_originals=cache_face_originals,
         )
     else:
@@ -963,7 +970,7 @@ def main() -> None:
         face_landmarker = load_face_landmarker(num_faces=1)
         analysis_stage = MediaPipeImageAnalysisStage(
             input_path, person_detector, pose_landmarker, face_landmarker,
-            skip_paths=analysis_skip, only_paths=regrade_paths,
+            only_paths=analysis_paths, album=analysis_album,
             cache=image_cache, cache_face_originals=cache_face_originals,
         )
 
@@ -973,18 +980,8 @@ def main() -> None:
     # the target -- still finds the target's own .FaceReco via ancestry walk.
     face_db_dir = None if args.regrade_only else _resolve_face_db_dir(args.face_db, working_dir, input_path, team_id)
 
-    # Run image analysis first (on its own) so each newly-discovered frame
-    # can be assigned its disambiguated bookkeeping key -- see
-    # algo/utils.py::make_unique_import_key -- before AnnotationStage (later
-    # in the pipeline) uses that key to name preview files.
+    # Each frame comes back keyed (and thumbnailed) from its album entry.
     frames: list[Frame] = analysis_stage.process([], app_config)
-    for frame in frames:
-        # A regraded frame keeps the key it was assigned at import time, so
-        # its preview/FaceReco/review bookkeeping all stays addressable.
-        frame.output_key = (
-            regrade_keys.get(frame.path.resolve(), frame.path.name) if args.regrade_only
-            else make_unique_import_key(frame.path.name, used_keys, frame.path.resolve())
-        )
 
     jersey_stage = JerseyCountingStage(
         forced_colors, regular_colors, no_team=args.noteam,
@@ -996,7 +993,8 @@ def main() -> None:
     ]
     if args.autoadjust:
         stages.append(AutoAdjustStage())
-    stages.append(AnnotationStage(working_dir))
+    # No annotation stage: previews are rendered on demand, the first time
+    # the web app shows a photo (see algo/stages/annotation.py).
     for stage in stages:
         frames = stage.process(frames, app_config)
 
@@ -1021,6 +1019,10 @@ def main() -> None:
         )
         log.info("Results written to album:  %s", output_dir)
 
+        # The re-analysis changed these photos' detections and verdicts, so
+        # any preview already rendered for them is stale; the web app
+        # re-renders each one the next time it is shown.
+        invalidate_previews(output_dir, [f.output_key or f.path.name for f in frames])
         # Anno_* lists describe THIS full re-analysis, so they're rebuilt
         # from scratch; SrcDir/SrcDirs/Timestamp are carried over by
         # AlbumInfo itself (it only seeds them when absent).
@@ -1061,12 +1063,8 @@ def main() -> None:
 
     if frames:
         log.info("")
-        log.info("Annotated previews saved to:")
-        log.info("  %s", output_dir / "previews")
-        log.info("")
-        log.info("Review the previews, then delete images you want to override:")
-        log.info("  previews/  delete a blurry preview → keep that original (not blurry after all)")
-        log.info("             delete a sharp preview → exclude that original (move to Unselected/)")
+        log.info("Previews (boxes, scores, names) are rendered on demand by the web app:")
+        log.info("  python culling_app.py")
         log.info("")
 
     if frames and not args.skip_facereco:

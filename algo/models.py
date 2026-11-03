@@ -213,6 +213,10 @@ class Body:
     # algo/thresholds.py). Independent of `passed`: a body that is too blurry
     # to pass can still be a teammate.
     is_teammate:       bool        = False
+    # Roster/face-tagging name of this person ("" when unidentified). Not
+    # produced by detection: it's attached at preview-render time from the
+    # album's face-recognition result (see algo/stages/annotation.py).
+    player_name:       str         = ""
     # Mean grey level [0,1] of this body's face crop, measured during analysis
     # so AutoAdjustStage never needs the pixels again.
     crop_brightness:   float       = 0.0

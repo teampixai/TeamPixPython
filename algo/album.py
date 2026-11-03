@@ -290,6 +290,7 @@ class PersonRecord:
             cloth_color=self.cloth_color,
             cloth_color_detail=self.cloth_color_detail,
             is_teammate=self.is_teammate,
+            player_name=self.player_name,
         )
 
     @classmethod
@@ -604,35 +605,65 @@ class AlbumImage:
 
     @property
     def preview_path(self) -> Optional[Path]:
-        """The annotated (boxes/badges drawn on) preview written at import,
-        or None for an entry that never got one."""
+        """Where this photo's annotated (boxes/badges/names drawn on) preview
+        lives, or None for an entry with no preview path.
+
+        The file is a CACHE rendered on demand (see algo/stages/annotation.py::
+        render_album_preview and culling_app.py), so it may well not exist
+        yet, or have been deleted to force a refresh -- callers that need
+        the pixels must go through the on-demand generator, not just open
+        this path."""
         preview = self._d.get("preview_path")
         return self.album.path / preview if preview else None
 
     @property
-    def thumbnail_path(self) -> Optional[Path]:
-        """The preview's square cover-crop thumbnail. Written alongside the
-        preview at import, and regenerated on demand by `ensure_thumbnail()`
-        for albums imported before thumbnails existed."""
-        preview = self.preview_path
-        return self.album.path / THUMBNAILS_SUBDIR / preview.name if preview else None
+    def thumbnail_path(self) -> Path:
+        """The photo's small square cover-crop thumbnail (the culling nav
+        strip): ``thumbnails/<key>.jpg``.
+
+        Named by the FULL key, extension included, because the key is the
+        only per-album unique name -- ``IMG_0001.JPG`` and ``IMG_0001.CR3``
+        shot as a RAW+JPEG pair are two photos with distinct keys but the same
+        stem. Written once, from the decoded photo, during import analysis
+        (see algo/stages/image_analysis.py), or on demand if it is missing; it
+        shows the plain photo, so nothing a regrade or face tagging changes
+        can make it stale."""
+        return self.album.path / THUMBNAILS_SUBDIR / f"{self.key}.jpg"
+
+    def existing_thumbnail(self) -> Optional[Path]:
+        """The thumbnail file already on disk for this photo, or None.
+
+        Albums imported before thumbnails were named by key kept them under
+        the preview's own name (``thumbnails/<preview stem>.jpg``); those are
+        honored too, so opening such an album doesn't regenerate thousands of
+        thumbnails that are already there."""
+        thumbnail = self.thumbnail_path
+        if thumbnail.is_file():
+            return thumbnail
+        legacy = self.album.path / THUMBNAILS_SUBDIR / f"{self.preview_stem}.jpg"
+        return legacy if legacy.is_file() else None
 
     def ensure_thumbnail(self) -> Optional[Path]:
-        """The thumbnail to serve for this photo, generating it from the
-        preview first if it is missing or stale. Falls back to the preview
-        itself if generation isn't possible."""
-        preview, thumbnail = self.preview_path, self.thumbnail_path
-        if preview is None or thumbnail is None or not preview.is_file():
+        """The thumbnail already on disk (see `existing_thumbnail`); failing
+        that, one derived from this photo's cached preview. None if neither is
+        available -- the caller can still generate one from the source photo
+        (culling_app.py does, through algo/stages/image_analysis.py::
+        render_album_thumbnail)."""
+        existing = self.existing_thumbnail()
+        if existing is not None:
+            return existing
+        preview = self.preview_path
+        if preview is None or not preview.is_file():
             return None
-        return ensure_cover_thumbnail(preview, thumbnail)
+        return ensure_cover_thumbnail(preview, self.thumbnail_path)
 
     @property
     def preview_stem(self) -> str:
-        """Filename stem shared by this photo's preview and thumbnail —
-        falling back to the key's stem, which is what the annotation stage
-        would name them (see algo/frame.py::Frame.key_stem)."""
+        """Filename stem of this photo's preview -- falling back to the key,
+        which is what the import names it (``previews/<key>.jpg``, see
+        algo/results.py)."""
         preview = self._d.get("preview_path")
-        return Path(preview).stem if preview else Path(self.key).stem
+        return Path(preview).stem if preview else self.key
 
     def set_edited_image(self, path: Path) -> None:
         """Record *path* (inside the album directory) as the accepted edit.
@@ -881,6 +912,16 @@ class Album:
                 }
             return self._source_index
 
+    def images_by_source(self) -> dict[Path, "AlbumImage"]:
+        """``{resolved source path: AlbumImage}`` -- the photo imported from a
+        given file. Lets the import's analysis stage find the album entry
+        (and so the key and thumbnail path) of each file it decodes."""
+        return {
+            Path(image.source_file).resolve(): image
+            for image in self.image_list
+            if image.source_file
+        }
+
     # -- persistence ---------------------------------------------------- #
     def save(self) -> None:
         """Atomically rewrite album.json from the in-memory payload.
@@ -1023,26 +1064,34 @@ class Album:
     def _copy_entry_files(self, other: "Album", entry: dict, old_key: str, new_key: str) -> None:
         """Copy *entry*'s preview/thumbnail/edited-image files from *other*
         into this album, renaming them to match *new_key* when it differs
-        from *old_key*, and updating *entry*'s path fields in place."""
+        from *old_key*, and updating *entry*'s path fields in place.
+
+        The thumbnail and preview are handled independently: the thumbnail
+        is written at import (named by key, see AlbumImage.thumbnail_path),
+        while the preview is an on-demand cache *other* may not have rendered
+        yet. A renamed key still needs its preview path renamed even when
+        there is no file to copy, or it would point at a name another photo
+        in this album may already use."""
         renamed = new_key != old_key
+
+        thumb_src = other.path / THUMBNAILS_SUBDIR / f"{old_key}.jpg"
+        if thumb_src.is_file():
+            thumb_dir = self.path / THUMBNAILS_SUBDIR
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(thumb_src, thumb_dir / f"{new_key}.jpg")
+
         preview_rel = entry.get("preview_path")
         if preview_rel:
             src = other.path / preview_rel
+            dest_name = f"{new_key}.jpg" if renamed else Path(preview_rel).name
             if src.is_file():
-                dest_name = f"{Path(new_key).stem}{Path(preview_rel).suffix}" if renamed else Path(preview_rel).name
                 previews_dir = self.path / "previews"
                 previews_dir.mkdir(parents=True, exist_ok=True)
                 dest = unique_path(previews_dir, dest_name)
                 shutil.copy2(src, dest)
                 entry["preview_path"] = f"previews/{dest.name}"
-                # The thumbnail is looked up BY the preview's own filename
-                # (see AlbumImage.thumbnail_path) so it must share dest.name,
-                # not go through its own unique_path resolution.
-                thumb_src = other.path / THUMBNAILS_SUBDIR / Path(preview_rel).name
-                if thumb_src.is_file():
-                    thumb_dir = self.path / THUMBNAILS_SUBDIR
-                    thumb_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(thumb_src, thumb_dir / dest.name)
+            elif renamed:
+                entry["preview_path"] = f"previews/{dest_name}"
 
         edited_rel = entry.get("edited_image")
         if edited_rel:

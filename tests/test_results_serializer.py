@@ -74,7 +74,8 @@ def test_entry_shape_and_key_order_are_unchanged():
     assert entry["laplacian_variance"] == 123.45
     assert entry["tenengrad_score"] == 67.89
     assert entry["auto_adjustment"] == {"ev": 0.5}
-    assert entry["preview_path"] == "previews/IMG_0001.jpg"
+    # Named by the FULL key (not its stem), so a RAW+JPEG pair can't collide.
+    assert entry["preview_path"] == "previews/IMG_0001.jpg.jpg"
     assert entry["annotation_data"]["processing_shape"] == [1080, 1920]
     assert entry["annotation_data"]["overall_blurry"] is False
 

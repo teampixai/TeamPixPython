@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import logging
+import os
+import unicodedata
+import uuid
+from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import cv2
 import numpy as np
 
-from algo.config import AppConfig
+from algo.config import AppConfig, app_config
 from algo.frame import Frame
 from algo.models import Box, Face
-from algo.stage import ProcessStage
-from algo.utils import THUMBNAIL_SIZE, THUMBNAILS_SUBDIR, apply_auto_adjustment, write_cover_thumbnail
+from algo.utils import apply_auto_adjustment
+
+if TYPE_CHECKING:  # algo.album imports nothing from here, but keep this module light
+    from algo.album import AlbumImage, PersonRecord
 
 log = logging.getLogger("TeamPixPython")
+
+PREVIEWS_SUBDIR = "previews"
+
+# What the preview says about a person who has no face-recognition name but
+# whose jersey matched the album's team (Body.is_teammate).
+TEAMMATE_LABEL = "teammate"
 
 # COCO 17-keypoint skeleton: pairs of indices to connect with a line.
 _COCO_SKELETON: tuple[tuple[int, int], ...] = (
@@ -59,30 +72,139 @@ def _draw_status_icon(
         cv2.line(image, p3, p4, (255, 255, 255), lw, cv2.LINE_AA)
 
 
+def _identity_label(body) -> str:
+    """The text naming a person on the preview: their face-recognition name
+    when they have one, otherwise "teammate" if the jersey check flagged
+    them, otherwise nothing."""
+    name = (body.player_name or "").strip()
+    if name:
+        return name
+    return TEAMMATE_LABEL if body.is_teammate else ""
+
+
+# Fonts tried (in order) for labels that OpenCV's built-in Hershey font can't
+# render -- anything outside ASCII, e.g. accented or CJK player names.
+_UNICODE_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "DejaVuSans.ttf",
+    "arial.ttf",
+)
+
+
+@lru_cache(maxsize=16)
+def _unicode_font(px: int):
+    """A TrueType font at *px*, or None if Pillow or every candidate font is
+    unavailable."""
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return None
+    for candidate in _UNICODE_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(candidate, px)
+        except OSError:
+            continue
+    return None
+
+
+def _ascii_fallback(text: str) -> str:
+    """Best-effort ASCII rendering for when no Unicode font is available
+    ("José" -> "Jose"); characters with no ASCII form become "?"."""
+    out = []
+    for ch in text:
+        folded = unicodedata.normalize("NFKD", ch).encode("ascii", "ignore").decode()
+        out.append(folded or "?")
+    return "".join(out)
+
+
+def _text_stroke(px: int) -> int:
+    """Stroke width that gives Pillow-drawn text roughly the weight of the
+    bold OpenCV labels it sits next to."""
+    return max(1, round(px / 24))
+
+
+def _text_extent(text: str, font, scale: float, thick: int, px: int) -> tuple[int, int]:
+    """(width, height) in pixels that `_draw_label` will use for *text*."""
+    if text.isascii():
+        (w, h), _ = cv2.getTextSize(text, font, scale, thick)
+        return w, h
+    ttf = _unicode_font(px)
+    if ttf is None:
+        (w, h), _ = cv2.getTextSize(_ascii_fallback(text), font, scale, thick)
+        return w, h
+    left, top, right, bottom = ttf.getbbox(text, anchor="ls", stroke_width=_text_stroke(px))
+    return right - left, bottom - top
+
+
+def _draw_label(
+    image: np.ndarray, text: str, org: tuple[int, int],
+    font, scale: float, color: tuple[int, int, int], thick: int, px: int,
+) -> None:
+    """cv2.putText for ASCII; Pillow with a real TrueType font for anything
+    else, so non-ASCII names aren't drawn as "???". *org* is the baseline-left
+    corner, as for cv2.putText."""
+    if text.isascii():
+        cv2.putText(image, text, org, font, scale, color, thick, cv2.LINE_AA)
+        return
+    ttf = _unicode_font(px)
+    if ttf is None:
+        cv2.putText(image, _ascii_fallback(text), org, font, scale, color, thick, cv2.LINE_AA)
+        return
+
+    from PIL import Image, ImageDraw
+
+    x, y = org
+    stroke = _text_stroke(px)
+    left, top, right, bottom = ttf.getbbox(text, anchor="ls", stroke_width=stroke)
+    pad = 2
+    x0, y0 = max(0, x + left - pad), max(0, y + top - pad)
+    x1, y1 = min(image.shape[1], x + right + pad), min(image.shape[0], y + bottom + pad)
+    if x1 <= x0 or y1 <= y0:
+        return
+    region = Image.fromarray(cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2RGB))
+    rgb = (color[2], color[1], color[0])
+    ImageDraw.Draw(region).text(
+        (x - x0, y - y0), text, font=ttf, fill=rgb, anchor="ls", stroke_width=stroke, stroke_fill=rgb,
+    )
+    image[y0:y1, x0:x1] = cv2.cvtColor(np.asarray(region), cv2.COLOR_RGB2BGR)
+
+
+def _write_jpeg_atomic(path: Path, image: np.ndarray, quality: int) -> None:
+    """Write *image* to *path* so a concurrent reader never sees a half-written
+    file: previews are rendered on demand while the web app may already be
+    serving the same path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp{path.suffix}")
+    if not cv2.imwrite(str(tmp), image, [cv2.IMWRITE_JPEG_QUALITY, quality]):
+        raise OSError(f"cv2.imwrite failed to write preview: {tmp}")
+    os.replace(tmp, path)
+
+
 def _annotate_frame(
     frame: Frame,
-    output_dir: Path,
+    preview_path: Path,
     config: AppConfig,
 ) -> None:
-    """Write an annotated preview for one frame into the shared ``previews/``
-    sub-folder.
+    """Write *frame*'s annotated preview to *preview_path*.
 
     - No image data  → do nothing (read error upstream).
     - No bodies      → no person detected; save original as-is.
-    - Otherwise      → draw boxes, keypoints, scores.
+    - Otherwise      → draw boxes, keypoints, scores, and each person's name
+                       (or "teammate").
+
+    Thumbnails are not made here: they show the plain photo and are written
+    once at import (see algo/stages/image_analysis.py).
     """
     if frame.image is None:
         return
 
     if not frame.bodies:
-        subdir = output_dir / "previews"
-        subdir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(
-            str(subdir / (frame.key_stem + ".jpg")),
-            frame.image,
-            [cv2.IMWRITE_JPEG_QUALITY, 60],
-        )
-        write_cover_thumbnail(frame.image, output_dir / THUMBNAILS_SUBDIR / (frame.key_stem + ".jpg"), THUMBNAIL_SIZE)
+        _write_jpeg_atomic(preview_path, frame.image, 60)
         return
 
     annotated = apply_auto_adjustment(frame.image, frame.auto_adjustment).copy()
@@ -108,7 +230,10 @@ def _annotate_frame(
     rejection_font_scale = config.annotation_rejection_reason_font_size_px * ann_scale / max(_base_h, 1)
 
     score_labels: list[tuple] = []
-
+    # (text, x, y, colour) -- who each person is; drawn after the score labels.
+    identity_labels: list[tuple] = []
+    identity_px = max(8, round(config.annotation_score_font_size_px * ann_scale * 1.1))
+    identity_gap = max(6, round(8 * ann_scale))
     # Bodies to annotate: top-N by bbox area ∪ all passed bodies.
     # Sort largest-first so bigger boxes render behind smaller ones.
     sorted_by_size = sorted(frame.bodies, key=lambda b: b.bbox.area, reverse=True)
@@ -153,6 +278,7 @@ def _annotate_frame(
                           body_color, body_kp_thick, cv2.LINE_AA)
 
         # Face bbox + sharpness score label
+        face_label: tuple[int, int, int] | None = None  # (x, baseline y, width) of the score text
         if body.best_face is not None:
             fb: Box = body.best_face.bbox
             rfx1 = int(fb.x1 * sx); rfy1 = int(fb.y1 * sy)
@@ -172,6 +298,24 @@ def _annotate_frame(
             (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
             text_y = min(label_bottom + th + baseline + 2, h_out - 1)
             score_labels.append((label, label_x, text_y, body_color, font_scale))
+            face_label = (label_x, text_y, tw)
+
+        # Name (or "teammate") next to the score, or -- with no face box to
+        # hang it on -- just under the body box's pass/fail badge.
+        identity = _identity_label(body)
+        if identity:
+            iw, _ih = _text_extent(identity, font, font_scale, font_thick, identity_px)
+            if face_label is not None:
+                ix, iy = face_label[0] + face_label[2] + identity_gap, face_label[1]
+                if ix + iw > w_out - 2:
+                    # No room beside the score: stack it just below instead of
+                    # sliding it back over the score text.
+                    ix, iy = face_label[0], min(face_label[1] + _ih + max(4, identity_gap // 2), h_out - 1)
+            else:
+                ix = rbx1 + 2
+                iy = min(rby1 + icon_size + _ih + 4, h_out - 1)
+            ix = max(0, min(ix, w_out - iw - 2))
+            identity_labels.append((identity, ix, iy, body_color))
 
         # Cloth colour label (passed) or rejection reason (failed)
         if body.passed:
@@ -206,47 +350,93 @@ def _annotate_frame(
 
     for label, lx, ly, lcolor, fscale in score_labels:
         cv2.putText(annotated, label, (lx, ly), font, fscale, lcolor, font_thick, cv2.LINE_AA)
+    for text, lx, ly, lcolor in identity_labels:
+        _draw_label(annotated, text, (lx, ly), font, font_scale, lcolor, font_thick, identity_px)
 
-    out_name    = frame.key_stem + ".jpg"
-    anno_subdir = output_dir / "previews"
-    anno_subdir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(anno_subdir / out_name), annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
-    write_cover_thumbnail(annotated, output_dir / THUMBNAILS_SUBDIR / out_name, THUMBNAIL_SIZE)
+    _write_jpeg_atomic(preview_path, annotated, 60)
 
 
 # ---------------------------------------------------------------------------
-# Stage
+# On-demand previews
 # ---------------------------------------------------------------------------
+#
+# A preview is a CACHE of "this photo with its detections drawn on", rendered
+# the first time something asks for it (culling_app.py) from the album's
+# persisted per-person data -- it is no longer pre-generated for the whole
+# album at import. Everything that draws one goes through `_annotate_frame`
+# above, via `render_album_preview`, so every preview looks the same however
+# and whenever it was produced.
 
-class AnnotationStage(ProcessStage):
-    """Annotate every frame and write previews to the output directory.
+def render_album_preview(
+    image: "AlbumImage",
+    config: AppConfig | None = None,
+    player_name_for: "Callable[[PersonRecord], str] | None" = None,
+) -> bool:
+    """Draw *image*'s annotated preview to its `preview_path`.
 
-    Every frame (sharp, blurry, or no-person) → ``<output_dir>/previews/``.
+    The photo is re-decoded from its original (the same reader the import
+    used) and annotated from the album's stored per-person records. Each
+    person's name comes from *player_name_for(record)* when given -- the web
+    app passes the current face-recognition result -- falling back to the
+    name stored on the record; with no name, "teammate" is drawn for people
+    the jersey check flagged.
 
-    The frame list is returned unchanged.
+    Returns False (writing nothing) when the entry has no preview path or the
+    source photo is missing or can't be decoded.
     """
+    preview = image.preview_path
+    source = image.original_path
+    if preview is None or source is None or not source.is_file():
+        return False
 
-    def __init__(self, output_dir: Path) -> None:
-        self.output_dir = output_dir
+    # Lazy: image_analysis pulls in the whole detection stack (ultralytics...),
+    # which a process that only serves previews shouldn't pay for until needed.
+    from algo.stages.image_analysis import _read_image
 
-    def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
-        from algo.stages.image_analysis import _read_image
+    decoded = _read_image(source)
+    if decoded is None:
+        return False
 
-        for idx, frame in enumerate(frames, 1):
-            log.debug("[AnnotationStage] [%d/%d] %s", idx, len(frames), frame.path.name)
-            # Analysis releases frame.image, so re-read it here and drop it
-            # again straight away -- only one source image is ever resident.
-            borrowed = frame.image is None
-            if borrowed:
-                frame.image = _read_image(frame.path)
-                if frame.image is None:
-                    log.warning("[AnnotationStage] %s — cannot re-read image, preview skipped",
-                                frame.path.name)
-                    continue
-            try:
-                _annotate_frame(frame, self.output_dir, config)
-            finally:
-                if borrowed:
-                    frame.image = None
-        log.info("[AnnotationStage] annotated %d frame(s) → %s", len(frames), self.output_dir)
-        return frames
+    bodies = []
+    for record in image.bodies:
+        body = record.to_body()
+        body.player_name = ((player_name_for(record) if player_name_for else "") or record.player_name or "").strip()
+        bodies.append(body)
+
+    frame = Frame(
+        path=source,
+        bodies=bodies,
+        image=decoded,
+        auto_adjustment=image.auto_adjustment,
+        output_key=image.key,
+    )
+    _annotate_frame(frame, preview, config or app_config)
+    return True
+
+
+def invalidate_previews(album_path: Path, stems: "Iterable[str] | None" = None) -> int:
+    """Delete cached previews so they are re-rendered, with current data, the
+    next time they are requested. Thumbnails are left alone: they show the
+    plain photo, so nothing that changes a preview makes them stale.
+
+    *stems* are preview filename stems (`AlbumImage.preview_stem`); None
+    invalidates every cached preview in the album. Returns how many files
+    were removed.
+    """
+    folder = Path(album_path) / PREVIEWS_SUBDIR
+    if not folder.is_dir():
+        return 0
+    if stems is None:
+        targets = [fp for fp in folder.iterdir() if fp.is_file()]
+    else:
+        targets = [folder / f"{stem}.jpg" for stem in stems]
+    removed = 0
+    for fp in targets:
+        try:
+            fp.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Could not delete cached preview %s: %s", fp, exc)
+    return removed

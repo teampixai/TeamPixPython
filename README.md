@@ -70,9 +70,9 @@ Image → normalize size (long edge = 1800 px)
       → match faces to bodies (head-keypoint overlap)
       → grade sharpness of each person's face crop
       → poll jersey colours → keep only your team (+ forced colours)
-      → annotate preview image
       → write the album's Album data (see algo/album.py) / info.json / blurry.csv / blur.lst
       → (optional) cluster faces into .FaceReco/
+      → (later, in the web app) render annotated previews on demand
 ```
 
 Detection runs on a pluggable **engine** (`--engine mediapipe` default, or `--engine yolo`):
@@ -89,8 +89,9 @@ The pipeline is a sequence of stages (`algo/stages/`):
 | `ImageAnalysisStage` | Run both YOLO models, match faces to bodies |
 | `GradingStage` | Compute the sharpness score and pass/fail per body |
 | `JerseyCountingStage` | Detect the dominant team colour and disqualify off-team bodies |
-| `AnnotationStage` | Draw and save annotated previews into `previews/` |
 | `FaceRecoStage` | Cluster qualifying faces into `.FaceReco/` (optional) |
+
+Annotated previews are not a pipeline stage: `algo/stages/annotation.py` draws them on demand (see "Annotated previews" below).
 
 ### Sharpness scoring
 
@@ -119,7 +120,7 @@ The geometric mean only scores high when *both* metrics agree, which avoids fals
 
 The tool is split into steps so you can review and override the automatic classifications before any files are moved.
 
-### Step 1 — Score and annotate
+### Step 1 — Score
 
 ```
 python 1_prep_review.py <image_or_directory> [options]
@@ -145,8 +146,9 @@ Scores every image and writes an output folder:
 
 ```
 <output_dir>/
-    previews/         ← annotated previews for every image (blur/sharp/skipped alike)
-    album.json      ← the Album's data (see algo/album.py; full per-body data used by face recognition); each result also carries a "preview_path" pointing into previews/
+    previews/         ← cache of annotated previews, rendered on demand by the web app (empty after an import); files named <key>.jpg
+    thumbnails/       ← small square thumbnails of each photo for the culling nav strip, written during import; files named <key>.jpg
+    album.json      ← the Album's data (see algo/album.py; full per-body data used by face recognition); each result also carries a "preview_path" naming where its preview is cached
     info.json         ← classification results (used by step 2)
     blurry.csv        ← one row per blurry image with score details
     blur.lst          ← plain list of blurry file paths
@@ -156,7 +158,7 @@ Scores every image and writes an output folder:
 
 **Face Recognition (optional):**
 
-By default, after annotation previews are generated, face recognition automatically clusters qualifying faces using the Facenet provider. The output is stored in `.FaceReco/` within the same output directory. Disable the auto-run with `--skip-facereco` if needed.
+By default, after the photos are scored, face recognition automatically clusters qualifying faces using the Facenet provider. The output is stored in `.FaceReco/` within the same output directory. Disable the auto-run with `--skip-facereco` if needed.
 
 **Sensitivity thresholds** (score ≤ threshold → blurry):
 
@@ -168,7 +170,15 @@ By default, after annotation previews are generated, face recognition automatica
 
 You can also pass any numeric value directly, e.g. `--sensitivity 0.45`.
 
-**Annotated preview legend:**
+**Annotated previews:**
+
+Previews are rendered **on demand** by the web app, the first time a photo is shown, from the album's stored detections (`album.json`) and the current face-recognition result, and then cached in `previews/`. An import no longer pre-renders them, so it finishes sooner and a big album only pays for the photos you actually look at. Deleting a cached file is harmless: it is simply re-rendered the next time it is needed. The app also drops a photo's cached preview itself whenever something it shows changes: when you assign or reject a face on the Faces page, after a regrade changes a person's verdict, and after a face-recognition re-run. All previews are drawn by the same code (`algo/stages/annotation.py`), so they look alike however they were produced. A preview needs the original photo to still be on disk.
+
+The culling page's nav-strip thumbnails are different: they show the plain photo (no boxes or scores) and are written once during import, from the image the analysis step has already decoded, so the nav strip never has to render previews. Nothing that changes a preview can make them stale. If a thumbnail is ever missing (deleted, or its write failed), the web app generates it on demand straight from the original photo. Albums imported earlier keep using their existing thumbnails.
+
+Previews and thumbnails are named by the photo's full key (e.g. `IMG_0001.CR3.jpg`), so a RAW+JPEG pair of the same shot (`IMG_0001.JPG` + `IMG_0001.CR3`) gets separate files.
+
+Legend:
 
 - **Blue box / ✓** — person scored sharp
 - **Red box / ✗** — person scored blurry
@@ -176,21 +186,12 @@ You can also pass any numeric value directly, e.g. `--sensitivity 0.45`.
 - **Yellow box** — full face-detection bbox
 - **Circles** — face landmarks (blue = confident, red = low confidence)
 - **Score label** — sharpness score printed below the face box
+- **Name** — next to the score: the person's name when face recognition has one (matched to your face database or assigned by you); otherwise **teammate** if their jersey matched your team colour; otherwise nothing
 - All annotation is semi-transparent (`annotation_alpha = 0.25`); score text is opaque
 
 ### Step 2 — Review
 
-Open the `previews/` folder in your photo viewer and **delete any preview images you want to override**:
-
-| Preview is for… | Delete a preview when… | Effect on the original |
-|---|---|---|
-| a blurry image | The photo isn't actually blurry — you want to keep it | Left in place |
-| a sharp image | The photo is sharp but you don't want it | Moved to `Blur/` |
-| a skipped image | You want to leave the original untouched | Left in place |
-
-Leave previews you agree with untouched.
-
-Then use the web app (`culling_app.py`) to review, tag faces, and export the kept photos — see "Quick start" above.
+Use the web app (`culling_app.py`) to review the scored photos (with their previews), override verdicts and star ratings, tag faces, and export the kept photos — see "Quick start" above.
 
 ---
 

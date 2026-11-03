@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -14,7 +15,10 @@ from algo.frame import Frame
 from algo.image_cache import FACE_ORIGINAL_BUFFER_RATIO, ImageCache
 from algo.models import Body, Box, Face, Point, PredictedKeyPoint
 from algo.stage import ProcessStage
-from algo.utils import _HEAD_KP_INDICES, _narrow_face_box, cap_long_edge
+from algo.utils import _HEAD_KP_INDICES, _narrow_face_box, cap_long_edge, write_cover_thumbnail
+
+if TYPE_CHECKING:
+    from algo.album import Album, AlbumImage
 
 log = logging.getLogger("TeamPixPython")
 
@@ -291,6 +295,51 @@ def _mean_brightness(image: np.ndarray | None) -> float:
     return float(np.mean(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))) / 255.0
 
 
+def _album_entry(entries: "dict[Path, AlbumImage]", path: Path, stage: str) -> "AlbumImage | None":
+    """The album entry created for *path* before analysis, or None when the
+    stage runs without an album (or, unexpectedly, the file has no entry)."""
+    entry = entries.get(path.resolve())
+    if entry is None and entries:
+        log.warning("[%s] %s has no album entry — no key or thumbnail assigned", stage, path.name)
+    return entry
+
+
+def write_import_thumbnail(image: "AlbumImage | None", decoded: np.ndarray) -> None:
+    """Write *image*'s nav-strip thumbnail to its album `thumbnail_path`, from
+    the photo the analysis loop has just decoded -- the one moment every
+    photo is in memory anyway, so it never has to be decoded again for this.
+    Best effort: on failure `render_album_thumbnail` generates it on demand."""
+    if image is None:
+        return
+    try:
+        write_cover_thumbnail(decoded, image.thumbnail_path)
+    except OSError as exc:
+        log.warning("[thumbnail] could not write %s: %s", image.thumbnail_path, exc)
+
+
+def render_album_thumbnail(image: "AlbumImage") -> bool:
+    """Generate *image*'s thumbnail on demand, for when none exists yet (an
+    album imported before thumbnails were written at import, or one that
+    failed or was deleted).
+
+    Re-decodes the photo with the same reader the import used and writes it
+    through the same `write_cover_thumbnail`, so an on-demand thumbnail is
+    identical to an import-time one. Returns False (writing nothing) when the
+    source photo is missing or can't be decoded."""
+    source = image.original_path
+    if source is None or not source.is_file():
+        return False
+    decoded = _read_image(source)
+    if decoded is None:
+        return False
+    try:
+        write_cover_thumbnail(decoded, image.thumbnail_path)
+    except OSError as exc:
+        log.warning("[thumbnail] could not write %s: %s", image.thumbnail_path, exc)
+        return False
+    return True
+
+
 def populate_frame_cache(
     frame: Frame,
     cache: "ImageCache | None",
@@ -376,6 +425,7 @@ class ImageAnalysisStage(ProcessStage):
         only_paths: list[Path] | None = None,
         cache: ImageCache | None = None,
         cache_face_originals: bool = False,
+        album: "Album | None" = None,
     ) -> None:
         self.input_path = input_path
         self.pose_model = pose_model
@@ -387,6 +437,10 @@ class ImageAnalysisStage(ProcessStage):
         # recorded sources, which may span several directories) -- bypasses
         # the input_path directory scan entirely when set.
         self.only_paths = only_paths
+        # The album whose entries (created before analysis) these files belong
+        # to: supplies each frame's key and where its thumbnail goes. Without
+        # one, no thumbnails are written and frames keep their filename as key.
+        self.album = album
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         files = list(self.only_paths) if self.only_paths is not None else collect_images(self.input_path)
@@ -394,6 +448,7 @@ class ImageAnalysisStage(ProcessStage):
             before = len(files)
             files = [f for f in files if f.resolve() not in self.skip_paths]
             log.info("[ImageAnalysisStage] skipping %d already-imported file(s)", before - len(files))
+        entries = self.album.images_by_source() if self.album is not None else {}
         result: list[Frame] = []
         width = len(str(len(files)))
 
@@ -413,12 +468,15 @@ class ImageAnalysisStage(ProcessStage):
             if not had_persons:
                 log.debug("[ImageAnalysisStage] %s — no person detected", path.name)
 
+            entry = _album_entry(entries, path, "ImageAnalysisStage")
             frame = Frame(
                 path=path,
                 bodies=bodies,
                 image=image,
                 normalized_image=normalized,
+                output_key=entry.key if entry is not None else "",
             )
+            write_import_thumbnail(entry, normalized)
             populate_frame_cache(frame, self.cache, config,
                                  cache_face_originals=self.cache_face_originals)
             # Released here: holding these for the whole album is what used to
@@ -521,6 +579,7 @@ class MediaPipeImageAnalysisStage(ProcessStage):
         only_paths: list[Path] | None = None,
         cache: ImageCache | None = None,
         cache_face_originals: bool = False,
+        album: "Album | None" = None,
     ) -> None:
         self.input_path = input_path
         self.person_detector = person_detector
@@ -531,6 +590,8 @@ class MediaPipeImageAnalysisStage(ProcessStage):
         self.cache_face_originals = cache_face_originals
         # See ImageAnalysisStage.only_paths.
         self.only_paths = only_paths
+        # See ImageAnalysisStage.album.
+        self.album = album
 
     def process(self, frames: list[Frame], config: AppConfig) -> list[Frame]:
         files = list(self.only_paths) if self.only_paths is not None else collect_images(self.input_path)
@@ -538,6 +599,7 @@ class MediaPipeImageAnalysisStage(ProcessStage):
             before = len(files)
             files = [f for f in files if f.resolve() not in self.skip_paths]
             log.info("[MediaPipeImageAnalysisStage] skipping %d already-imported file(s)", before - len(files))
+        entries = self.album.images_by_source() if self.album is not None else {}
         result: list[Frame] = []
         width = len(str(len(files)))
 
@@ -559,12 +621,15 @@ class MediaPipeImageAnalysisStage(ProcessStage):
             if not had_persons:
                 log.debug("[MediaPipeImageAnalysisStage] %s — no person detected", path.name)
 
+            entry = _album_entry(entries, path, "MediaPipeImageAnalysisStage")
             frame = Frame(
                 path=path,
                 bodies=bodies,
                 image=image,
                 normalized_image=normalized,
+                output_key=entry.key if entry is not None else "",
             )
+            write_import_thumbnail(entry, normalized)
             populate_frame_cache(frame, self.cache, config,
                                  cache_face_originals=self.cache_face_originals)
             # See ImageAnalysisStage.process.

@@ -45,10 +45,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from algo.config import app_config
-from algo.frame import Frame
 from algo.models import ColorLab
 from algo.results import baseline_stars
-from algo.stages.annotation import _annotate_frame
+from algo.stages.annotation import invalidate_previews
 from algo.stages.grading import cloth_color_predictor
 from algo.stages.jersey_counting import (
     _REF_LAB_BY_LABEL,
@@ -78,8 +77,7 @@ class RegradeSummary:
     team_color: str | None = None      # jersey colour used for this regrade
     team_color_pinned: bool = False    # True when it came from a manual override, not a poll
     stars_rebaselined: int = 0         # flipped photos whose star rating was reset
-    previews_regenerated: int = 0      # verdict flipped -> preview/thumbnail redrawn
-    previews_regen_failed: int = 0     # ...of which the source photo couldn't be re-read
+    previews_invalidated: int = 0      # verdict flipped -> cached preview/thumbnail dropped (re-rendered on demand)
     teammates: int = 0                 # bodies flagged is_teammate after this regrade
     teammates_added: int = 0           # ...that were not teammates before
     teammates_removed: int = 0         # bodies that were teammates before and no longer are
@@ -101,26 +99,18 @@ def _parse_jersey_colors(jerseycolor_arg: str | None) -> tuple[frozenset[str], f
     return forced, regular
 
 
-def _regenerate_preview(image: AlbumImage, album: Album) -> bool:
-    """Redraw <album>/previews/<key>.jpg (+ thumbnail) from the photo's
-    just-updated per-body verdicts, so the pass/fail badges and rejection-
-    reason labels baked into the preview stay in sync with the new overall
-    status. Returns False (leaving the stale preview in place) when the
-    source photo can no longer be re-read."""
-    file_path = image.source_file
-    decoded = _read_source_image(file_path)
-    if decoded is None:
-        return False
+def _drawn_state(record: PersonRecord) -> tuple:
+    """The per-person facts a preview draws that a regrade can change."""
+    return (record.is_blurry, record.rejection_reason, record.is_teammate, record.cloth_color)
 
-    frame = Frame(
-        path=Path(file_path),
-        bodies=[record.to_body() for record in image.bodies],
-        image=decoded,
-        auto_adjustment=image.auto_adjustment,
-        output_key=image.preview_stem,
-    )
-    _annotate_frame(frame, album.path, app_config)
-    return True
+
+def _invalidate_preview(image: AlbumImage, album: Album) -> bool:
+    """Drop the photo's cached preview (+ thumbnail) after its per-body
+    verdicts changed, so the pass/fail badges and rejection-reason labels
+    baked into it can't go stale. The web app re-renders it, from the new
+    verdicts, the next time it is shown. Returns True if a cached file was
+    actually removed."""
+    return invalidate_previews(album.path, [image.preview_stem]) > 0
 
 
 def _read_source_image(file_path: str):
@@ -284,6 +274,10 @@ def regrade_sensitivity(
     # colour and an is_teammate verdict). Eligible is a subset of in_range.
     gradable: list[tuple[AlbumImage, list[PersonRecord], list[bool], list[bool], list[bool]]] = []
     candidates: list[PersonRecord] = []
+    # What each photo's preview currently shows (per person: verdict,
+    # rejection reason, teammate flag, jersey colour), snapshotted before
+    # anything is mutated so a preview is dropped exactly when it would change.
+    drawn_before: dict[str, list[tuple]] = {}
     for image in album.image_list:
         if image.status not in ("blurry", "sharp"):
             continue
@@ -291,6 +285,7 @@ def regrade_sensitivity(
         if not bodies:
             continue
         summary.images_considered += 1
+        drawn_before[image.key] = [_drawn_state(b) for b in bodies]
         cleared = [b.cleared_grading_gates for b in bodies]
         eligible = [
             c and b.sharpness_score > new_threshold
@@ -450,12 +445,12 @@ def regrade_sensitivity(
             ):
                 summary.stars_rebaselined += 1
 
-            if _regenerate_preview(image, album):
-                summary.previews_regenerated += 1
-            else:
-                summary.previews_regen_failed += 1
-                log.warning("[regrade] verdict changed but preview could not be regenerated (source unreadable): %s",
-                            image.source_file)
+        # Drop the cached preview if anything it shows changed -- the overall
+        # verdict, or any one person's badge, rejection reason, teammate flag
+        # or jersey colour. It is re-rendered on demand with the new data.
+        if new_status != old_status or [_drawn_state(b) for b in bodies] != drawn_before[image.key]:
+            if _invalidate_preview(image, album):
+                summary.previews_invalidated += 1
 
     # The team colour (polled or pinned) can move, so persist it alongside
     # the verdicts it just produced.
@@ -480,10 +475,10 @@ def regrade_sensitivity(
     info.save()
     log.info(
         "[regrade] threshold=%.2f team_colour=%s(%s) — recovered=%d demoted=%d stars_rebaselined=%d "
-        "cloth_colours_measured=%d (unreadable=%d) previews_regenerated=%d (failed=%d) of %d image(s)",
+        "cloth_colours_measured=%d (unreadable=%d) previews_invalidated=%d of %d image(s)",
         new_threshold, summary.team_color or "n/a", "pinned" if pinned else "polled",
         summary.recovered, summary.demoted, summary.stars_rebaselined,
         summary.jersey_rechecked, summary.jersey_recheck_unreadable,
-        summary.previews_regenerated, summary.previews_regen_failed, summary.images_considered,
+        summary.previews_invalidated, summary.images_considered,
     )
     return summary

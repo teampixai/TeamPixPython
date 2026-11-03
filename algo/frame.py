@@ -22,14 +22,18 @@ class Frame:
     img_w:            int   = 0
     img_h:            int   = 0
     overall_brightness: float = 0.0  # mean grey level [0,1] of the normalised frame
-    # Disambiguated bookkeeping key (preview filename, Album/info.json
-    # entries, FaceReco origFilename) -- see algo/utils.py::make_unique_import_key.
-    # Empty means "use path.stem" (single-source-dir album, the common case).
+    # Disambiguated bookkeeping key (preview and thumbnail filenames,
+    # Album/info.json entries, FaceReco origFilename) -- see
+    # algo/utils.py::make_unique_import_key. Set by the analysis stage from
+    # the album entry created before analysis; empty means "use path.name".
     output_key:       str = ""
 
     @property
     def key_stem(self) -> str:
-        """The stem used for output artifact filenames (previews, etc.)."""
+        """The key without its extension -- a readable prefix for per-run
+        scratch files. NOT unique (IMG_0001.JPG and IMG_0001.CR3 share it), so
+        never use it to name a per-photo artifact; previews and thumbnails are
+        named by the full key."""
         return Path(self.output_key).stem if self.output_key else self.path.stem
 
     def is_sharp(self) -> bool:
