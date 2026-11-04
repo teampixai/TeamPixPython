@@ -13,6 +13,7 @@ from __future__ import annotations
 from algo.album import PersonRecord
 from algo.frame import Frame
 from algo.models import Box, Face, NumpyEncoder, PredictedKeyPoint
+from algo.utils import image_capture_timestamp
 
 __all__ = ["NumpyEncoder", "baseline_stars", "build_result_entries",
            "serial_box", "serial_face", "serial_keypoint"]
@@ -54,10 +55,12 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
         auto_adj = frame.auto_adjustment
         auto_adj_entry = {"ev": auto_adj.ev} if auto_adj is not None else None
         key = frame.output_key or frame.path.name
+        capture_ts = image_capture_timestamp(frame.path)
         if not frame.bodies:
             entry: dict = {
                 "file": str(frame.path),
                 "key": key,
+                "capture_ts": capture_ts,
                 "status": "skipped",
                 "auto_adjustment": auto_adj_entry,
                 "preview_path": f"previews/{key}.jpg",
@@ -69,6 +72,7 @@ def build_result_entries(frames: list[Frame]) -> list[dict]:
             entry = {
                 "file":               str(frame.path),
                 "key":                key,
+                "capture_ts":         capture_ts,
                 "status":             "blurry" if overall_blurry else "sharp",
                 "sharpness_score":    round(best.sharpness_score, 4),
                 "sharpness_grade":    round(best.sharpness_score * 100, 1),

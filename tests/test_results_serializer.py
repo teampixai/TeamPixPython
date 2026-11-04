@@ -57,7 +57,7 @@ def test_entry_shape_and_key_order_are_unchanged():
     entry = build_result_entries([frame])[0]
 
     assert list(entry) == [
-        "file", "key", "status", "sharpness_score", "sharpness_grade",
+        "file", "key", "capture_ts", "status", "sharpness_score", "sharpness_grade",
         "laplacian_variance", "tenengrad_score", "auto_adjustment",
         "preview_path", "annotation_data",
     ]
@@ -102,7 +102,7 @@ def test_a_frame_with_no_bodies_is_skipped_with_no_annotation_data():
 
     entry = build_result_entries([frame])[0]
 
-    assert list(entry) == ["file", "key", "status", "auto_adjustment", "preview_path"]
+    assert list(entry) == ["file", "key", "capture_ts", "status", "auto_adjustment", "preview_path"]
     assert entry["status"] == "skipped"
     assert "annotation_data" not in entry
 

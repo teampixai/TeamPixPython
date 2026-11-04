@@ -1013,20 +1013,6 @@ input.culling-file-path:focus {
 .llm-grade-badge.llm-grade-mid { background: #b8860b; }
 .llm-grade-badge.llm-grade-low { background: #b33a3a; }
 
-/* Shown in the main-pane rank-info bar only while viewMode === "original"
-   (see culling.js toggleViewMode) — the default annotated view has no badge. */
-.view-mode-badge {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 16px;
-  color: #fff;
-  white-space: nowrap;
-  background: #3b6ea5;
-}
-
 .culling-strip {
   flex: 0 0 auto;
   display: flex;

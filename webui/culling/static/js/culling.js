@@ -132,7 +132,9 @@ async function initCulling() {
   }
   $("#cullingApp").show();
 
-  await loadSummary();
+  // Summary and data are independent; start both so the page isn't
+  // held up behind the summary. loadSummary handles its own errors.
+  const summaryLoaded = loadSummary();
 
   try {
     await fetchFiltered();
@@ -141,6 +143,7 @@ async function initCulling() {
   } catch (err) {
     $("#cullingStatus").text("Failed to load culling data: " + err.message).show();
   }
+  await summaryLoaded;
 }
 
 async function loadSummary() {
@@ -357,10 +360,6 @@ function renderMain() {
   }
   if (activeImage.burstRanking) {
     $rankInfo.append($("<span>", { class: "rank-reason" }).text(activeImage.burstRanking.reason || ""));
-  }
-  if (viewMode === "original") {
-    $rankInfo.append($("<span>", { class: "view-mode-badge" }).text("Original (x to toggle)"));
-    hasRankInfo = true;
   }
   if (hasRankInfo) $rankInfo.show();
 

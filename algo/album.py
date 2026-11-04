@@ -580,6 +580,18 @@ class AlbumImage:
         return True
 
     @property
+    def capture_ts(self) -> Optional[float]:
+        """When the photo was taken (Unix timestamp), cached at import so
+        burst grouping never has to re-read EXIF from the source. None for
+        albums written before it was recorded."""
+        ts = self._d.get("capture_ts")
+        return float(ts) if ts is not None else None
+
+    @capture_ts.setter
+    def capture_ts(self, value: Optional[float]) -> None:
+        self._d["capture_ts"] = value
+
+    @property
     def llm_grade(self) -> Optional[float]:
         """The LLM's 0.0-1.0 quality score, None if culling never ran."""
         grade = self._d.get("llm_grade")

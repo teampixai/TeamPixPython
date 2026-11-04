@@ -39,7 +39,6 @@ import time
 import uuid
 import webbrowser
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -58,13 +57,6 @@ from algo.album_info import CATEGORIES as CULLING_CATEGORIES
 from algo.album_info import INFO_JSON_NAME, AlbumInfo, category_for_status
 from algo.utils import THUMBNAILS_SUBDIR, image_capture_timestamp
 from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, render_player_videos, summarize_bursts
-
-try:
-    from PIL import Image as _PILImage
-    from PIL import ExifTags as _PILExifTags
-except ImportError:  # Pillow not installed — EXIF timestamps just won't be available.
-    _PILImage = None
-    _PILExifTags = None
 
 log = logging.getLogger("CullingApp")
 
@@ -1685,53 +1677,23 @@ _CULLING_DEFAULT_STARS = {"blur": 1, "sharp": 3, "skipped": 0}
 # the same "burst" for the nav-pane grouping.
 BURST_GAP_SECONDS = 1.0
 
-# EXIF tag ids (main IFD "DateTime", and Exif sub-IFD "DateTimeOriginal" /
-# "DateTimeDigitized") — checked in that order.
-_EXIF_TAG_DATETIME = 306
-_EXIF_TAG_DATETIME_ORIGINAL = 36867
-_EXIF_TAG_DATETIME_DIGITIZED = 36868
 
-
-@lru_cache(maxsize=None)
-def _image_timestamp(path: Path) -> float:
-    """Best-effort capture time (as a Unix timestamp) for burst grouping:
-    EXIF capture time first, falling back to min(file create time, file
-    modified time) when EXIF is missing/unreadable (non-JPEG source, no
-    camera metadata, Pillow not installed, etc.).
-
-    Memoized (per resolved source path, for the life of the server process):
-    this previously re-opened and re-parsed EXIF for every image in the
-    album on *every* /api/culling/summary and /api/culling/data call (two
-    full album scans per page load, repeated again on every star-filter/sort
-    change), which dominated the Culling page's load time on large albums.
-    Source photos are never modified in place after import, so the result
-    never goes stale for a given path."""
-    if _PILImage is not None:
-        try:
-            with _PILImage.open(path) as img:
-                exif = img.getexif()
-                raw = exif.get(_EXIF_TAG_DATETIME)
-                if not raw:
-                    sub = exif.get_ifd(_PILExifTags.IFD.Exif)
-                    raw = sub.get(_EXIF_TAG_DATETIME_ORIGINAL) or sub.get(_EXIF_TAG_DATETIME_DIGITIZED)
-                if raw:
-                    return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S").timestamp()
-        except Exception:
-            pass
-    try:
-        stat = path.stat()
-        return min(stat.st_ctime, stat.st_mtime)
-    except OSError:
-        return 0.0
-
-
-def _culling_images(album_path: Path, category: str) -> list[dict]:
+def _culling_images(
+    album_path: Path, category: str, with_timestamp: bool = True,
+    backfilled: Optional[list] = None,
+) -> list[dict]:
     """Per-image metadata for one review category: album key, source path,
     effective star rating, effective keep state (derived from the star
     rating — 3+ = keep — so it can never drift out of sync with the
-    star-driven color scheme), and best-effort capture timestamp. Preview
+    star-driven color scheme), and capture timestamp. Preview
     and thumbnail images are fetched by key (see /api/anno_img and
-    /api/culling/thumb), so no filenames are sent to the client."""
+    /api/culling/thumb), so no filenames are sent to the client.
+
+    The timestamp (only burst grouping/sorting needs it) comes from the
+    album's cached ``capture_ts``; a photo imported before that was recorded
+    gets it read from the source once, set on the album, and appended to
+    *backfilled* so the caller can persist it. ``with_timestamp=False``
+    skips all of that (``timestamp`` is None)."""
     info = AlbumInfo(album_path)
     src_dir = Path(info.src_dir)
     album_images = album_for(album_path).images
@@ -1754,7 +1716,13 @@ def _culling_images(album_path: Path, category: str) -> list[dict]:
         # Prefer the per-entry absolute source path (multi-source-directory
         # imports) over joining the album's single legacy SrcDir.
         src_path = entry.source_path or src_dir / src_name
-        ts_path = src_path if src_path.is_file() else preview
+        timestamp = None
+        if with_timestamp:
+            timestamp = image.capture_ts
+            if timestamp is None:
+                timestamp = image.capture_ts = image_capture_timestamp(src_path)
+                if backfilled is not None:
+                    backfilled.append(image)
         images.append({
             "file": src_name,
             "path": str(src_path),
@@ -1762,7 +1730,7 @@ def _culling_images(album_path: Path, category: str) -> list[dict]:
             "stars": stars,
             "burstRanking": burst_ranking,
             "llmGrade": llm_grade,
-            "timestamp": _image_timestamp(ts_path),
+            "timestamp": timestamp,
         })
     return images
 
@@ -1774,19 +1742,25 @@ def _kept_image_basenames(album_path: Path, min_stars: int = 3) -> set[str]:
     to copy to the destination."""
     kept: set[str] = set()
     for category in CULLING_CATEGORIES:
-        for image in _culling_images(album_path, category):
+        for image in _culling_images(album_path, category, with_timestamp=False):
             if image["stars"] >= min_stars:
                 kept.add(image["file"])
     return kept
 
 
-def _all_culling_images(album_path: Path) -> list[dict]:
+def _all_culling_images(album_path: Path, with_timestamp: bool = True) -> list[dict]:
     """Every reviewable image (blur + sharp + skipped combined) with its
     effective star rating — the single pool the Culling page's star filter
-    is applied against."""
+    is applied against. Capture times computed for photos that had none
+    cached are persisted to album.json (once, synchronously) before
+    returning."""
     images = []
+    backfilled: list = []
     for category in CULLING_CATEGORIES:
-        images.extend(_culling_images(album_path, category))
+        images.extend(_culling_images(album_path, category, with_timestamp, backfilled))
+    if backfilled:
+        album_for(album_path).save()
+        log.info("Cached capture time for %d photo(s) in %s", len(backfilled), album_path.name)
     return images
 
 
@@ -2880,7 +2854,7 @@ def api_culling_summary() -> dict:
     1-5 = graded), for the star-filter checkboxes' live counts."""
     album_path = _current_album_path()
     star_counts = {str(n): 0 for n in range(6)}
-    for image in _all_culling_images(album_path):
+    for image in _all_culling_images(album_path, with_timestamp=False):
         star_counts[str(image["stars"])] += 1
     return {"starCounts": star_counts}
 
