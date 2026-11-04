@@ -139,6 +139,9 @@ $(function () {
 //     ...react to data...
 //   });
 //
+// If the server stops answering for ~10s while polling, the dialog becomes
+// closable (and says so in the log) instead of trapping the user.
+//
 // If `dialogId` isn't already a <div> on the page, one is created lazily
 // (with a single <textarea outputId>) the first time create() runs, so new
 // callers (like ai-edit.js) don't need to hand-author any dialog markup.
@@ -217,19 +220,68 @@ const LogDialog = (function () {
     // Stops itself as soon as the job is no longer running, so onData's
     // "finished" branch fires exactly once instead of repeating forever
     // (every caller relies on this single-fire behavior).
+    //
+    // Resilience: ticks never overlap (a stalled server would otherwise
+    // pile up requests until the browser's per-host connection limit is
+    // hit), each request times out, and if the server stays unreachable
+    // for STALL_AFTER_MS the dialog becomes closable again so the user is
+    // never trapped behind a modal with no [x]. Polling keeps retrying
+    // either way, and re-locks the dialog if the server comes back while
+    // the job is still running.
+    const REQUEST_TIMEOUT_MS = 5000;
+    const STALL_AFTER_MS = 10000;
+
     function startPolling(onData) {
       stop();
+      let inFlight = false;
+      let firstFailureAt = null;
+      let stalled = false;
+
+      function markStalled() {
+        stalled = true;
+        appendLines(["⚠ Lost contact with the server — it may be busy, paused or stopped. You can close this dialog; the job may still be running."]);
+        $dialog.dialog("option", "closeOnEscape", true);
+        $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+      }
+
+      function markRecovered() {
+        stalled = false;
+        appendLines(["Reconnected to the server."]);
+        $dialog.dialog("option", "closeOnEscape", false);
+        $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+      }
+
       async function tick() {
+        if (inFlight) return;
+        inFlight = true;
         let data;
+        const controller = new AbortController();
+        const abortTimer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
-          data = await apiGet(opts.statusUrl(since));
+          const r = await fetch(opts.statusUrl(since), { signal: controller.signal });
+          if (!r.ok) throw new Error((await r.text()) || r.statusText);
+          data = await r.json();
         } catch (err) {
+          const now = Date.now();
+          if (firstFailureAt === null) firstFailureAt = now;
+          if (!stalled && now - firstFailureAt >= STALL_AFTER_MS) markStalled();
           return; // transient — try again next tick
+        } finally {
+          clearTimeout(abortTimer);
+          inFlight = false;
         }
+        firstFailureAt = null;
+        if (stalled && data.running) markRecovered();
+        stalled = false;
         appendLines(data.lines);
         since = data.next;
         if (!data.running) stop();
-        onData(data);
+        try {
+          onData(data);
+        } catch (err) {
+          console.error(`${opts.label || "job"} status handler failed`, err);
+          if (!data.running) setFinished();
+        }
       }
       timer = setInterval(tick, pollIntervalMs);
       tick();
