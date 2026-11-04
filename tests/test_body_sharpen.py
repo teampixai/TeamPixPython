@@ -266,6 +266,85 @@ def test_sharpen_bodies_keypoints_exclude_neighbour_blob_inside_the_box(monkeypa
     assert neighbour_px.max() == 0  # neighbour's blob now fully excluded
 
 
+def test_sharpen_bodies_fills_debug_layers_with_silhouette_and_sharpened(monkeypatch):
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _TwoBlobsSegmenter())
+    image = np.full((400, 1000, 3), 7, dtype=np.uint8)
+    target = (0.40, 0.25, 0.50, 0.75)
+    keypoints = [[420 / 1000, 210 / 400, 0.9]]  # on the target's own blob only
+    debug = {}
+
+    result = autoedit.sharpen_bodies(image, [target], _FakeDispatcher(), keypoints_norm=[keypoints], debug_layers=debug)
+
+    assert set(debug) == {"silhouette", "sharpened"}
+    silhouette, sharpened = debug["silhouette"], debug["sharpened"]
+    assert silhouette.shape == image.shape[:2] and silhouette.dtype == np.float32
+    assert sharpened.shape == image.shape and sharpened.dtype == np.uint8
+    assert silhouette[200, 485] == 0.0   # the neighbour's blob isn't in the blend mask
+    assert silhouette[210, 420] > 0.9
+    assert silhouette[0, 0] == 0.0       # outside every crop
+    # The sharpened layer holds the unmasked sharpened crop (the fake paints it white),
+    # and the untouched original everywhere else...
+    assert sharpened[200, 485].min() == 255
+    assert np.array_equal(sharpened[0, 0], image[0, 0])
+    # ...and blending it over the original with the silhouette reproduces the result.
+    alpha = np.clip(silhouette, 0, 1)[..., None]
+    rebuilt = sharpened.astype(np.float32) * alpha + image.astype(np.float32) * (1 - alpha)
+    np.testing.assert_allclose(rebuilt, result, atol=1.0)
+
+
+def test_sharpen_bodies_without_debug_layers_is_unchanged(monkeypatch):
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _EverythingIsPerson())
+    image = np.zeros((400, 1000, 3), dtype=np.uint8)
+    a = autoedit.sharpen_bodies(image, [(0.40, 0.25, 0.50, 0.75)], _FakeDispatcher())
+    b = autoedit.sharpen_bodies(image, [(0.40, 0.25, 0.50, 0.75)], _FakeDispatcher(), debug_layers={})
+    assert np.array_equal(a, b)
+
+
+def test_process_one_saves_the_four_debug_images_at_full_resolution(monkeypatch, tmp_path):
+    import cv2
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _EverythingIsPerson())
+    src = tmp_path / "IMG_0001.png"
+    original = np.full((400, 1000, 3), 40, dtype=np.uint8)
+    cv2.imwrite(str(src), original)
+    debug_dir = tmp_path / "debug" / "esrgan_silhouette"
+
+    out = autoedit.process_one(
+        src, [autoedit.AiSharpenPipeline()], tmp_path / "out", "png", 95,
+        _FakeDispatcher(), None, out_file=tmp_path / "result.png",
+        body_boxes=[(0.40, 0.25, 0.50, 0.75)], silhouette_dir=debug_dir,
+    )
+
+    assert out is not None
+    assert sorted(p.name for p in debug_dir.iterdir()) == [
+        "IMG_0001_final.jpg", "IMG_0001_orig.jpg", "IMG_0001_sharpened.jpg", "IMG_0001_silhouette.png",
+    ]
+    for name in ("IMG_0001_final.jpg", "IMG_0001_orig.jpg", "IMG_0001_sharpened.jpg", "IMG_0001_silhouette.png"):
+        assert cv2.imread(str(debug_dir / name), cv2.IMREAD_UNCHANGED).shape[:2] == (400, 1000)
+    assert abs(int(cv2.imread(str(debug_dir / "IMG_0001_orig.jpg"))[10, 10, 0]) - 40) <= 1
+    assert cv2.imread(str(debug_dir / "IMG_0001_silhouette.png"), cv2.IMREAD_UNCHANGED)[200, 450] == 255
+    assert cv2.imread(str(debug_dir / "IMG_0001_final.jpg"))[200, 450].min() > 240
+
+
+def test_process_one_saves_nothing_without_silhouette_dir_or_when_nothing_is_sharpened(monkeypatch, tmp_path):
+    import cv2
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _NobodyIsPerson())
+    src = tmp_path / "IMG_0002.png"
+    cv2.imwrite(str(src), np.full((100, 200, 3), 40, dtype=np.uint8))
+    debug_dir = tmp_path / "debug"
+
+    autoedit.process_one(src, [autoedit.AiSharpenPipeline()], tmp_path / "out", "png", 95, _FakeDispatcher(), None,
+                         out_file=tmp_path / "r.png", body_boxes=[(0.4, 0.25, 0.5, 0.75)], silhouette_dir=debug_dir)
+    assert not debug_dir.exists()  # segmentation found nobody -> nothing sharpened -> nothing saved
+
+
 # --- unselected ("protected") players -------------------------------------- #
 
 def _standing_keypoints(cx: float, top: float, bottom: float, w: int, h: int) -> list[list[float]]:
@@ -297,6 +376,69 @@ def test_sharpen_bodies_leaves_protected_neighbour_inside_the_box_untouched(monk
     # Without protection the same pixel would have been sharpened.
     unprotected = autoedit.sharpen_bodies(image, [target], _FakeDispatcher(), keypoints_norm=[target_kps])
     assert unprotected[200, 590].min() > 240
+
+
+def _person_keypoints(cx: float, top: float, height: float, w: int, h: int) -> list[list[float]]:
+    """17 confident COCO keypoints of a person standing facing the camera,
+    horizontally centred on *cx* (px), spanning *height* px from *top*,
+    normalised to a w x h image."""
+    layout = [  # (dx, y), as fractions of the height
+        (0, .07), (-.02, .06), (.02, .06), (-.04, .07), (.04, .07),
+        (-.11, .20), (.11, .20), (-.14, .35), (.14, .35), (-.15, .48), (.15, .48),
+        (-.07, .50), (.07, .50), (-.07, .72), (.07, .72), (-.07, .93), (.07, .93),
+    ]
+    return [[(cx + dx * height) / w, (top + y * height) / h, 0.95] for dx, y in layout]
+
+
+def test_same_person_tells_a_duplicate_from_a_neighbour():
+    mine = [(x * 1000, y * 400, c) for x, y, c in _person_keypoints(460, 40, 320, 1000, 400)]
+    duplicate = [(x * 1000, y * 400, c) for x, y, c in _person_keypoints(480, 45, 320, 1000, 400)]
+    neighbour = [(x * 1000, y * 400, c) for x, y, c in _person_keypoints(560, 40, 320, 1000, 400)]
+    assert autoedit._same_person(mine, duplicate, 320)
+    assert not autoedit._same_person(mine, neighbour, 320)
+    assert not autoedit._same_person(mine, [], 320)
+
+
+def test_protected_duplicate_detection_of_the_target_does_not_carve_it_up(monkeypatch):
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _EverythingIsPerson())
+    w, h = 1000, 400
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    target = (0.40, 0.10, 0.52, 0.90)
+    duplicate = (0.42, 0.11, 0.54, 0.91)  # the same player detected twice, shifted 20 px
+    kps = _person_keypoints(460, 40, 320, w, h)
+    dup_kps = _person_keypoints(480, 44, 320, w, h)
+
+    result = autoedit.sharpen_bodies(
+        image, [target], _FakeDispatcher(), keypoints_norm=[kps], protected_norm=[(duplicate, dup_kps)],
+    )
+
+    # Across the whole torso, including the side the duplicate is deeper on.
+    for x in (430, 460, 495):
+        assert result[150, x].min() > 240, x
+
+
+def test_sharpening_is_limited_to_the_targets_own_body_when_others_are_nearby(monkeypatch):
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _EverythingIsPerson())
+    w, h = 1000, 400
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    target = (0.38, 0.10, 0.54, 0.90)
+    neighbour = (0.52, 0.10, 0.64, 0.90)
+    kps = _person_keypoints(460, 40, 320, w, h)
+    other_kps = _person_keypoints(580, 40, 320, w, h)
+
+    result = autoedit.sharpen_bodies(
+        image, [target], _FakeDispatcher(), keypoints_norm=[kps], protected_norm=[(neighbour, other_kps)],
+    )
+
+    assert result[62, 460].min() > 240   # the target's head
+    assert result[150, 460].min() > 240  # torso
+    # A corner of the target's box that its body doesn't reach (and the segmenter
+    # called "person" anyway, as it would for a merged neighbour) stays untouched.
+    assert result[60, 385].max() < 40
 
 
 def test_protected_keep_mask_is_none_when_nobody_overlaps():

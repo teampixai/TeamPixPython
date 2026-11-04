@@ -178,8 +178,14 @@ const Viewport = (function () {
   // button / nav buttons) are excluded from the "anything closes this
   // window" behavior below, so the path can be selected/copied and the
   // buttons clicked without the window vanishing first.
-  function showImageWindow(images, index) {
+  //
+  // `opts.onAiEditResult(result)` (optional) is called with AiEdit.run's
+  // result when an AI edit launched from this window ends. Whenever the
+  // photo changed (`result.changed`), the window itself first reloads the
+  // current image so it shows the edited (or reverted) photo.
+  function showImageWindow(images, index, opts) {
     images = images || [];
+    opts = opts || {};
     let current = Math.max(0, Math.min(images.length - 1, index || 0));
     const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
 
@@ -199,7 +205,7 @@ const Viewport = (function () {
       $toolbar.append($pathInput);
       $toolbar.append(
         $("<button>", { type: "button", class: "btn btn-sm" }).text("AI edit")
-          .on("click", () => { if (currentAiEditKey) AiEdit.run(currentAiEditKey); })
+          .on("click", () => { if (currentAiEditKey) AiEdit.run(currentAiEditKey, { onResult: onAiEditResult }); })
       );
       $backdrop.append($toolbar);
     }
@@ -235,6 +241,28 @@ const Viewport = (function () {
       const item = images[current] || {};
       if ($pathInput) $pathInput.val(item.originalPath || "");
       currentAiEditKey = item.aiEditKey || null;
+    }
+
+    // The server always serves the current (edited, if any) version at the
+    // same URL, so after an edit the browser has to be told to refetch: a
+    // changing query string defeats its cache, and a kept edit may be a
+    // different size (crop), so zoom/pan start over.
+    function onAiEditResult(result) {
+      if (result.changed) {
+        const i = images.findIndex((it) => it.aiEditKey === result.file);
+        if (i >= 0) {
+          const base = images[i].url.split("?")[0];
+          images[i].url = `${base}?t=${Date.now()}`;
+          if (i === current) {
+            $img.off("load").one("load", function () {
+              lock();
+              zoomCtl.resetToFit(imgs());
+            });
+            $img.attr("src", images[i].url);
+          }
+        }
+      }
+      if (opts.onAiEditResult) opts.onAiEditResult(result);
     }
 
     function updateNavUI() {
@@ -372,8 +400,10 @@ const Viewport = (function () {
   // clicking away, Esc, or any other key: the caller needs an explicit
   // verdict, so the only ways out are the two action buttons.
   // `opts`: { title, beforeUrl, afterUrl, beforeLabel, afterLabel,
-  //           acceptLabel, rejectLabel, onAccept, onReject } — the two
-  // handlers may return a promise; the window closes once it settles.
+  //           acceptLabel, rejectLabel, onAccept, onReject, extraButtons }
+  // — the handlers may return a promise; the window closes once it settles.
+  // `extraButtons` is an optional array of `{ label, onClick }` shown between
+  // the reject and accept buttons, handled the same way.
   //
   // Optional extras (used by the edit mode in static/js/ai-edit.js):
   //   sidePanel      — element shown to the right of the viewport; the
@@ -387,12 +417,24 @@ const Viewport = (function () {
   //                    coordinates; return true if handled, which skips the
   //                    usual fit/actual zoom toggle.
   //   onImageHover(x, y)  — pointer moved over the image (x/y null when it
-  //                    left); return true to show a pointer cursor.
-  // Returns { close, setAfterUrl }.
+  //                    left); return true to show a pointer cursor, or a CSS
+  //                    cursor name (e.g. "nwse-resize") to show that one.
+  //   onPointerDown(x, y, e) — mouse button pressed over the image; return
+  //                    true to claim the drag, which then reports every move
+  //                    to onPointerMove(x, y, e) and the release to
+  //                    onPointerUp(x, y, e) (coordinates not clamped to the
+  //                    image) instead of panning, and swallows the click.
+  //   onViewChange(zoom)  — called whenever zoom/pan/size changes, so
+  //                    overlay content can keep a constant on-screen size.
+  // Returns { close, setAfterUrl, setBeforeUrl, setSplit, pxToImage, zoom }.
   function showCompareWindow(opts) {
     opts = opts || {};
+    const HINT_SPLIT = "Drag the handle to compare \u2014 scroll to zoom, drag image to pan";
+    const HINT_SINGLE = "Scroll to zoom, drag image to pan";
     const zoomCtl = createZoomController({ min: 1, max: 6, step: 0.25 });
     let sliderPct = 50;
+    // false = single-image mode: only the after image, no slider (setSplit).
+    let split = true;
     const hasPanel = !!opts.sidePanel;
 
     const $beforeImg = $("<img>", { src: opts.beforeUrl, alt: opts.beforeLabel || "Before", class: "compare-slider-before" });
@@ -412,10 +454,14 @@ const Viewport = (function () {
 
     const $reject = $("<button>", { type: "button", class: "btn btn-danger" }).text(opts.rejectLabel || "Reject");
     const $accept = $("<button>", { type: "button", class: "btn btn-primary" }).text(opts.acceptLabel || "Accept");
-    const $toolbar = $("<div>", { class: "compare-window-toolbar" }).append(
-      $("<span>", { class: "compare-window-hint" }).text("Drag the handle to compare \u2014 scroll to zoom, drag image to pan")
+    // Optional extra buttons between the two (opts.extraButtons).
+    const $extras = (opts.extraButtons || []).map((b) =>
+      $("<button>", { type: "button", class: "btn" }).text(b.label).on("click", () => decide(b.onClick))
     );
-    if (!hasPanel) $toolbar.append($reject, $accept);
+    const $toolbar = $("<div>", { class: "compare-window-toolbar" }).append(
+      $("<span>", { class: "compare-window-hint" }).text(HINT_SPLIT)
+    );
+    if (!hasPanel) $toolbar.append($reject, ...$extras, $accept);
     const $body = $("<div>", { class: "compare-window-body" }).append($viewport);
     if (hasPanel) $body.append($(opts.sidePanel).addClass("compare-window-panel"));
     const $backdrop = $("<div>", { class: "image-window-backdrop compare-window-backdrop" }).append(
@@ -464,9 +510,21 @@ const Viewport = (function () {
     function syncClip() {
       const width = $viewport.width();
       if (!width) return;
+      if (!split) {
+        $afterImg.css("clip-path", "none");
+        notifyView();
+        return;
+      }
       const handlePx = (sliderPct / 100) * width;
       const localPct = ((handlePx - zoomCtl.tx) / zoomCtl.zoom / width) * 100;
       $afterImg.css("clip-path", `inset(0 0 0 ${Math.min(100, Math.max(0, localPct))}%)`);
+      notifyView();
+    }
+
+    // Every zoom/pan/resize ends in syncClip(), so this is the one place
+    // that tells the caller the view changed.
+    function notifyView() {
+      if (opts.onViewChange) opts.onViewChange(zoomCtl.zoom);
     }
 
     // The viewport box is sized from whichever image reports a natural size
@@ -488,9 +546,11 @@ const Viewport = (function () {
       zoomCtl.apply(imgs());
       setSlider(sliderPct);
     }
+    // Re-locked on every load, not just the first: setAfterUrl/setBeforeUrl
+    // may swap in a photo of a different size (the edit panel's Reload).
     [$beforeImg, $afterImg].forEach(($img) => {
+      $img.on("load", lock);
       if ($img[0].complete) lock();
-      else $img.on("load", lock);
     });
     $(window).on("resize.compareWindow", lock);
 
@@ -521,18 +581,38 @@ const Viewport = (function () {
     // images at once so they stay in lockstep.
     let dragging = false;
     let dragMoved = false;
+    // A drag claimed by opts.onPointerDown (e.g. moving a crop box).
+    let pointerDrag = false;
     $viewport.on("mousedown", "img", function (e) {
       e.preventDefault();
       dragMoved = false;
+      if (opts.onPointerDown && e.button === 0) {
+        const pt = toImageCoords(e.clientX, e.clientY);
+        if (pt && opts.onPointerDown(pt.x, pt.y, e)) {
+          pointerDrag = true;
+          dragMoved = true;  // swallow the click that follows
+          return;
+        }
+      }
       dragging = zoomCtl.dragStart(this, e.clientX, e.clientY);
     });
     $(document).on("mousemove.compareWindowDrag", function (e) {
+      if (pointerDrag) {
+        const pt = toImageCoords(e.clientX, e.clientY);
+        if (pt && opts.onPointerMove) opts.onPointerMove(pt.x, pt.y, e);
+        return;
+      }
       if (!dragging) return;
       dragMoved = true;
       zoomCtl.dragMove(imgs(), e.clientX, e.clientY);
       syncClip();
     });
-    $(document).on("mouseup.compareWindowDrag", function () {
+    $(document).on("mouseup.compareWindowDrag", function (e) {
+      if (pointerDrag) {
+        pointerDrag = false;
+        const pt = toImageCoords(e.clientX, e.clientY);
+        if (opts.onPointerUp) opts.onPointerUp(pt ? pt.x : null, pt ? pt.y : null, e);
+      }
       dragging = false;
     });
     $viewport.on("wheel", "img", function (e) {
@@ -555,14 +635,19 @@ const Viewport = (function () {
       syncClip();
     });
     if (opts.onImageHover) {
+      const setCursor = (result) => {
+        $viewport.toggleClass("compare-window-pointer", result === true);
+        $viewport.find("img").css("cursor", typeof result === "string" ? result : "");
+      };
       $viewport.on("mousemove", "img", function (e) {
-        if (dragging) return;
+        if (dragging || pointerDrag) return;
         const pt = toImageCoords(e.clientX, e.clientY);
-        $viewport.toggleClass("compare-window-pointer", !!(pt && opts.onImageHover(pt.x, pt.y)));
+        setCursor(pt ? opts.onImageHover(pt.x, pt.y) : false);
       });
       $viewport.on("mouseleave", function () {
+        if (pointerDrag) return;
         opts.onImageHover(null, null);
-        $viewport.removeClass("compare-window-pointer");
+        setCursor(false);
       });
     }
 
@@ -590,6 +675,7 @@ const Viewport = (function () {
     function decide(handler) {
       $accept.prop("disabled", true);
       $reject.prop("disabled", true);
+      $extras.forEach(($b) => $b.prop("disabled", true));
       Promise.resolve(handler ? handler() : null).then(close, close);
     }
     $accept.on("click", () => decide(opts.onAccept));
@@ -600,7 +686,31 @@ const Viewport = (function () {
       $afterImg.attr("src", url);
     }
 
-    return { close, setAfterUrl };
+    function setBeforeUrl(url) {
+      $beforeImg.attr("src", url);
+    }
+
+    // true = before/after split with the slider; false = the after image
+    // alone (no slider, no badges).
+    function setSplit(on) {
+      split = !!on;
+      $viewport.toggleClass("compare-window-single", !split);
+      $toolbar.find(".compare-window-hint").text(split ? HINT_SPLIT : HINT_SINGLE);
+      syncClip();
+    }
+
+    // How much of the image (normalised 0-1, per axis) `px` screen pixels
+    // span at the current zoom — for zoom-independent hit tolerances.
+    function pxToImage(px) {
+      const w = $viewport.width() || 1;
+      const h = $viewport.height() || 1;
+      return { x: px / (w * zoomCtl.zoom), y: px / (h * zoomCtl.zoom) };
+    }
+
+    return {
+      close, setAfterUrl, setBeforeUrl, setSplit, pxToImage,
+      get zoom() { return zoomCtl.zoom; },
+    };
   }
 
   return { computeContainFit, createZoomController, showImageWindow, showCompareWindow };

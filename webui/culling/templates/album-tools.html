@@ -256,7 +256,8 @@
   <h3>Per-Player Highlight Videos <span class="muted">(experimental)</span></h3>
   <p class="muted">
     Renders one MP4 per tagged player, containing every photo they're
-    recognized in (chronological order), regardless of star rating. Uses
+    recognized in (chronological order), regardless of star rating. Always
+    uses the original photos, never AI-edited versions. Uses
     ffmpeg if it's on PATH for best quality, otherwise falls back to a
     lower-quality built-in encoder.
   </p>
@@ -293,7 +294,8 @@
   <p class="muted">
     Stitches each detected photo burst (consecutive shots within 1 second of
     each other, regardless of blur/sharp verdict) into its own MP4, saved to
-    a destination folder of your choice. Uses ffmpeg if it's on PATH for
+    a destination folder of your choice. Always uses the original photos,
+    never AI-edited versions. Uses ffmpeg if it's on PATH for
     best quality, otherwise falls back to a lower-quality built-in encoder.
   </p>
   <div class="row">

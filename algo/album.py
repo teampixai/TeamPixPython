@@ -17,6 +17,7 @@ know this cache exists.
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import threading
@@ -75,6 +76,84 @@ def entry_key(entry: dict) -> str:
     entries in place without wrapping every one in an `AlbumImage`.
     """
     return entry.get("key") or Path(entry.get("file", "")).name
+
+
+# ---------------------------------------------------------------------------
+# Re-framing detections onto a cropped photo
+# ---------------------------------------------------------------------------
+# Every stored position is normalised (0-1) to the ORIGINAL photo. A copy
+# saved from a cropped edit is a different frame, so the positions are mapped
+# through the crop -- the normalised (x1, y1, x2, y2) rectangle of the
+# original the copy shows.
+NormCrop = tuple[float, float, float, float]
+
+
+def box_in_crop(box: tuple[float, float, float, float], crop: Optional[NormCrop]) -> Optional[NormCrop]:
+    """*box* (normalised to the original) re-expressed in the frame of a
+    photo cropped to *crop*, clipped to it; None if nothing of it is left."""
+    if crop is None:
+        return box
+    cx1, cy1, cx2, cy2 = crop
+    cw, ch = cx2 - cx1, cy2 - cy1
+    x1 = min(1.0, max(0.0, (box[0] - cx1) / cw))
+    y1 = min(1.0, max(0.0, (box[1] - cy1) / ch))
+    x2 = min(1.0, max(0.0, (box[2] - cx1) / cw))
+    y2 = min(1.0, max(0.0, (box[3] - cy1) / ch))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _box_wire_in_crop(wire: Optional[dict], crop: NormCrop) -> Optional[dict]:
+    """A ``{"x1", "y1", "x2", "y2"}`` wire box mapped through *crop*; None
+    when it is absent or the crop removed it entirely."""
+    if not wire:
+        return None
+    mapped = box_in_crop((wire["x1"], wire["y1"], wire["x2"], wire["y2"]), crop)
+    if mapped is None:
+        return None
+    return {"x1": mapped[0], "y1": mapped[1], "x2": mapped[2], "y2": mapped[3]}
+
+
+def _point_wire_in_crop(wire: dict, crop: NormCrop) -> dict:
+    """A keypoint/landmark wire dict mapped through *crop*. Keypoint lists
+    are positional (17 COCO points), so one the crop cut off is kept, pinned
+    to the new frame's edge, with zero confidence and not passed."""
+    cx1, cy1, cx2, cy2 = crop
+    x = (wire["x"] - cx1) / (cx2 - cx1)
+    y = (wire["y"] - cy1) / (cy2 - cy1)
+    out = dict(wire)
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        out["x"], out["y"] = x, y
+    else:
+        out["x"], out["y"] = min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
+        out["conf"] = 0.0
+        out["passed"] = False
+    return out
+
+
+def _person_wire_in_crop(person: dict, crop: NormCrop) -> Optional[dict]:
+    """A copy of an ``evaluated[]`` person dict re-framed to *crop*, or None
+    when the crop removed the person's body altogether. A face the crop cut
+    off is dropped from the copy while the body stays."""
+    body = person.get("body_bbox")
+    if body and _box_wire_in_crop(body, crop) is None:
+        return None
+    out = copy.deepcopy(person)
+    for name in ("body_bbox", "face_bbox", "narrow_face_bbox"):
+        if name in person:
+            out[name] = _box_wire_in_crop(person[name], crop)
+    if "body_keypoints" in person:
+        out["body_keypoints"] = [_point_wire_in_crop(kp, crop) for kp in person["body_keypoints"] or []]
+    face = person.get("face_kps")
+    if face:
+        face_box = _box_wire_in_crop(face.get("bbox"), crop)
+        if face_box is None:
+            out["face_kps"] = None
+        else:
+            out["face_kps"]["bbox"] = face_box
+            out["face_kps"]["landmarks"] = [_point_wire_in_crop(lm, crop) for lm in face.get("landmarks") or []]
+    return out
 
 
 class PersonRecord:
@@ -670,6 +749,107 @@ class AlbumImage:
         Stored relative to the album so the folder stays movable."""
         self._d["edited_image"] = f"{EDITEDIMAGES_SUBDIR}/{Path(path).name}"
 
+    @property
+    def edited_crop(self) -> Optional[tuple[float, float, float, float]]:
+        """Which part of the ORIGINAL photo the accepted edit shows, as a
+        normalised ``(x1, y1, x2, y2)`` box (the frame every stored
+        detection is relative to), or None when the edit is uncropped --
+        or there is no edit on disk, in which case the photo is the
+        original again."""
+        crop = self._d.get("edited_crop")
+        if not crop or self.edited_path is None:
+            return None
+        try:
+            x1, y1, x2, y2 = (float(v) for v in crop)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+            return None
+        return (x1, y1, x2, y2)
+
+    @property
+    def edited_crop_px(self) -> Optional[dict]:
+        """`edited_crop` in pixels of the ORIGINAL photo, as
+        ``{"x", "y", "h", "w"}`` (top-left corner, height, width) -- the
+        human-readable record written when a cropped edit is accepted. None
+        under the same conditions as `edited_crop`."""
+        px = self._d.get("edited_crop_px")
+        if not px or self.edited_crop is None:
+            return None
+        try:
+            return {k: int(px[k]) for k in ("x", "y", "h", "w")}
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def set_edited_crop(
+        self,
+        crop: Optional[tuple[float, float, float, float]],
+        crop_px: Optional[dict] = None,
+    ) -> None:
+        """Record where the accepted edit sits in the original photo (see
+        `edited_crop`, and `edited_crop_px` for the pixel form); None for an
+        uncropped edit."""
+        if crop is None:
+            self._d.pop("edited_crop", None)
+            self._d.pop("edited_crop_px", None)
+            return
+        self._d["edited_crop"] = [round(float(v), 6) for v in crop]
+        if crop_px is None:
+            self._d.pop("edited_crop_px", None)
+        else:
+            self._d["edited_crop_px"] = {k: int(crop_px[k]) for k in ("x", "y", "h", "w")}
+
+    def clear_edited(self) -> Optional[Path]:
+        """Forget the accepted edit, so the photo is its original again --
+        crop included. Returns where the edited file was recorded to live (it
+        may no longer exist) so the caller can delete it, or None if there
+        was none."""
+        edited = self._d.pop("edited_image", None)
+        self._d.pop("edited_crop", None)
+        self._d.pop("edited_crop_px", None)
+        return self.album.path / edited if edited else None
+
+    def copy_entry(self, *, file: Path, key: str, crop: Optional[NormCrop] = None) -> dict:
+        """A new ``results[]`` entry for a copy of this photo saved as its
+        own file (*file*, bookkeeping *key*) -- what "Save Copy" adds to the
+        album. The copy carries this photo's whole record (verdict, scores,
+        stars, detections, ...) except what is specific to this file:
+
+        - ``file``/``key``/``preview_path`` point at the copy;
+        - no edit pointers (``edited_image``, crops): the copy IS the edit;
+        - ``auto_adjustment`` is dropped, since the saved pixels already carry
+          the exposure that suggestion would apply to the original;
+        - with *crop* (the rectangle of the original the copy shows, see
+          `edited_crop`), every detection is re-framed onto the cropped
+          photo (``processing_shape`` shrinks to match) and bodies the crop
+          removed are left out. A photo that had people but none left
+          becomes "skipped", like any photo with nobody in it.
+
+        This photo's own entry is not modified.
+        """
+        entry = copy.deepcopy(self._d)
+        for name in ("edited_image", "edited_crop", "edited_crop_px"):
+            entry.pop(name, None)
+        entry["file"] = str(file)
+        entry["key"] = key
+        entry["preview_path"] = f"previews/{key}.jpg"
+        entry["auto_adjustment"] = None
+
+        annotation = entry.get("annotation_data")
+        if crop is not None and annotation:
+            people = annotation.get("evaluated") or []
+            kept = [p for p in (_person_wire_in_crop(person, crop) for person in people) if p is not None]
+            annotation["evaluated"] = kept
+            shape = annotation.get("processing_shape")
+            if shape:
+                annotation["processing_shape"] = [
+                    max(1, round(shape[0] * (crop[3] - crop[1]))),
+                    max(1, round(shape[1] * (crop[2] - crop[0]))),
+                ]
+            if people and not kept:
+                entry["status"] = "skipped"
+        return entry
+
 
 
 @dataclass
@@ -973,6 +1153,28 @@ class Album:
             self._images = None
             self._source_index = None
             self.save()
+
+    def unused_key(self, filename: str, source: Path) -> str:
+        """A bookkeeping key for a photo being added from *source* that no
+        photo already in the album uses (see make_unique_import_key)."""
+        with self._lock:
+            used = {
+                key: Path(entry["file"]).resolve()
+                for key, entry in self.entries.items() if entry.get("file")
+            }
+        return make_unique_import_key(filename, used, Path(source).resolve())
+
+    def add_entry(self, entry: dict) -> "AlbumImage":
+        """Append one photo's ``results[]`` entry (e.g. from
+        `AlbumImage.copy_entry`) and save. The caller owns the matching
+        info.json bucket, the way `import_from` does for a merged album."""
+        with self._lock:
+            self.payload.setdefault("results", []).append(entry)
+            self._entries = None
+            self._images = None
+            self._source_index = None
+            self.save()
+            return self.images[entry_key(entry)]
 
     def mark_import_complete(self) -> None:
         """Flip ``import_status`` to "complete". Called once the full

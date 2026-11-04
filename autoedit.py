@@ -12,6 +12,7 @@ Usage:
     python autoedit.py C:\\shoot\\keepers -pipelines "brightness level"
     python autoedit.py keepers.lst -pipelines "all openai_ig" --openaikey sk-...
     python autoedit.py photo.cr3 -o ./edited -ext png
+    python autoedit.py photo.jpg -pipelines tone --crop 100,50,1600,2000
 
 Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     tone             Highlights/midtones/shadows exposure (EV) + contrast,
@@ -196,14 +197,30 @@ BODY_SHARPEN_MIN_PERSON_COVERAGE = 0.01
 # whose caller did pass them.
 BODY_SHARPEN_KEYPOINT_CONF_MIN = 0.3
 
-# COCO-17 skeleton (pairs of keypoint indexes) used to tell overlapping
-# players apart: a pixel belongs to whichever player's skeleton is closest
-# (see _protected_keep_mask()).
-_COCO_BONES: tuple[tuple[int, int], ...] = (
-    (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6),
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-)
+# COCO-17 limb bones (pairs of keypoint indexes) of the body-shape model that
+# tells overlapping players apart (see _protected_keep_mask()): arms, legs.
+_ARM_BONES: tuple[tuple[int, int], ...] = ((5, 7), (7, 9), (6, 8), (8, 10))
+_LEG_BONES: tuple[tuple[int, int], ...] = ((11, 13), (13, 15), (12, 14), (14, 16))
+# Body-shape model sizes, as fractions of the player's own box height: limb
+# half-thickness, head radius, the torso polygon's (shoulders-hips) margin,
+# and how much deeper a head counts than a body part of the same size —
+# heads win ownership fights, since a sharpened stranger's face is the
+# most visible error.
+_BODY_ARM_RADIUS = 0.035
+_BODY_LEG_RADIUS = 0.055
+_BODY_HEAD_RADIUS = 0.07
+_BODY_TORSO_MARGIN = 0.02
+_BODY_HEAD_BONUS = 0.06
+# Ownership rules (fractions of the target's box height): a protected
+# player only takes a pixel when clearly deeper inside than the target
+# (_BODY_TIE_MARGIN, which keeps near-equal depths from flickering); pixels
+# further than _BODY_ALLOWED_MARGIN outside the target's own body model are
+# never sharpened (merged neighbours, the ball, ...); and an unselected
+# detection whose keypoints sit within _BODY_DUPLICATE_DISTANCE of the
+# target's on average is the same person detected twice, not a neighbour.
+_BODY_TIE_MARGIN = 0.04
+_BODY_ALLOWED_MARGIN = 0.06
+_BODY_DUPLICATE_DISTANCE = 0.12
 # The ownership map is computed on a grid with at most this many cells along
 # the crop's long edge, then upscaled — plenty for a feathered mask.
 _PROTECT_GRID_LONG_EDGE = 512
@@ -360,6 +377,41 @@ def write_image(image: np.ndarray, path: Path, ext: str, compression: int) -> bo
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(buf.tobytes())
     return True
+
+
+def parse_crop(text: str) -> tuple[int, int, int, int]:
+    """Parses --crop's "X,Y,W,H" (source pixels) into a 4-tuple of ints."""
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("--crop expects X,Y,W,H")
+    try:
+        x, y, w, h = (int(round(float(p))) for p in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--crop expects numbers: {exc}") from exc
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("--crop width and height must be positive")
+    return x, y, w, h
+
+
+def crop_image(
+    image: np.ndarray, crop: tuple[int, int, int, int], source_size: tuple[int, int] | None = None
+) -> np.ndarray:
+    """Cuts the (x, y, w, h) rectangle out of *image*, clamped to its bounds.
+
+    *crop* is in the pixels of the image as read from disk (*source_size*,
+    (width, height)); if a pipeline changed the image's size since, the
+    rectangle is scaled to match so it still covers the same part of the
+    scene."""
+    height, width = image.shape[:2]
+    x, y, w, h = crop
+    if source_size is not None and source_size != (width, height):
+        sx, sy = width / source_size[0], height / source_size[1]
+        x, y, w, h = round(x * sx), round(y * sy), round(w * sx), round(h * sy)
+    x = min(max(0, x), width - 1)
+    y = min(max(0, y), height - 1)
+    w = min(max(1, w), width - x)
+    h = min(max(1, h), height - y)
+    return image[y:y + h, x:x + w].copy()
 
 
 def collect_inputs(input_path: Path) -> list[Path]:
@@ -1087,48 +1139,90 @@ def _select_body_component(
     return mask * keep.astype(np.float32), info
 
 
-def _skeleton_segments(
-    keypoints_px: list[tuple[float, float, float]],
+def _signed_depth(shape: np.ndarray, step: float) -> np.ndarray:
+    """Signed distance (crop pixels; negative inside) to the filled region of
+    the uint8 0/1 grid *shape*; +inf everywhere if it is empty."""
+    if not shape.any():
+        return np.full(shape.shape, np.inf, dtype=np.float32)
+    inside = cv2.distanceTransform(shape, cv2.DIST_L2, 3)
+    outside = cv2.distanceTransform(1 - shape, cv2.DIST_L2, 3)
+    return (outside - inside) * np.float32(step)
+
+
+def _body_depth(
+    grid_hw: tuple[int, int],
+    step: float,
     box_px: tuple[float, float, float, float],
-) -> np.ndarray:
-    """(n, 4) array of x1, y1, x2, y2 line segments approximating a body:
-    its COCO bones between confident keypoints, plus lone confident
-    keypoints as zero-length segments; falls back to the vertical centre
-    line of its box when it has no confident keypoints at all."""
-    confident = [conf >= BODY_SHARPEN_KEYPOINT_CONF_MIN for _x, _y, conf in keypoints_px]
-    segments: list[tuple[float, float, float, float]] = []
-    used: set[int] = set()
-    if len(keypoints_px) == 17:
-        for a, b in _COCO_BONES:
-            if confident[a] and confident[b]:
-                segments.append((keypoints_px[a][0], keypoints_px[a][1], keypoints_px[b][0], keypoints_px[b][1]))
-                used.update((a, b))
-    for i, (x, y, _conf) in enumerate(keypoints_px):
-        if confident[i] and i not in used:
-            segments.append((x, y, x, y))
-    if not segments:
-        x1, y1, x2, y2 = box_px
-        cx = (x1 + x2) / 2.0
-        segments.append((cx, y1, cx, y2))
-    return np.asarray(segments, dtype=np.float32)
+    keypoints_px: list[tuple[float, float, float]],
+) -> tuple[np.ndarray, bool]:
+    """(depth, modelled): a float32 field over the ownership grid giving how
+    deep inside this player's body each cell is (negative = inside, in crop
+    pixels; positive = outside), and whether it came from their keypoints.
+
+    The body is modelled from the player's COCO keypoints as a head circle,
+    a filled shoulders-hips torso and thick limbs (sizes scale with the box
+    height — see _BODY_* constants); heads count _BODY_HEAD_BONUS deeper.
+    Parts whose keypoints aren't confident are skipped; a player with no
+    usable part at all is an ellipse inscribed in their box (modelled=False,
+    so callers shouldn't trust it to rule pixels out)."""
+    gh, gw = grid_hw
+    x1, y1, x2, y2 = box_px
+    height = max(y2 - y1, 1.0)
+    ok = [conf >= BODY_SHARPEN_KEYPOINT_CONF_MIN for _x, _y, conf in keypoints_px] if len(keypoints_px) == 17 else []
+    g = lambda i: (int(round(keypoints_px[i][0] / step)), int(round(keypoints_px[i][1] / step)))  # noqa: E731
+
+    def limbs(bones, radius):
+        shape = np.zeros((gh, gw), np.uint8)
+        thickness = max(1, int(round(2 * radius * height / step)))
+        for a, b in bones:
+            if ok and ok[a] and ok[b]:
+                cv2.line(shape, g(a), g(b), 1, thickness)
+        return shape
+
+    torso = np.zeros((gh, gw), np.uint8)
+    if ok and all(ok[i] for i in (5, 6, 11, 12)):
+        cv2.fillPoly(torso, [np.array([g(5), g(6), g(12), g(11)], np.int32)], 1)
+        cv2.polylines(torso, [np.array([g(5), g(6), g(12), g(11)], np.int32)], True, 1,
+                      max(1, int(round(2 * _BODY_TORSO_MARGIN * height / step))))
+    head = np.zeros((gh, gw), np.uint8)
+    head_pts = [keypoints_px[i][:2] for i in range(5) if ok and ok[i]]
+    if head_pts:
+        cx, cy = np.mean(head_pts, axis=0)
+        cv2.circle(head, (int(round(cx / step)), int(round(cy / step))),
+                   max(1, int(round(_BODY_HEAD_RADIUS * height / step))), 1, -1)
+
+    parts = [
+        _signed_depth(limbs(_ARM_BONES, _BODY_ARM_RADIUS), step),
+        _signed_depth(limbs(_LEG_BONES, _BODY_LEG_RADIUS), step),
+        _signed_depth(torso, step),
+        _signed_depth(head, step) - np.float32(_BODY_HEAD_BONUS * height),
+    ]
+    depth = np.minimum.reduce(parts)
+    if np.isinf(depth).all():
+        fallback = np.zeros((gh, gw), np.uint8)
+        cv2.ellipse(fallback, (int(round((x1 + x2) / 2 / step)), int(round((y1 + y2) / 2 / step))),
+                    (max(1, int(round((x2 - x1) * 0.35 / step))), max(1, int(round(height * 0.45 / step)))),
+                    0, 0, 360, 1, -1)
+        return _signed_depth(fallback, step), False
+    return depth, True
 
 
-def _distance_to_segments(xs: np.ndarray, ys: np.ndarray, segments: np.ndarray) -> np.ndarray:
-    """Distance from every grid point (xs along columns, ys along rows) to
-    the nearest of *segments*."""
-    px = xs[None, :]
-    py = ys[:, None]
-    best = np.full((ys.size, xs.size), np.inf, dtype=np.float32)
-    for x1, y1, x2, y2 in segments:
-        dx, dy = x2 - x1, y2 - y1
-        length_sq = dx * dx + dy * dy
-        if length_sq > 1e-9:
-            t = np.clip(((px - x1) * dx + (py - y1) * dy) / length_sq, 0.0, 1.0)
-        else:
-            t = 0.0
-        dist = np.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
-        np.minimum(best, dist, out=best)
-    return best
+def _same_person(
+    keypoints_a: list[tuple[float, float, float]],
+    keypoints_b: list[tuple[float, float, float]],
+    height: float,
+) -> bool:
+    """True if two detections' keypoints coincide (mean distance over the
+    keypoints both are confident about under _BODY_DUPLICATE_DISTANCE of
+    *height*, with at least 5 of them) — one person detected twice."""
+    if len(keypoints_a) != 17 or len(keypoints_b) != 17:
+        return False
+    both = [(a, b) for a, b in zip(keypoints_a, keypoints_b)
+            if a[2] >= BODY_SHARPEN_KEYPOINT_CONF_MIN and b[2] >= BODY_SHARPEN_KEYPOINT_CONF_MIN]
+    if len(both) < 5:
+        return False
+    mean = float(np.mean([math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in both]))
+    return mean < _BODY_DUPLICATE_DISTANCE * height
 
 
 def _protected_keep_mask(
@@ -1137,33 +1231,38 @@ def _protected_keep_mask(
     target_keypoints_px: list[tuple[float, float, float]],
     protected_px: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]],
 ) -> np.ndarray | None:
-    """Float32 [0, 1] mask of *shape_hw* that is 0 wherever a protected
-    (not selected) player overlaps the target: pixels inside that player's
-    box that are closer to their skeleton than to the target's. All
-    coordinates are in the crop's own pixels. None if nothing is excluded.
+    """Float32 [0, 1] mask of *shape_hw* that is 0 wherever sharpening the
+    target would also sharpen someone else, 1 elsewhere; None if nothing is
+    excluded. All coordinates are in the crop's own pixels.
 
-    The segmentation mask can't tell two touching people apart, and the
-    target's box often contains part of a neighbour; this is what keeps
-    such an unselected neighbour from being sharpened along with them."""
+    The segmentation mask can't tell touching people apart (nor the ball,
+    nor a merged neighbour's leg from the target's), so the target's own
+    body model (see _body_depth()) decides:
+      * pixels more than _BODY_ALLOWED_MARGIN of the box height away from it
+        are dropped (skipped when the target has no usable keypoints);
+      * pixels clearly deeper inside a protected player's body than inside
+        the target's (by _BODY_TIE_MARGIN) are dropped — comparing depth in
+        plain pixels means the larger, usually nearer and so occluding,
+        player wins an overlap;
+      * a protected detection that is the same person as the target is
+        ignored."""
     height, width = shape_hw
     step = max(1, int(math.ceil(max(height, width) / _PROTECT_GRID_LONG_EDGE)))
-    xs = np.arange(step / 2.0, width, step, dtype=np.float32)
-    ys = np.arange(step / 2.0, height, step, dtype=np.float32)
-    target_dist = _distance_to_segments(xs, ys, _skeleton_segments(target_keypoints_px, target_box_px))
-    remove = np.zeros((ys.size, xs.size), dtype=bool)
+    grid = (max(1, math.ceil(height / step)), max(1, math.ceil(width / step)))
+    target_height = max(target_box_px[3] - target_box_px[1], 1.0)
+    target_depth, modelled = _body_depth(grid, step, target_box_px, target_keypoints_px)
+    keep = (target_depth < _BODY_ALLOWED_MARGIN * target_height) if modelled else np.ones(grid, dtype=bool)
     for box_px, keypoints_px in protected_px:
-        x1, y1, x2, y2 = box_px
-        inside = ((xs[None, :] >= x1) & (xs[None, :] <= x2)) & ((ys[:, None] >= y1) & (ys[:, None] <= y2))
-        if not inside.any():
+        if _same_person(target_keypoints_px, keypoints_px, target_height):
             continue
-        dist = _distance_to_segments(xs, ys, _skeleton_segments(keypoints_px, box_px))
-        remove |= inside & (dist < target_dist)
-    if not remove.any():
+        depth, _ = _body_depth(grid, step, box_px, keypoints_px)
+        keep &= ~((depth < 0) & (depth < target_depth - _BODY_TIE_MARGIN * target_height))
+    if keep.all():
         return None
-    keep = cv2.resize((~remove).astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    keep_full = cv2.resize(keep.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
     if BODY_SHARPEN_CLIP_FEATHER_PX > 0:
-        keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=BODY_SHARPEN_CLIP_FEATHER_PX)
-    return keep
+        keep_full = cv2.GaussianBlur(keep_full, (0, 0), sigmaX=BODY_SHARPEN_CLIP_FEATHER_PX)
+    return keep_full
 
 
 def sharpen_bodies(
@@ -1173,6 +1272,7 @@ def sharpen_bodies(
     label: str = "",
     keypoints_norm: list[list[tuple[float, float, float]]] | None = None,
     protected_norm: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None,
+    debug_layers: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Sharpen only the given players, leaving the rest of *image*
     pixel-identical to the source.
@@ -1199,12 +1299,22 @@ def sharpen_bodies(
     list for a given box, just skips keypoint-assisted component selection
     for it — the box-clip alone is still applied.
 
+    *debug_layers*, if given (the save_silhouette debug feature), is filled
+    with two full-frame layers, composited across every sharpened box:
+    "silhouette" (float32 [0, 1]: the alpha actually used for blending —
+    after keypoint blob selection, unselected-player exclusion, feathering
+    and the box clip) and "sharpened" (uint8 BGR: *image* with every
+    sharpened padded crop pasted in unmasked — the layer that silhouette
+    blends over *image* to give the result).
+
     *protected_norm*, if given, lists players that must NOT be sharpened
-    as (normalised box, normalised keypoints) pairs. Wherever one overlaps a
-    target's crop, pixels inside its box that sit closer to its skeleton
-    than to the target's are removed from the target's mask (see
-    _protected_keep_mask()) — so an unselected neighbour touching or
-    standing in front of/behind a selected player stays untouched.
+    as (normalised box, normalised keypoints) pairs. Whenever any overlap a
+    target's crop, the target's mask is also limited to the target's own
+    keypoint-based body shape and loses the pixels a protected player
+    clearly owns (see _protected_keep_mask()) — so an unselected neighbour
+    touching or standing in front of/behind a selected player, and anything
+    merged into the same segmentation blob (a leg, the ball), stays
+    untouched, while a second detection of the same player is ignored.
 
     Logs every box it was given and, per box, whether segmentation worked
     (and how much of the crop it marked as person) or why the box was skipped.
@@ -1253,7 +1363,7 @@ def sharpen_bodies(
         if mask.shape[:2] != crop.shape[:2]:
             mask = cv2.resize(mask, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-        kps = keypoints_norm[index - 1] if keypoints_norm and index - 1 < len(keypoints_norm) else []
+        kps =  keypoints_norm[index - 1] if keypoints_norm and index - 1 < len(keypoints_norm) else []
         keypoints_px = [(kx * img_w - px1, ky * img_h - py1, kconf) for kx, ky, kconf in kps]
         mask, component_info = _select_body_component(mask, keypoints_px)
         if component_info is not None:
@@ -1276,8 +1386,8 @@ def sharpen_bodies(
                 if keep is not None:
                     before = float((mask > 0.5).mean())
                     mask = mask * keep
-                    log.info("%s  box %d/%d: excluded %d unselected overlapping player(s); person "
-                             "%.1f%% -> %.1f%% of crop",
+                    log.info("%s  box %d/%d: limited to this player's own body (%d other detection(s) "
+                             "nearby); person %.1f%% -> %.1f%% of crop",
                              prefix, index, total, len(protected_px), before * 100,
                              float((mask > 0.5).mean()) * 100)
 
@@ -1311,6 +1421,11 @@ def sharpen_bodies(
         alpha = np.clip(mask, 0.0, 1.0)[..., None]
         blended = sharpened_crop.astype(np.float32) * alpha + crop.astype(np.float32) * (1.0 - alpha)
         result[py1:py2, px1:px2] = np.clip(blended, 0, 255).astype(np.uint8)
+        if debug_layers is not None:
+            silhouette = debug_layers.setdefault("silhouette", np.zeros((img_h, img_w), dtype=np.float32))
+            np.maximum(silhouette[py1:py2, px1:px2], np.clip(alpha[..., 0], 0.0, 1.0),
+                       out=silhouette[py1:py2, px1:px2])
+            debug_layers.setdefault("sharpened", image.copy())[py1:py2, px1:px2] = sharpened_crop
         sharpened += 1
         log.info("%s  box %d/%d: segmentation OK - person %.1f%% of crop, %.1f%% after clipping "
                  "to the body box; sharpened and blended",
@@ -1433,6 +1548,14 @@ class EditContext:
     # keypoints) pairs — --boxes-file entries marked "protect" (see
     # sharpen_bodies()'s protected_norm).
     protected_bodies: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None
+    # Debug (--save-silhouette): folder to write the body-sharpen debug images
+    # into (see _save_sharpen_debug()); None = don't. `original` is the photo
+    # as read from disk (set only when silhouette_dir is), and
+    # `silhouette_saved` is flipped once the sharpen step has written its
+    # images, so process_one() knows to add the final result next to them.
+    silhouette_dir: Path | None = None
+    original: np.ndarray | None = None
+    silhouette_saved: bool = False
 
 
 class EditPipeline(ABC):
@@ -1482,10 +1605,17 @@ class AiSharpenPipeline(EditPipeline):
     def apply(self, image: np.ndarray, ctx: EditContext) -> np.ndarray:
         assert ctx.dispatcher is not None
         if AI_SHARPEN_SCOPE == "bodies" and ctx.body_boxes:
-            return sharpen_bodies(
+            debug_layers: dict[str, np.ndarray] | None = {} if ctx.silhouette_dir is not None else None
+            result = sharpen_bodies(
                 image, ctx.body_boxes, ctx.dispatcher, label=ctx.source.name,
                 keypoints_norm=ctx.body_keypoints, protected_norm=ctx.protected_bodies,
+                debug_layers=debug_layers,
             )
+            if debug_layers:
+                _save_sharpen_debug(debug_layers, ctx)
+            elif debug_layers is not None:
+                log.warning("[%s] save_silhouette: no body was sharpened, nothing to save", ctx.source.name)
+            return result
         reason = (
             f"AI_SHARPEN_SCOPE={AI_SHARPEN_SCOPE!r}" if AI_SHARPEN_SCOPE != "bodies"
             else "no body boxes were passed in for this photo"
@@ -1493,6 +1623,36 @@ class AiSharpenPipeline(EditPipeline):
         log.info("[%s] Sharpening the whole frame (%s)", ctx.source.name, reason)
         return ctx.dispatcher.submit(image)
 
+
+# JPEG quality of the debug images (--save-silhouette): effectively lossless.
+DEBUG_JPEG_QUALITY = 100
+
+
+def _save_debug_image(image: np.ndarray, path: Path, source: Path) -> None:
+    """Debug: writes a full-resolution, minimally compressed JPEG (or, for a
+    .png path, an 8-bit PNG). Logs instead of raising: a debug write must
+    not fail the edit."""
+    ext = path.suffix.lstrip(".").lower()
+    try:
+        if write_image(image, path, ext, DEBUG_JPEG_QUALITY):
+            log.info("[%s] save_silhouette: wrote %s", source.name, path)
+    except OSError as exc:
+        log.warning("[%s] save_silhouette: could not write %s: %s", source.name, path, exc)
+
+
+def _save_sharpen_debug(layers: dict[str, np.ndarray], ctx: EditContext) -> None:
+    """Debug (--save-silhouette): writes, into ctx.silhouette_dir as
+    <source stem>_*, the original photo (_orig.jpg), the silhouette mask
+    (_silhouette.png, white = sharpened), and the sharpened layer
+    (_sharpened.jpg) — sharpen_bodies()'s debug_layers. The edit's final
+    result (_final.jpg) is saved by process_one() once it exists."""
+    directory, stem = ctx.silhouette_dir, ctx.source.stem
+    if ctx.original is not None:
+        _save_debug_image(ctx.original, directory / f"{stem}_orig.jpg", ctx.source)
+    _save_debug_image(np.rint(layers["silhouette"] * 255.0).astype(np.uint8),
+                      directory / f"{stem}_silhouette.png", ctx.source)
+    _save_debug_image(layers["sharpened"], directory / f"{stem}_sharpened.jpg", ctx.source)
+    ctx.silhouette_saved = True
 
 class OpenAiAutoEditPipeline(EditPipeline):
     name = "openai_autoedit"
@@ -1590,16 +1750,21 @@ def process_one(
     body_keypoints: list[list[tuple[float, float, float]]] | None = None,
     tone: ToneParams | None = None,
     protected_bodies: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None,
+    silhouette_dir: Path | None = None,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> Path | None:
     image = read_image(source)
     if image is None:
         return None
     log.info("[%s] %dx%d", source.name, image.shape[1], image.shape[0])
+    source_size = (image.shape[1], image.shape[0])
 
     ctx = EditContext(
         source=source, dispatcher=dispatcher, openai_client=openai_client,
         body_boxes=body_boxes, body_keypoints=body_keypoints, tone=tone,
-        protected_bodies=protected_bodies,
+        protected_bodies=protected_bodies, silhouette_dir=silhouette_dir,
+        # No pipeline mutates its input, so the untouched original is kept by reference.
+        original=image if silhouette_dir is not None else None,
     )
     for pipeline in pipelines:
         try:
@@ -1608,12 +1773,21 @@ def process_one(
             log.error("[%s] pipeline '%s' failed: %s", source.name, pipeline.name, exc)
             return None
 
+    # Cropping runs last so every pipeline (notably body-only sharpening,
+    # whose --boxes-file boxes are relative to the full source frame) sees
+    # the whole photo.
+    if crop is not None:
+        image = crop_image(image, crop, source_size)
+        log.info("[%s] cropped to %dx%d", source.name, image.shape[1], image.shape[0])
+
     # out_file may equal source (re-editing an already-edited image in
     # place) — safe since read_image() fully decodes into memory up front,
     # nothing streams from disk during pipeline processing.
     destination = out_file if out_file is not None else output_path_for(source, output_dir, ext)
     if not write_image(image, destination, ext, compression):
         return None
+    if ctx.silhouette_saved:
+        _save_debug_image(image, silhouette_dir / f"{source.stem}_final.jpg", source)
     log.info("[%s] wrote %s (%dx%d)", source.name, destination, image.shape[1], image.shape[0])
     return destination
 
@@ -1756,6 +1930,23 @@ def main() -> None:
         "--contrast", type=float, default=None, metavar="AMOUNT",
         help=f"tone pipeline: contrast (-{TONE_CONTRAST_LIMIT:g}..+{TONE_CONTRAST_LIMIT:g}, 0 = unchanged).",
     )
+    parser.add_argument(
+        "--crop", type=parse_crop, default=None, metavar="X,Y,W,H",
+        help=(
+            "Crop the result to this rectangle, in pixels of the input image (top-left "
+            "X,Y plus width W and height H; clamped to the image). Applied after every "
+            "pipeline. Requires exactly one input image."
+        ),
+    )
+    parser.add_argument(
+        "--save-silhouette", type=Path, default=None, metavar="DIR",
+        help=(
+            "Debug: when the aisharpen pipeline sharpens bodies (see --boxes-file), save "
+            "full-resolution debug images into DIR, named after the photo: <name>_orig.jpg "
+            "(original), <name>_silhouette.png (blend mask, white = sharpened), "
+            "<name>_sharpened.jpg (the sharpened layer) and <name>_final.jpg (the result)."
+        ),
+    )
     args = parser.parse_args()
 
     tone = None
@@ -1785,6 +1976,9 @@ def main() -> None:
         sys.exit(1)
     if args.out_file is not None and len(sources) != 1:
         log.error("--out-file requires exactly one input image (got %d).", len(sources))
+        sys.exit(1)
+    if args.crop is not None and len(sources) != 1:
+        log.error("--crop requires exactly one input image (got %d).", len(sources))
         sys.exit(1)
 
     pipelines = resolve_pipelines(args.pipelines)
@@ -1826,7 +2020,9 @@ def main() -> None:
                     body_boxes=boxes_by_name.get(source.name),
                     body_keypoints=keypoints_by_name.get(source.name),
                     protected_bodies=protected_by_name.get(source.name),
+                    silhouette_dir=args.save_silhouette,
                     tone=tone,
+                    crop=args.crop,
                 ),
                 sources,
             )

@@ -326,7 +326,8 @@ def test_render_falls_back_to_the_name_stored_on_the_person(tmp_path, monkeypatc
     write_album(album, [entry])
     album_module.invalidate_all()
     seen = []
-    monkeypatch.setattr(annotation, "_annotate_frame", lambda frame, out, cfg: seen.append(frame.bodies[0].player_name))
+    monkeypatch.setattr(annotation, "_annotate_frame",
+                        lambda frame, out, cfg, crop=None: seen.append(frame.bodies[0].player_name))
     assert annotation.render_album_preview(album_module.album_for(album).image(KEY))
     assert seen == ["Stored Name"]
 

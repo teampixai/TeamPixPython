@@ -46,14 +46,22 @@ function cullingThumbUrl(file) {
   return `/api/culling/thumb/${encodeURIComponent(file)}`;
 }
 
+// Photos whose picture changed since the page loaded (an AI edit was kept or
+// reverted): their full-size URLs get a changing suffix so the browser
+// refetches them instead of reusing what it showed before.
+const imageVersions = {};
+function versioned(url, file) {
+  return imageVersions[file] ? `${url}?v=${imageVersions[file]}` : url;
+}
+
 // Full-resolution images for the large main preview pane, toggled between
 // via the 'x' hotkey (see viewMode below) — the small cached-thumbnail
 // endpoint above is always used for the nav/strip thumbnails, regardless.
 function annoImgUrl(file) {
-  return `/api/anno_img/${encodeURIComponent(file)}`;
+  return versioned(`/api/anno_img/${encodeURIComponent(file)}`, file);
 }
 function originalImgUrl(file) {
-  return `/api/original/${encodeURIComponent(file)}`;
+  return versioned(`/api/original/${encodeURIComponent(file)}`, file);
 }
 
 // Main-pane view mode ("anno" | "original"), toggled either by the "Show
@@ -571,8 +579,36 @@ $("#cullingApplyBtn").on("click", async function () {
 
 $("#cullingAiEditBtn").on("click", function () {
   if (!lastActiveImage) return;
-  AiEdit.run(lastActiveImage.file);
+  AiEdit.run(lastActiveImage.file, {
+    onResult(result) {
+      if (result.changed) imageVersions[result.file] = Date.now();
+      if (result.outcome === "copied") reloadAfterCopy(result.copy.key);
+      else if (result.changed) renderMain();
+    },
+  });
 });
+
+// "Save Copy" added a photo to the album: reload the counts and the list and
+// jump to it (it sits in the same burst as the photo it was made from).
+async function reloadAfterCopy(newKey) {
+  try {
+    await loadSummary();
+    await fetchFiltered();
+    if (currentData) {
+      currentData.groups.forEach((group, gi) => {
+        const ii = group.images.findIndex((im) => im.file === newKey);
+        if (ii >= 0) {
+          currentData.activeGroup = gi;
+          currentData.activeImage = ii;
+        }
+      });
+    }
+    renderNav();
+    renderMain();
+  } catch (err) {
+    $("#cullingStatus").text("Saved a copy, but couldn't refresh the list: " + err.message).show();
+  }
+}
 
 $("#cullingShowAnnotation").on("change", function () {
   setViewMode(this.checked ? "anno" : "original");

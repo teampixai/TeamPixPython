@@ -185,10 +185,45 @@ def _write_jpeg_atomic(path: Path, image: np.ndarray, quality: int) -> None:
     os.replace(tmp, path)
 
 
+# How much of the picture a preview darkens outside the accepted edit's crop.
+CROPPED_OUT_DARKEN = 0.8
+
+
+def darken_outside_crop(
+    image: np.ndarray,
+    crop: "tuple[float, float, float, float] | None",
+    amount: float = CROPPED_OUT_DARKEN,
+) -> np.ndarray:
+    """*image* with everything outside the normalised ``(x1, y1, x2, y2)``
+    *crop* darkened by *amount* (0.8 = 80% black), so a preview of the
+    original shows what an accepted crop removed. Returns *image* itself when
+    there is nothing to darken."""
+    if crop is None:
+        return image
+    h, w = image.shape[:2]
+    x1, y1 = round(crop[0] * w), round(crop[1] * h)
+    x2, y2 = round(crop[2] * w), round(crop[3] * h)
+    if x1 <= 0 and y1 <= 0 and x2 >= w and y2 >= h:
+        return image
+    keep = 1.0 - amount
+    out = image.copy()
+    for rows, cols in (
+        (slice(0, y1), slice(None)),
+        (slice(y2, h), slice(None)),
+        (slice(y1, y2), slice(0, x1)),
+        (slice(y1, y2), slice(x2, w)),
+    ):
+        band = out[rows, cols]
+        if band.size:
+            out[rows, cols] = np.rint(band * keep).astype(image.dtype)
+    return out
+
+
 def _annotate_frame(
     frame: Frame,
     preview_path: Path,
     config: AppConfig,
+    crop: "tuple[float, float, float, float] | None" = None,
 ) -> None:
     """Write *frame*'s annotated preview to *preview_path*.
 
@@ -199,12 +234,16 @@ def _annotate_frame(
 
     Thumbnails are not made here: they show the plain photo and are written
     once at import (see algo/stages/image_analysis.py).
+
+    With *crop* (a normalised box, see AlbumImage.edited_crop) everything
+    outside it is darkened 80% (darken_outside_crop) to signify the photo was
+    cropped.
     """
     if frame.image is None:
         return
 
     if not frame.bodies:
-        _write_jpeg_atomic(preview_path, frame.image, 60)
+        _write_jpeg_atomic(preview_path, darken_outside_crop(frame.image, crop), 60)
         return
 
     annotated = apply_auto_adjustment(frame.image, frame.auto_adjustment).copy()
@@ -353,7 +392,7 @@ def _annotate_frame(
     for text, lx, ly, lcolor in identity_labels:
         _draw_label(annotated, text, (lx, ly), font, font_scale, lcolor, font_thick, identity_px)
 
-    _write_jpeg_atomic(preview_path, annotated, 60)
+    _write_jpeg_atomic(preview_path, darken_outside_crop(annotated, crop), 60)
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +422,9 @@ def render_album_preview(
 
     Returns False (writing nothing) when the entry has no preview path or the
     source photo is missing or can't be decoded.
+
+    The preview always shows the ORIGINAL photo; if an accepted edit cropped
+    it (`AlbumImage.edited_crop`), what the crop removed is darkened 80%.
     """
     preview = image.preview_path
     source = image.original_path
@@ -410,7 +452,7 @@ def render_album_preview(
         auto_adjustment=image.auto_adjustment,
         output_key=image.key,
     )
-    _annotate_frame(frame, preview, config or app_config)
+    _annotate_frame(frame, preview, config or app_config, crop=image.edited_crop)
     return True
 
 

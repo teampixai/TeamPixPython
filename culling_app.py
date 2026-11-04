@@ -30,7 +30,6 @@ import csv
 import json
 import logging
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -54,9 +53,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from algo.facereco import record_manual_override
 from algo.regrade import regrade_sensitivity
 from algo.stages.annotation import invalidate_previews, render_album_preview
-from algo.album import ALBUM_JSON_NAME, EDITEDIMAGES_SUBDIR, AlbumImage, PersonRecord, album_for
+from algo.album import ALBUM_JSON_NAME, EDITEDIMAGES_SUBDIR, AlbumImage, PersonRecord, album_for, box_in_crop
 from algo.album_info import CATEGORIES as CULLING_CATEGORIES
-from algo.album_info import INFO_JSON_NAME, AlbumInfo
+from algo.album_info import INFO_JSON_NAME, AlbumInfo, category_for_status
+from algo.utils import THUMBNAILS_SUBDIR, image_capture_timestamp
 from algo.burst_video import DEFAULT_FPS, DEFAULT_MIN_FRAMES, render_album_bursts, render_player_videos, summarize_bursts
 
 try:
@@ -243,6 +243,16 @@ class AiEditRequest(BaseModel):
     file: str
 
 
+class CropRect(BaseModel):
+    """A crop rectangle in pixels of the photo being edited (top-left x/y,
+    width/height) — see AiEditApplyRequest.crop."""
+
+    x: int
+    y: int
+    w: int
+    h: int
+
+
 class AiEditApplyRequest(BaseModel):
     """Everything the edit-mode panel collected; see api_ai_edit_apply()."""
 
@@ -255,6 +265,10 @@ class AiEditApplyRequest(BaseModel):
     sharpen: bool = False
     # Indexes into the photo's bodies, as returned by /api/edit/ai-edit/session.
     bodyIds: list[int] = Field(default_factory=list)
+    # The Crop tab's rectangle, in pixels of the editable source (the
+    # session's width/height). None, or one covering the whole photo, means
+    # no crop.
+    crop: Optional[CropRect] = None
 
 # --------------------------------------------------------------------------- #
 # Processing (1_prep_review.py) — run in a background thread, buffer combined
@@ -349,6 +363,12 @@ class AiEditState:
         self.before_path: Optional[Path] = None
         self.pending_path: Optional[Path] = None
         self.final_path: Optional[Path] = None
+        # The photo's edited_crop to record if this edit is accepted (see
+        # AlbumImage.edited_crop) — any earlier crop composed with this run's.
+        self.crop: Optional[tuple[float, float, float, float]] = None
+        # The same crop in pixels of the original photo ({x, y, h, w}), which
+        # is what gets written into the album entry as well.
+        self.crop_px: Optional[dict] = None
 
     def set_pending(
         self,
@@ -357,6 +377,8 @@ class AiEditState:
         before_path: Path,
         pending_path: Path,
         final_path: Path,
+        crop: Optional[tuple[float, float, float, float]] = None,
+        crop_px: Optional[dict] = None,
     ) -> None:
         with self.lock:
             self.album_dir = album_dir
@@ -364,6 +386,8 @@ class AiEditState:
             self.before_path = before_path
             self.pending_path = pending_path
             self.final_path = final_path
+            self.crop = crop
+            self.crop_px = crop_px
 
     def snapshot(self) -> Optional[dict]:
         with self.lock:
@@ -375,6 +399,8 @@ class AiEditState:
                 "before_path": self.before_path,
                 "pending_path": self.pending_path,
                 "final_path": self.final_path,
+                "crop": self.crop,
+                "crop_px": self.crop_px,
             }
 
     def clear(self, delete_files: bool = False) -> None:
@@ -389,6 +415,8 @@ class AiEditState:
             self.before_path = None
             self.pending_path = None
             self.final_path = None
+            self.crop = None
+            self.crop_px = None
         if not delete_files:
             return
         for path in stale:
@@ -421,20 +449,25 @@ class EditSessionState:
         self.key: Optional[str] = None
         self.base = None  # BGR uint8 numpy array, long edge <= EDIT_PREVIEW_LONG_EDGE
         self.before_jpeg: Optional[bytes] = None
+        # Full-resolution (width, height) of the source — the pixel space the
+        # Crop tab's rectangle is expressed in.
+        self.size: Optional[tuple[int, int]] = None
 
-    def open(self, album_dir: Path, key: str, base, before_jpeg: bytes) -> None:
+    def open(self, album_dir: Path, key: str, base, before_jpeg: bytes,
+             size: Optional[tuple[int, int]] = None) -> None:
         with self.lock:
             self.album_dir = album_dir
             self.key = key
             self.base = base
             self.before_jpeg = before_jpeg
+            self.size = size
 
     def snapshot(self) -> Optional[dict]:
         with self.lock:
             if self.key is None:
                 return None
             return {"album_dir": self.album_dir, "key": self.key, "base": self.base,
-                    "before_jpeg": self.before_jpeg}
+                    "before_jpeg": self.before_jpeg, "size": self.size}
 
     def clear(self) -> None:
         with self.lock:
@@ -442,6 +475,7 @@ class EditSessionState:
             self.key = None
             self.base = None
             self.before_jpeg = None
+            self.size = None
 
 
 edit_session_state = EditSessionState()
@@ -799,21 +833,32 @@ def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]
     return src, pending, final
 
 
-def _prepare_before_image(source_path: Path, pending_dir: Path) -> Path:
+def _prepare_before_image(
+    source_path: Path, pending_dir: Path, crop_px: Optional[tuple[int, int, int, int]] = None
+) -> Path:
     """Return a browser-displayable copy of *source_path* for the "before"
     pane of the compare view. JPEG/PNG/WebP sources are served straight from
     disk; anything else (RAW originals, TIFF) is rasterized to a JPEG cached
-    next to the pending edit."""
-    if source_path.suffix.lower() in _WEB_DISPLAYABLE_EXTENSIONS:
+    next to the pending edit. With *crop_px* (x, y, w, h) the before image is
+    cut to the same rectangle as the edit, so the two line up."""
+    if crop_px is None and source_path.suffix.lower() in _WEB_DISPLAYABLE_EXTENSIONS:
         return source_path
 
-    from algo.stages.image_analysis import _read_image  # lazy: pulls in the heavy CV stack
+    import cv2  # lazy: pulls in the heavy CV stack
 
-    image = _read_image(source_path)
+    if crop_px is not None:
+        import autoedit  # decodes exactly like the edit itself, so the crop lines up
+
+        image = autoedit.read_image(source_path)
+        if image is not None:
+            image = autoedit.crop_image(image, crop_px)
+    else:
+        from algo.stages.image_analysis import _read_image  # lazy: pulls in the heavy CV stack
+
+        image = _read_image(source_path)
     if image is None:
         raise RuntimeError(f"Could not decode {source_path}")
     out = pending_dir / f"{source_path.stem}__before.jpg"
-    import cv2  # lazy for the same reason
 
     ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
     if not ok:
@@ -836,31 +881,84 @@ def _album_sharpness_threshold(run_settings: dict) -> float:
     return threshold
 
 
-def _edit_session_bodies(bodies) -> list[dict]:
+NormBox = tuple[float, float, float, float]
+
+
+def _compose_crop(outer: Optional[NormBox], inner: Optional[NormBox]) -> Optional[NormBox]:
+    """*inner* (normalised to the frame *outer* cuts out of the original)
+    expressed in the original's frame — i.e. what a photo cropped to *outer*
+    and then to *inner* shows of the original. Either may be None (no crop)."""
+    if inner is None:
+        return outer
+    if outer is None:
+        return inner
+    ox1, oy1, ox2, oy2 = outer
+    ow, oh = ox2 - ox1, oy2 - oy1
+    x1, y1, x2, y2 = inner
+    return (ox1 + x1 * ow, oy1 + y1 * oh, ox1 + x2 * ow, oy1 + y2 * oh)
+
+
+def _box_in_crop(box: NormBox, crop: Optional[NormBox]) -> Optional[NormBox]:
+    """*box* (normalised to the original) re-expressed in the frame of a
+    photo cropped to *crop*, clipped to it; None if nothing of it is left."""
+    return box_in_crop(box, crop)
+
+
+def _keypoints_in_crop(body, crop: Optional[NormBox]) -> list[list[float]]:
+    """*body*'s keypoints as [x, y, confidence], in the frame of a photo
+    cropped to *crop*; keypoints the crop cut off are dropped."""
+    points = [[kp.point.x, kp.point.y, kp.confidence] for kp in body.body_keypoints]
+    if crop is None:
+        return points
+    cx1, cy1, cx2, cy2 = crop
+    cw, ch = cx2 - cx1, cy2 - cy1
+    out = []
+    for x, y, conf in points:
+        nx, ny = (x - cx1) / cw, (y - cy1) / ch
+        if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+            out.append([nx, ny, conf])
+    return out
+
+
+def _body_box(body, crop: Optional[NormBox]) -> Optional[list[float]]:
+    """*body*'s box as [x1, y1, x2, y2] in the frame of a photo cropped to
+    *crop* (see _box_in_crop), or None if it has no box or is cropped out."""
+    box = body.body_bbox
+    if box is None:
+        return None
+    mapped = _box_in_crop((box.x1, box.y1, box.x2, box.y2), crop)
+    return list(mapped) if mapped is not None else None
+
+
+def _edit_session_bodies(bodies, crop: Optional[NormBox] = None) -> list[dict]:
     """Bodies the edit-mode panel draws as selectable boxes: every body with
     a stored box, ``id`` being its index in *bodies* (what the panel sends
     back as bodyIds) and ``isTeammate`` whether the album marked it as
     wearing the team's jersey of the day (see algo/thresholds.py) — those
-    start selected. Albums that predate the flag count as not teammates."""
+    start selected. Albums that predate the flag count as not teammates.
+
+    Stored boxes are relative to the original photo; *crop* (the accepted
+    edit's AlbumImage.edited_crop) maps them onto an already cropped edit,
+    leaving out bodies the crop removed."""
     out = []
     for index, body in enumerate(bodies):
-        box = body.body_bbox
+        box = _body_box(body, crop)
         if box is None:
             continue
         out.append({
             "id": index,
-            "box": [box.x1, box.y1, box.x2, box.y2],
+            "box": box,
             "isTeammate": bool(body.is_teammate),
         })
     return out
 
 
-def _selected_body_entries(bodies, body_ids) -> list[dict]:
+def _selected_body_entries(bodies, body_ids, crop: Optional[NormBox] = None) -> list[dict]:
     """Per-body payload for autoedit.py's --boxes-file: the normalised
     [x1, y1, x2, y2] box of each body (by index into *bodies*, see
     _edit_session_bodies) the user selected for sharpening; everyone else
     stays exactly as in the original. Unknown ids and bodies without a box
-    are skipped.
+    (or cropped out by *crop*, see _edit_session_bodies) are skipped.
 
     Also includes each body's 17 COCO keypoints (normalised x, y,
     confidence; empty list if the album never stored them) — autoedit.py's
@@ -872,30 +970,61 @@ def _selected_body_entries(bodies, body_ids) -> list[dict]:
         if not 0 <= index < len(bodies):
             continue
         body = bodies[index]
-        box = body.body_bbox
+        box = _body_box(body, crop)
         if box is None:
             continue
         entries.append({
-            "box": [box.x1, box.y1, box.x2, box.y2],
-            "keypoints": [[kp.point.x, kp.point.y, kp.confidence] for kp in body.body_keypoints],
+            "box": box,
+            "keypoints": _keypoints_in_crop(body, crop),
         })
     return entries
 
 
-def _protected_body_entries(bodies, body_ids) -> list[dict]:
+def _protected_body_entries(bodies, body_ids, crop: Optional[NormBox] = None) -> list[dict]:
     """--boxes-file entries ("protect": true) for every boxed body the user
     did NOT select, so autoedit.py's sharpen_bodies() keeps them untouched
     even where they overlap a selected player (see its protected_norm)."""
     selected = set(body_ids)
-    return [
-        {
-            "box": [body.body_bbox.x1, body.body_bbox.y1, body.body_bbox.x2, body.body_bbox.y2],
-            "keypoints": [[kp.point.x, kp.point.y, kp.confidence] for kp in body.body_keypoints],
-            "protect": True,
-        }
-        for index, body in enumerate(bodies)
-        if index not in selected and body.body_bbox is not None
-    ]
+    entries = []
+    for index, body in enumerate(bodies):
+        if index in selected:
+            continue
+        box = _body_box(body, crop)
+        if box is None:
+            continue
+        entries.append({"box": box, "keypoints": _keypoints_in_crop(body, crop), "protect": True})
+    return entries
+
+
+def _crop_to_px(
+    crop: NormBox, source_size: tuple[int, int], prior_crop: Optional[NormBox]
+) -> dict:
+    """*crop* (normalised to the original photo) as pixels of the original:
+    ``{"x", "y", "h", "w"}``. *source_size* is the size of the file that was
+    edited — an earlier cropped edit when *prior_crop* is set, so the
+    original's own size is that divided by the fraction it kept."""
+    width, height = source_size
+    if prior_crop is not None:
+        width = width / (prior_crop[2] - prior_crop[0])
+        height = height / (prior_crop[3] - prior_crop[1])
+    x1, y1 = round(crop[0] * width), round(crop[1] * height)
+    x2, y2 = round(crop[2] * width), round(crop[3] * height)
+    return {"x": x1, "y": y1, "h": y2 - y1, "w": x2 - x1}
+
+
+def _clamp_crop_px(crop: Optional[CropRect], width: int, height: int) -> Optional[tuple[int, int, int, int]]:
+    """The panel's crop rectangle clamped to a *width* x *height* source as
+    (x, y, w, h), or None when there is nothing to crop (no rectangle, or
+    one covering the whole photo)."""
+    if crop is None or width <= 0 or height <= 0:
+        return None
+    x = min(max(0, crop.x), width - 1)
+    y = min(max(0, crop.y), height - 1)
+    w = min(max(1, crop.w), width - x)
+    h = min(max(1, crop.h), height - y)
+    if (x, y, w, h) == (0, 0, width, height):
+        return None
+    return (x, y, w, h)
 
 
 def _run_ai_edit(
@@ -905,6 +1034,7 @@ def _run_ai_edit(
     pending_path: Path,
     final_path: Path,
     req: AiEditApplyRequest,
+    source_size: Optional[tuple[int, int]] = None,
 ) -> None:
     """Run autoedit.py with the edit-mode panel's settings (*req*) against a
     single photo, writing to *pending_path* (editedimages/.pending/<key
@@ -912,7 +1042,10 @@ def _run_ai_edit(
     "tone" pipeline with the exact brightness/contrast values the user
     previewed, then — if Sharpen players is on and at least one player is
     selected — body-only "aisharpen" (with GFPGAN face enhance) on just
-    those players.
+    those players, and finally the Crop tab's rectangle (if any).
+    *source_size* is the source's full-resolution (width, height) when the
+    caller already knows it (the open edit session); otherwise it is read
+    from the file when a crop needs it.
 
     Nothing is recorded on the Album entry here: the result stays
     parked in the pending folder until the user accepts it in the
@@ -927,15 +1060,45 @@ def _run_ai_edit(
         if stale.is_file():
             stale.unlink(missing_ok=True)
 
+    crop_px = None
+    if req.crop is not None:
+        if source_size is None:
+            import autoedit  # lazy: pulls in the CV stack
+
+            decoded = autoedit.read_image(source_path)
+            if decoded is not None:
+                source_size = (decoded.shape[1], decoded.shape[0])
+            del decoded
+        if source_size is not None:
+            crop_px = _clamp_crop_px(req.crop, *source_size)
+        else:
+            log.warning("AI edit: could not read %s to size the crop; not cropping", source_path.name)
+
     try:
-        before_path = _prepare_before_image(source_path, pending_path.parent)
+        before_path = _prepare_before_image(source_path, pending_path.parent, crop_px)
     except (RuntimeError, OSError, ImportError) as exc:
         log.warning("AI edit: could not prepare the 'before' image for %s: %s", key, exc)
         before_path = source_path
 
     image = album_for(album_dir).image(key)
     bodies = image.bodies if image is not None else []
-    entries = _selected_body_entries(bodies, req.bodyIds) if req.sharpen else []
+    # Stored detections are relative to the original; when the source is an
+    # already cropped edit they are mapped onto it.
+    prior_crop = image.edited_crop if image is not None else None
+    entries = _selected_body_entries(bodies, req.bodyIds, prior_crop) if req.sharpen else []
+
+    new_crop = None
+    if crop_px is not None and source_size is not None:
+        x, y, w, h = crop_px
+        width, height = source_size
+        new_crop = (x / width, y / height, (x + w) / width, (y + h) / height)
+    composed_crop = _compose_crop(prior_crop, new_crop)
+    # An uncropped run on top of a cropped edit keeps that edit's recorded crop.
+    composed_crop_px = None
+    if new_crop is not None:
+        composed_crop_px = _crop_to_px(composed_crop, source_size, prior_crop)
+    elif image is not None:
+        composed_crop_px = image.edited_crop_px
 
     pipelines = ["tone"] + (["aisharpen"] if entries else [])
     cmd = [
@@ -949,6 +1112,8 @@ def _run_ai_edit(
         "--shadows", f"{req.shadows:g}",
         "--contrast", f"{req.contrast:g}",
     ]
+    if crop_px is not None:
+        cmd += ["--crop", ",".join(str(v) for v in crop_px)]
 
     # Feeds autoedit.py's aisharpen pipeline the boxes (+ keypoints) of the
     # selected players (see _selected_body_entries) so it sharpens+blends
@@ -958,9 +1123,14 @@ def _run_ai_edit(
     # reads) so it can look itself up without any other album context.
     if entries:
         boxes_file = pending_path.parent / "boxes.json"
-        payload = entries + _protected_body_entries(bodies, req.bodyIds)
+        payload = entries + _protected_body_entries(bodies, req.bodyIds, prior_crop)
         boxes_file.write_text(json.dumps({source_path.name: payload}), encoding="utf-8")
         cmd += ["--face-enhance", "--boxes-file", str(boxes_file)]
+        # Debug feature: "save_silhouette": true in .culling_state.json also
+        # writes the original, silhouette mask, sharpened layer and final
+        # image to <album>/debug/esrgan_silhouette/.
+        if _load_state().get("save_silhouette") is True:
+            cmd += ["--save-silhouette", str(album_dir / "debug" / "esrgan_silhouette")]
 
     log.info("Starting AI edit for %s: %s", key, " ".join(cmd))
     returncode = processing_state.run_subprocess(cmd)
@@ -971,6 +1141,8 @@ def _run_ai_edit(
             before_path=before_path,
             pending_path=pending_path,
             final_path=final_path,
+            crop=composed_crop,
+            crop_px=composed_crop_px,
         )
     processing_state.mark_stopped()
     log.info("AI edit finished for %s (exit code %s)", key, returncode)
@@ -1271,10 +1443,9 @@ def _is_album_complete(path: Path) -> bool:
     return _album_data(path)[0]
 
 
-# How many random sharp-image filenames to hand to the client per album for
-# the polaroid preview / hover slideshow — capped so the /api/albums payload
-# stays small even for albums with thousands of sharp photos.
-PREVIEW_IMAGE_SAMPLE = 8
+# How many of an album's highest-ranked sharp photos the polaroid preview /
+# hover slideshow cycles through (see _build_album_summary).
+PREVIEW_IMAGE_COUNT = 10
 
 
 # Matches the "<yyyymmdd-hhmmss>-" prefix _run_processing() stamps onto every
@@ -1331,12 +1502,18 @@ def _build_album_summary(path: Path) -> dict:
     summary["blurCount"] = info.count("blur")
     summary["skippedCount"] = info.count("skipped")
     album_images = album_for(path).images
-    sharp_previews = []
+    # The album's best photos: highest star rating first (the explicit rating,
+    # else the sharp default the Culling page uses), then the LLM grade, then
+    # sharpness. Deterministic, so the card shows the same strong shots every
+    # visit, and cheap to serve: they are plain cached thumbnails.
+    ranked = []
     for entry in info.entries("sharp"):
         image = album_images.get(entry.key)
         if image and image.preview_path:
-            sharp_previews.append(image.key)
-    summary["previewImages"] = random.sample(sharp_previews, min(len(sharp_previews), PREVIEW_IMAGE_SAMPLE))
+            stars = image.stars if image.stars is not None else _CULLING_DEFAULT_STARS["sharp"]
+            ranked.append((stars, image.llm_grade or 0.0, image.sharpness_score or 0.0, image.key))
+    ranked.sort(reverse=True)
+    summary["previewImages"] = [key for *_rest, key in ranked[:PREVIEW_IMAGE_COUNT]]
     return summary
 
 
@@ -1355,7 +1532,7 @@ def _build_album_summary(path: Path) -> dict:
 # whenever that shape changes so stale on-disk caches are rejected instead of
 # served with missing/renamed fields.
 _ALBUM_SUMMARY_CACHE_NAME = ".summary_cache.json"
-_ALBUM_SUMMARY_CACHE_VERSION = 1
+_ALBUM_SUMMARY_CACHE_VERSION = 2  # 2: previewImages = the top-ranked photos, no longer a random sample
 
 
 def _album_summary_cache_path(path: Path) -> Path:
@@ -2377,10 +2554,11 @@ def _collect_all_face_tagging_rows(album_path: Path) -> list[list[str]]:
 
 def _collect_player_frame_paths(album_path: Path) -> dict[str, list[Path]]:
     """{player name: every distinct photo they're tagged in}, resolved to
-    on-disk paths via the Album (accepted-edit-or-original, same preference
-    as algo/burst_video.py's detect_bursts) — the source data for rendering
-    one highlight MP4 per player. Faces on clusters sharing the same name
-    (e.g. after a merge) are pooled and de-duplicated by resolved path."""
+    on-disk paths via the Album — always the ORIGINAL photo, never an
+    accepted AI edit, same as algo/burst_video.py's detect_bursts — the
+    source data for rendering one highlight MP4 per player. Faces on
+    clusters sharing the same name (e.g. after a merge) are pooled and
+    de-duplicated by resolved path."""
     fr = _facereco_dir(album_path)
     if fr is None:
         return {}
@@ -2401,7 +2579,7 @@ def _collect_player_frame_paths(album_path: Path) -> dict[str, list[Path]]:
             if not orig:
                 continue
             image = album.image(orig)
-            path = image.image_path if image else None
+            path = image.original_path if image else None
             if path is None or not path.is_file():
                 continue
             bucket[str(path)] = path
@@ -2655,14 +2833,24 @@ def api_select_album(req: AlbumSelectRequest) -> dict:
 
 @app.get("/api/albums/thumb")
 def api_album_thumb(id: str = Query(...), file: str = Query(...)) -> FileResponse:
-    """Annotated preview of one photo in *any* album (not just the current
-    one) — the rotating sample images on the album-picker cards. Rendered on
-    first request, then served from the album's preview cache."""
+    """Small thumbnail of one photo in *any* album (not just the current
+    one) — the rotating sample images on the album-picker cards.
+
+    Served straight from the album's ``thumbnails/<key>.jpg`` file written at
+    import, without loading album.json: that file is tens of MB per album, and
+    parsing one per card on every visit is what made the page slow. Only a
+    photo with no thumbnail yet (an older album) goes through the album to
+    have one generated, once. The picture never changes, so browsers may
+    reuse it for a while."""
     album_path = _album_dir_by_id(id)
-    fp = _ensure_preview(album_for(album_path).image(file))
+    headers = {"Cache-Control": "private, max-age=3600"}
+    direct = album_path / THUMBNAILS_SUBDIR / f"{_safe_component(file)}.jpg"
+    if direct.is_file():
+        return FileResponse(direct, headers=headers)
+    fp = _ensure_thumbnail(album_for(album_path).image(file))
     if fp is None:
         raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(fp)
+    return FileResponse(fp, headers=headers)
 
 
 @app.post("/api/albums/delete")
@@ -2740,11 +2928,13 @@ def api_anno_img(file: str) -> FileResponse:
     """Full-resolution annotated preview image — shared by the culling page's
     main pane (toggle-able against /api/original) and any other consumer
     that wants the annotated (not cropped/resized) version of a photo.
-    Rendered on first request, then served from the album's preview cache."""
+    Rendered on first request, then served from the album's preview cache.
+    `no-cache` because the file is redrawn at the same URL when an edit is
+    accepted or reverted (see render_album_preview)."""
     fp = _ensure_preview(album_for(_current_album_path()).image(file))
     if fp is None:
         raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(fp)
+    return FileResponse(fp, headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/api/culling/apply")
@@ -2965,7 +3155,7 @@ def _open_edit_session(key: str):
         base = cv2.resize(full, (max(1, round(width * scale)), max(1, round(height * scale))),
                           interpolation=cv2.INTER_AREA)
     del full
-    edit_session_state.open(album_dir, key, base, _encode_jpeg(base))
+    edit_session_state.open(album_dir, key, base, _encode_jpeg(base), (width, height))
     return album_dir, (width, height), proposed
 
 
@@ -2987,7 +3177,9 @@ def api_ai_edit_session(req: AiEditRequest) -> dict:
     caches a downscaled copy of the exact pixels autoedit.py will edit for
     live previews (see _open_edit_session), and returns the auto
     ("suggested") tone values plus every detected body for the Sharpen
-    players overlay."""
+    players overlay (mapped onto the accepted edit if it was cropped).
+    Calling it again for the same photo re-reads it from disk (the panel's
+    Reload button)."""
     import autoedit
 
     album_dir, (width, height), proposed = _open_edit_session(req.file)
@@ -2996,6 +3188,7 @@ def api_ai_edit_session(req: AiEditRequest) -> dict:
         "file": req.file,
         "width": width,
         "height": height,
+        "edited": image is not None and image.edited_path is not None,
         "proposed": {
             "highlights": proposed.highlights,
             "midtones": proposed.midtones,
@@ -3003,7 +3196,7 @@ def api_ai_edit_session(req: AiEditRequest) -> dict:
             "contrast": proposed.contrast,
         },
         "limits": {"ev": autoedit.TONE_EV_LIMIT, "contrast": autoedit.TONE_CONTRAST_LIMIT},
-        "bodies": _edit_session_bodies(image.bodies if image is not None else []),
+        "bodies": _edit_session_bodies(image.bodies, image.edited_crop) if image is not None else [],
     }
 
 
@@ -3050,11 +3243,13 @@ def api_ai_edit_apply(req: AiEditApplyRequest) -> dict:
 
     if not processing_state.claim():
         raise HTTPException(status_code=409, detail="Processing is already running.")
+    session = edit_session_state.snapshot()
+    source_size = session["size"] if session is not None and session["key"] == req.file else None
     edit_session_state.clear()
 
     thread = threading.Thread(
         target=_run_ai_edit,
-        args=(album_dir, req.file, source_path, pending_path, final_path, req),
+        args=(album_dir, req.file, source_path, pending_path, final_path, req, source_size),
         daemon=True,
     )
     thread.start()
@@ -3110,7 +3305,11 @@ def api_ai_edit_accept() -> dict:
         image = album.image(key)
         if image is not None:
             image.set_edited_image(final_path)
+            image.set_edited_crop(pending["crop"], pending["crop_px"])
             album.save()
+            # The annotated preview shows the cropped-out area darkened, so
+            # redraw it with the crop that was just recorded (or dropped).
+            _invalidate_cached_previews(album_dir, [key])
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("AI edit accepted but failed to record edited_image for %s: %s", key, exc)
     ai_edit_state.clear(delete_files=True)
@@ -3126,6 +3325,171 @@ def api_ai_edit_reject() -> dict:
     ai_edit_state.clear(delete_files=True)
     log.info("AI edit rejected for %s", pending["key"])
     return {"ok": True}
+
+
+# Where "Save Copy" keeps the processed photos, inside the album folder.
+_SAVE_COPY_SUBDIR = "SaveCopy"
+_save_copy_lock = threading.Lock()
+
+
+def _next_copy_path(copy_dir: Path, stem: str) -> Path:
+    """``copy_dir/<stem>_<N>.jpg`` with N one past the highest number already
+    used for *stem* (1 for the first copy), so a deleted copy's number is not
+    handed out again; also never an existing file."""
+    pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.jpg$", re.IGNORECASE)
+    highest = 0
+    if copy_dir.is_dir():
+        for existing in copy_dir.iterdir():
+            match = pattern.match(existing.name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    n = highest + 1
+    while (copy_dir / f"{stem}_{n}.jpg").exists():
+        n += 1
+    return copy_dir / f"{stem}_{n}.jpg"
+
+
+@app.post("/api/edit/ai-edit/save-copy")
+def api_ai_edit_save_copy() -> dict:
+    """Save the pending edit as a NEW photo instead of replacing the current
+    one (the review's "Save Copy"): the processed image moves to
+    <album>/SaveCopy/<stem>_<N>.jpg, a copy of the photo's album entry
+    (detections re-framed to the crop) is added to album.json pointing at it,
+    and it is listed in info.json next to the original. The photo being
+    edited keeps whatever edit it had."""
+    pending = _require_pending_edit()
+    album_dir: Path = pending["album_dir"]
+    key: str = pending["key"]
+    album = album_for(album_dir)
+    image = album.image(key)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found in album")
+
+    with _save_copy_lock:
+        dest = _next_copy_path(album_dir / _SAVE_COPY_SUBDIR, Path(key).stem)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(pending["pending_path"], dest)
+
+        # The copy has no EXIF, so file times are all the Culling page has to
+        # place it: give it the original's capture time so it lands in the
+        # same burst, right beside the photo it came from.
+        original = image.original_path
+        if original is not None and original.is_file():
+            capture = image_capture_timestamp(original)
+            if capture:
+                os.utime(dest, (capture, capture))
+
+        new_key = album.unused_key(dest.name, dest)
+        entry = image.copy_entry(file=dest, key=new_key, crop=pending["crop"])
+        album.add_entry(entry)
+
+        info = AlbumInfo(album_dir)
+        if info.exists:
+            category = category_for_status(entry.get("status", "")) or info.category_of(key)
+            if category:
+                info.add(category, new_key, dest)
+                info.save()
+
+    ai_edit_state.clear(delete_files=True)
+    log.info("AI edit of %s saved as a copy: %s (key %s)", key, dest, new_key)
+    return {"ok": True, "key": new_key, "path": str(dest)}
+
+
+def _require_edit_idle() -> None:
+    """409 while a background job (e.g. an AI edit render) is running —
+    the Other tab's actions must not race it over the edited file."""
+    with processing_state.lock:
+        if processing_state.running:
+            raise HTTPException(status_code=409, detail="Processing is already running.")
+
+
+@app.post("/api/edit/revert")
+def api_edit_revert(req: AiEditRequest) -> dict:
+    """Other tab → Revert: irreversibly discard *req.file*'s accepted edit
+    (deleting the edited file and forgetting it, crop included) so the photo
+    is its original again. The panel asks for confirmation first, then
+    reopens the session on the original."""
+    _require_edit_idle()
+    album_dir = _current_album_path()
+    album = album_for(album_dir)
+    image = album.image(req.file)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found in album")
+    pending = ai_edit_state.snapshot()
+    if pending is not None and pending["key"] == req.file:
+        ai_edit_state.clear(delete_files=True)
+
+    edited = image.clear_edited()
+    album.save()
+    _invalidate_cached_previews(album_dir, [req.file])  # redraw without the crop shading
+    deleted = False
+    # Only ever delete inside the album's editedimages folder.
+    if edited is not None and edited.parent == album_dir / _EDITEDIMAGES_SUBDIR and edited.is_file():
+        edited.unlink()
+        deleted = True
+    edit_session_state.clear()
+    log.info("Edit reverted for %s (deleted %s)", req.file, edited if deleted else "nothing")
+    return {"ok": True, "deleted": deleted}
+
+
+def _ensure_edited_copy(album_dir: Path, key: str) -> tuple[Path, bool]:
+    """*key*'s edited file, creating it from the original first if the photo
+    has no edit yet (JPEGs copied byte for byte, anything else — RAW, TIFF,
+    PNG — decoded like autoedit.py does and saved as JPEG) and recording it
+    as the accepted edit. Returns (path, whether it was just created)."""
+    album = album_for(album_dir)
+    image = album.image(key)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found in album")
+    edited = image.edited_path
+    if edited is not None:
+        return edited, False
+
+    source = image.original_path
+    if source is None or not source.is_file():
+        raise HTTPException(status_code=404, detail="Source image not found on disk")
+    final = album_dir / _EDITEDIMAGES_SUBDIR / f"{Path(key).stem}.jpg"
+    final.parent.mkdir(parents=True, exist_ok=True)
+    if source.suffix.lower() in (".jpg", ".jpeg"):
+        shutil.copy2(source, final)
+    else:
+        import autoedit  # lazy: pulls in the CV stack
+
+        decoded = autoedit.read_image(source)
+        if decoded is None or not autoedit.write_image(decoded, final, "jpg", 95):
+            raise HTTPException(status_code=422, detail=f"Could not convert {source.name} to JPEG")
+    image.set_edited_image(final)
+    image.set_edited_crop(None)
+    album.save()
+    log.info("Created edited copy of %s at %s", key, final)
+    return final, True
+
+
+def _open_with_chooser(path: Path) -> None:
+    """Show Windows' "Open with" app chooser for *path* (ShellExecute's
+    "openas" verb). Like _open_in_file_explorer this only makes sense with
+    the server on the user's own desktop."""
+    try:
+        os.startfile(str(path), "openas")  # noqa: S606 — local-machine convenience only
+    except OSError:
+        subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", str(path)])
+
+
+@app.post("/api/edit/open-external")
+def api_edit_open_external(req: AiEditRequest) -> dict:
+    """Other tab → Edit with custom app: make sure *req.file* has an edited
+    copy (see _ensure_edited_copy) and open THAT — never the original — with
+    an app the user picks. Unapplied panel settings are not included."""
+    if sys.platform != "win32":
+        raise HTTPException(status_code=501, detail="Editing with another app is only supported on Windows.")
+    _require_edit_idle()
+    album_dir = _current_album_path()
+    path, created = _ensure_edited_copy(album_dir, req.file)
+    try:
+        _open_with_chooser(path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open {path.name}: {exc}") from exc
+    return {"ok": True, "path": str(path), "created": created}
 
 
 @app.get("/api/processing-output")
@@ -3165,16 +3529,19 @@ def api_faces_thumb(cluster: str, crop: str) -> FileResponse:
 
 @app.get("/api/original/{file:path}")
 def api_original(file: str) -> FileResponse:
-    """Unmodified source photo for *file* — shared by the faces page's
-    face-crop context view and the culling page's anno/original toggle (see
+    """Current photo for *file* — shared by the faces page's face-crop
+    context view and the culling page's anno/original toggle (see
     /api/anno_img for the annotated counterpart). An accepted AI edit always
-    wins over the original, so the user sees the current state of the photo."""
+    wins over the original, so the user sees the current state of the photo.
+    `no-cache` makes the browser revalidate every time: the same URL serves a
+    different file once an edit is accepted or reverted."""
     album_path = _current_album_path()
     image = album_for(album_path).image(file)
+    headers = {"Cache-Control": "no-cache"}
     if image is not None:
         fp = image.image_path
         if fp is not None and fp.is_file():
-            return FileResponse(fp)
+            return FileResponse(fp, headers=headers)
     # Fall back to the legacy single-SrcDir + basename join for albums
     # written before multi-source-directory import support existed.
     src_dir = _read_album_summary(album_path).get("srcDir")
@@ -3183,7 +3550,7 @@ def api_original(file: str) -> FileResponse:
     fp = Path(src_dir) / _safe_component(file)
     if not fp.is_file():
         raise HTTPException(status_code=404, detail="Original not found")
-    return FileResponse(fp)
+    return FileResponse(fp, headers=headers)
 
 
 @app.post("/api/faces/commit")

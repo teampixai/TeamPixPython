@@ -47,7 +47,7 @@ _RAW_EXTENSIONS = frozenset({".cr3", ".cr2", ".nef", ".arw"})
 @dataclass
 class BurstFrame:
     key: str
-    path: Path  # frame to render: accepted AI edit if any, else the original
+    path: Path  # frame to render: always the original photo, never an AI edit
     timestamp: float
     name_stem: str  # original photo's filename stem, used to name the output video
 
@@ -64,20 +64,20 @@ class Burst:
 
 def detect_bursts(album_path: Path) -> list[Burst]:
     """Group every photo in *album_path* (any status) into bursts by
-    capture-time gap, ordered chronologically."""
+    capture-time gap, ordered chronologically. Frames are always the
+    ORIGINAL photos, never an accepted AI edit (whose crop could even change
+    the frame size); photos whose original is no longer on disk are left out."""
     album = album_for(album_path)
     items: list[BurstFrame] = []
     for key, image in album.images.items():
-        frame_path = image.image_path
-        if frame_path is None or not frame_path.is_file():
-            continue
         original = image.original_path
-        ts_source = original if original and original.is_file() else frame_path
+        if original is None or not original.is_file():
+            continue
         items.append(BurstFrame(
             key=key,
-            path=frame_path,
-            timestamp=image_capture_timestamp(ts_source),
-            name_stem=(original or frame_path).stem,
+            path=original,
+            timestamp=image_capture_timestamp(original),
+            name_stem=original.stem,
         ))
     items.sort(key=lambda it: (it.timestamp, it.key))
 

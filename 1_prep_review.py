@@ -380,7 +380,7 @@ def write_blur_lst(frames: list[Frame], lst_path: Path, *, append: bool = False)
 # review/editing work would be wiped.
 _REGRADE_PRESERVED_FIELDS = (
     "stars", "stars_manual", "keep", "burst_ranking", "llm_grade", "burst_caption",
-    "edited_image",
+    "edited_image", "edited_crop", "edited_crop_px",
 )
 
 

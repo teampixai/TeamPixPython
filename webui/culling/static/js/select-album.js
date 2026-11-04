@@ -33,7 +33,9 @@ function buildPolaroidCard(album) {
   const photo = $("<div>", { class: "polaroid-photo" });
 
   if (urls.length) {
-    const startUrl = urls[Math.floor(Math.random() * urls.length)];
+    // urls are the album's top-ranked photos, best first: the card shows the
+    // best one and the hover slideshow steps through the rest in order.
+    const startUrl = urls[0];
     const img = $("<img>", { src: startUrl, alt: album.displayName || album.name });
     img.data("original", startUrl);
     img.data("urls", urls);
@@ -56,17 +58,19 @@ function buildPolaroidCard(album) {
 
   card.append(photo, caption);
 
-  // Hover slideshow: cycle the thumbnail through a random sample of the
-  // album's sharp images while hovered; reset to the original still on
-  // mouse-out. (The delete button's fade in/out is pure CSS — see
-  // .polaroid:hover .polaroid-delete in style.css.)
+  // Hover slideshow: step the thumbnail through the album's top-ranked
+  // photos while hovered; reset to the first (best) one on mouse-out. (The
+  // delete button's fade in/out is pure CSS — see .polaroid:hover
+  // .polaroid-delete in style.css.)
   let slideTimer = null;
   card.on("mouseenter", () => {
     const img = card.find("img");
     const imgUrls = img.data("urls");
     if (!imgUrls || imgUrls.length < 2) return;
+    let next = 1;
     slideTimer = setInterval(() => {
-      img.attr("src", imgUrls[Math.floor(Math.random() * imgUrls.length)]);
+      img.attr("src", imgUrls[next % imgUrls.length]);
+      next += 1;
     }, SLIDESHOW_INTERVAL_MS);
   });
   card.on("mouseleave", () => {
