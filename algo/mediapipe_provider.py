@@ -33,7 +33,7 @@ Known limitation: unlike the YOLO face model, MediaPipe's Face Landmarker
 does not expose a reliable per-landmark occlusion/visibility score in the
 Python Tasks API, so mapped face landmarks are given a fixed confidence of
 1.0.  This makes ``face_coverage_min_visible`` (occlusion disqualification)
-effectively a pass-through under this engine — see README.
+effectively a pass-through under this engine — see AGENTS.md.
 """
 
 from __future__ import annotations
