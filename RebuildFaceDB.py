@@ -330,6 +330,12 @@ def _rebuild_cluster(
         "faces": faces,
         "negative_faces": negatives,
     }
+    # Curation state owned by the app's Players page: the chosen profile
+    # picture and the crops the user deleted (so a later export doesn't
+    # re-sync them). The app validates profileCrop itself on every read.
+    for key in ("profileCrop", "deletedCrops"):
+        if meta.get(key):
+            payload[key] = meta[key]
 
     with open(face_json_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)

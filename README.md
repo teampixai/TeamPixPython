@@ -55,7 +55,8 @@ ship untested code just to see how it goes.
 
 ## Your first album
 
-Five steps, left to right along the top of the page. Like a fast break, but with more clicking.
+Five steps, left to right along the top of the page (the optional **Players** step is covered
+[below](#tidying-up-a-players-faces-players)). Like a fast break, but with more clicking.
 
 1. **Team.** Name, jersey colour(s) and, optionally, the roster. The goalie's in a different kit? Add that
    colour as *forced*: no keeper left behind. An optional **OpenAI API key** turns on AI burst ranking
@@ -79,6 +80,22 @@ Five steps, left to right along the top of the page. Like a fast break, but with
 
 Closed the browser tab by accident? The app keeps running. Open **TeamPixPython** from the Start Menu
 again, or use the link in the console window.
+
+### Tidying up a player's faces (Players)
+
+The **Players** step (right after Team) shows each player's picture and the faces the app has learned for
+them. Pick a player in the list. The middle column, **Positive**, holds photos of that player, and the
+right-hand column, **Negative**, holds look-alikes that must *not* be matched to them. Rest the mouse on a
+photo for a moment to see it full size.
+
+- **Drag** photos between the two columns when a face landed in the wrong place.
+- **Delete** (or the **Del** key) removes photos that aren't usable. Ctrl- or Shift-click to select several.
+- **Set as profile picture** puts the selected photo next to the player's name. Players with no photos yet
+  get a mystery player in a disguise.
+
+Changes are saved when you switch to another player. Deleted photos stay in a recycle bin until you click
+**Rebuild face DB**, which empties it and re-learns the team's faces. That takes a minute or two, and the
+log shows the progress.
 
 ---
 

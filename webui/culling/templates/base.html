@@ -15,11 +15,11 @@
       <h1 id="title"><span id="titleBase">Photo Culling</span><span id="titleAlbum" class="title-album"></span></h1>
     </div>
     <nav id="steps" class="stepper">
-      {% set step_labels = [("team", "Team"), ("select-album", "Select Album"), ("culling", "Culling"), ("faces", "Faces"), ("album-tools", "Album Tools")] %}
+      {% set step_labels = [("team", "Team"), ("players", "Players"), ("select-album", "Select Album"), ("culling", "Culling"), ("faces", "Faces"), ("album-tools", "Album Tools")] %}
       {% set gated_steps = ("culling", "faces", "album-tools") %}
       {% set no_team = not has_teams() %}
       {% for key, label in step_labels %}
-      {% set needs_team = key == "select-album" and no_team %}
+      {% set needs_team = key in ("select-album", "players") and no_team %}
       {% set is_disabled = needs_team or (key in gated_steps and not has_active_album()) %}
       <a class="step {{ 'active' if active_step == key else '' }} {{ 'disabled' if is_disabled else '' }}"
          data-step="{{ key }}"

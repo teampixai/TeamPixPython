@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Players — Photo Culling{% endblock %}
+{% block content %}
+<div id="playersApp">
+  <div class="players-toolbar">
+    <label class="inline-check">Team
+      <select id="playersTeamSelect"></select>
+    </label>
+    <div class="players-actions">
+      <span id="playersStatus" class="muted players-status"></span>
+      <button type="button" id="playersProfileBtn" class="btn btn-sm" disabled>Set as profile picture</button>
+      <button type="button" id="playersDeleteBtn" class="btn btn-sm btn-danger" disabled title="Delete selected images (Del)">Delete</button>
+      <button type="button" id="playersRebuildBtn" class="btn btn-sm btn-primary"
+              title="Permanently remove deleted faces, then recompute and calibrate this team's face database">Rebuild face DB</button>
+    </div>
+  </div>
+
+  <div class="players-body">
+    <nav id="playersNav" class="players-nav"></nav>
+    <div class="players-main">
+      <section class="players-pane" data-set="Face">
+        <header class="players-pane-head">
+          <strong>Positive</strong> <span class="tab-count" id="playersPosCount">0</span>
+          <span class="muted">— photos of this player, used to recognise them</span>
+        </header>
+        <div class="players-grid" id="playersPosGrid"></div>
+      </section>
+      <section class="players-pane" data-set="Negative">
+        <header class="players-pane-head">
+          <strong>Negative</strong> <span class="tab-count" id="playersNegCount">0</span>
+          <span class="muted">— look-alikes that must <em>not</em> match this player</span>
+        </header>
+        <div class="players-grid" id="playersNegGrid"></div>
+      </section>
+    </div>
+  </div>
+
+  <p class="muted players-hotkeys">
+    <strong>click</strong> select &middot; <strong>ctrl/shift-click</strong> multi-select &middot;
+    <strong>drag</strong> between Positive and Negative to move &middot; <strong>hover</strong> to see full size &middot; <strong>del</strong> delete &middot;
+    changes are saved when you switch player
+  </p>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script>window.SECRET_PLAYER_ICON = "{{ static_url('img/secret-player.png') }}";</script>
+<script src="{{ static_url('js/players.js') }}"></script>
+{% endblock %}

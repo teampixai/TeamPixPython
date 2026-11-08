@@ -592,6 +592,20 @@ player_video_state = PlayerVideoState()
 
 
 # --------------------------------------------------------------------------- #
+# Face-DB rebuild (Players page) — flush deleted crops, then re-run
+# RebuildFaceDB.py on one team's face DB. Same background-job pattern; never
+# runs alongside an export (export also rebuilds the DB).
+# --------------------------------------------------------------------------- #
+class FaceDbRebuildState(BackgroundJobState):
+    def reset(self) -> None:
+        super().reset()
+        self.team_id: Optional[str] = None
+
+
+face_db_rebuild_state = FaceDbRebuildState()
+
+
+# --------------------------------------------------------------------------- #
 # Heartbeat watchdog — the browser pings /api/heartbeat periodically from
 # every page (common.js); if none arrives within the timeout, the watchdog
 # prints a reminder (with the relaunch link) instead of shutting the server
@@ -1609,6 +1623,13 @@ def _list_albums() -> list[dict]:
 # --------------------------------------------------------------------------- #
 FACE_SUBDIR = "Face"
 FACE_ANNOTATED_SUBDIR = "Face.annotated"
+NEGATIVE_SUBDIR = "Negative"
+# Players page: per-person recycle bin (emptied by "Rebuild face DB"), the
+# face.json key naming the profile-picture crop, and the face.json key that
+# remembers deleted crop names so export never re-syncs them.
+DELETED_SUBDIR = "Deleted"
+PROFILE_CROP_KEY = "profileCrop"
+DELETED_CROPS_KEY = "deletedCrops"
 
 # Matching tolerance for body_bbox floats when writing back to the Album.
 BBOX_EPS = 1e-6
@@ -1941,6 +1962,308 @@ def _collect_names(album_path: Path) -> list[str]:
             if name:
                 names.add(name)
     return sorted(names, key=str.casefold)
+
+
+# --------------------------------------------------------------------------- #
+# Players page — curate one team's face DB (.FaceReco/<team id>/<Person>/).
+# A person is every folder whose face.json carries the same name (alias
+# folders like "Ansel" → "Ansel Chang" are merged), plus roster players who
+# have no folder yet. Images are addressed as (folder, set, crop). Moving or
+# deleting a crop moves its face.json embedding with it, so matching picks the
+# change up immediately without a rebuild. The profile picture lives in the
+# primary folder's face.json (PROFILE_CROP_KEY) and falls back to the first
+# positive crop.
+# --------------------------------------------------------------------------- #
+PLAYER_IMAGE_SETS: dict[str, str] = {FACE_SUBDIR: "faces", NEGATIVE_SUBDIR: "negative_faces"}
+_PLAYER_CROP_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
+players_lock = threading.Lock()
+
+
+class PlayerOp(BaseModel):
+    op: str                   # "move" | "delete" | "profile"
+    folder: str
+    crop: str
+    to: Optional[str] = None  # "move" only: "Face" | "Negative"
+
+
+class PlayersCommitRequest(BaseModel):
+    teamId: str
+    name: str
+    ops: list[PlayerOp] = Field(default_factory=list)
+
+
+class PlayersRebuildRequest(BaseModel):
+    teamId: str
+
+
+def _team_or_404(team_id: str) -> TeamData:
+    team = _find_team(_load_teams_file(), team_id) if team_id else None
+    if team is None:
+        raise HTTPException(status_code=404, detail="Unknown team.")
+    return team
+
+
+def _default_players_team(teams_file: TeamsFile) -> TeamData:
+    """The current album's team when one is selected, else the first team."""
+    if _has_active_album():
+        try:
+            team = _find_team(teams_file, _album_team_id(_current_album_path()))
+        except Exception:  # noqa: BLE001 — any album problem just means "no default"
+            team = None
+        if team is not None:
+            return team
+    return teams_file.Teams[0]
+
+
+def _team_face_db_path(team: TeamData) -> Path:
+    return _system_face_db_root() / team.id
+
+
+def _is_person_dir(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and not path.name.startswith((".", "Annotated."))
+        and (path / "face.json").is_file()
+    )
+
+
+def _list_crops(set_dir: Path, entries: list[dict]) -> list[str]:
+    """Crop files on disk in *set_dir* (sub-folders such as Face/Retired/
+    excluded), in face.json order first, then by name."""
+    if not set_dir.is_dir():
+        return []
+    order = {f.get("cropFileName"): i for i, f in enumerate(entries) if f.get("cropFileName")}
+    names = [p.name for p in set_dir.iterdir() if p.is_file() and p.suffix.lower() in _PLAYER_CROP_EXTS]
+    return sorted(names, key=lambda n: (order.get(n, len(order)), n.casefold()))
+
+
+def _team_people(team: TeamData) -> list[dict]:
+    """Every person of *team*: {name, number, inRoster, folders}, where
+    folders is [(dir, face.json payload)] with the primary folder first."""
+    team_dir = _team_face_db_path(team)
+    groups: dict[str, dict] = {}
+
+    def group(name: str) -> dict:
+        return groups.setdefault(name.casefold(), {"name": name, "number": "", "inRoster": False, "folders": []})
+
+    if team_dir.is_dir():
+        for d in sorted(team_dir.iterdir(), key=lambda p: p.name.casefold()):
+            if not _is_person_dir(d):
+                continue
+            try:
+                payload = _load_face_json(d)
+            except ValueError as exc:
+                log.warning("Players: unreadable %s/face.json skipped: %s", d.name, exc)
+                continue
+            g = group(str(payload.get("name") or "").strip() or d.name)
+            g["folders"].append((d, payload))
+            if not g["number"] and payload.get("playernum") not in (None, ""):
+                g["number"] = str(payload["playernum"])
+    for player in team.players:
+        name = (player.name or "").strip()
+        if not name:
+            continue
+        g = group(name)
+        g["name"], g["inRoster"] = name, True
+        if player.number:
+            g["number"] = str(player.number)
+    for g in groups.values():
+        primary = _sanitize_player_dirname(g["name"])
+        g["folders"].sort(key=lambda fp: fp[0].name != primary)
+    return sorted(groups.values(), key=lambda g: g["name"].casefold())
+
+
+def _find_person(team: TeamData, name: str) -> dict:
+    key = (name or "").strip().casefold()
+    for person in _team_people(team):
+        if person["name"].casefold() == key:
+            return person
+    raise HTTPException(status_code=404, detail=f"Player {name!r} not found.")
+
+
+def _player_sets(person: dict) -> tuple[list[dict], list[dict]]:
+    positives: list[dict] = []
+    negatives: list[dict] = []
+    for d, payload in person["folders"]:
+        for image_set, key, bucket in ((FACE_SUBDIR, "faces", positives), (NEGATIVE_SUBDIR, "negative_faces", negatives)):
+            bucket.extend({"folder": d.name, "crop": c} for c in _list_crops(d / image_set, payload.get(key) or []))
+    return positives, negatives
+
+
+def _resolve_profile(person: dict, positives: list[dict]) -> Optional[dict]:
+    """The chosen profile crop while it's still a positive, else the first
+    positive, else None (the UI shows the secret-player icon)."""
+    if not positives:
+        return None
+    wanted = person["folders"][0][1].get(PROFILE_CROP_KEY) if person["folders"] else None
+    if wanted:
+        for image in positives:
+            if image["crop"] == wanted:
+                return image
+    return positives[0]
+
+
+def _player_view(person: dict) -> dict:
+    positives, negatives = _player_sets(person)
+    return {
+        "name": person["name"],
+        "number": person["number"],
+        "inRoster": person["inRoster"],
+        "profile": _resolve_profile(person, positives),
+        "positives": positives,
+        "negatives": negatives,
+    }
+
+
+def _unique_dest(directory: Path, name: str) -> Path:
+    dest = directory / name
+    stem, suffix = Path(name).stem, Path(name).suffix
+    n = 1
+    while dest.exists():
+        dest = directory / f"{stem}_{n}{suffix}"
+        n += 1
+    return dest
+
+
+def _pop_face_set_entry(payload: dict, key: str, crop: str) -> Optional[dict]:
+    entries = payload.setdefault(key, [])
+    for i, entry in enumerate(entries):
+        if entry.get("cropFileName") == crop:
+            return entries.pop(i)
+    return None
+
+
+def _write_face_json_atomic(person_dir: Path, payload: dict) -> None:
+    tmp = person_dir / "face.json.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(tmp, person_dir / "face.json")
+
+
+def _apply_player_ops(person: dict, ops: list[PlayerOp]) -> None:
+    """Apply *ops* in order to one person's folders. Every face.json touched
+    is written once at the end — also when an op fails part-way, so the
+    files already moved and their embeddings never disagree."""
+    folders = {d.name: (d, payload) for d, payload in person["folders"]}
+    touched: dict[str, tuple[Path, dict]] = {}
+    try:
+        for op in ops:
+            if op.folder not in folders:
+                raise HTTPException(status_code=400, detail="Image doesn't belong to this player.")
+            d, payload = folders[op.folder]
+            crop = _safe_component(op.crop)
+            current = next((s for s in PLAYER_IMAGE_SETS if (d / s / crop).is_file()), None)
+            if current is None:
+                raise HTTPException(status_code=404, detail=f"Image {crop!r} not found.")
+            src = d / current / crop
+
+            if op.op == "move":
+                if op.to not in PLAYER_IMAGE_SETS:
+                    raise HTTPException(status_code=400, detail="Move target must be Face or Negative.")
+                if op.to == current:
+                    continue
+                (d / op.to).mkdir(parents=True, exist_ok=True)
+                dest = _unique_dest(d / op.to, crop)
+                shutil.move(str(src), str(dest))
+                entry = _pop_face_set_entry(payload, PLAYER_IMAGE_SETS[current], crop)
+                if entry is not None:
+                    entry["cropFileName"] = dest.name
+                    payload.setdefault(PLAYER_IMAGE_SETS[op.to], []).append(entry)
+            elif op.op == "delete":
+                trash = d / DELETED_SUBDIR
+                trash.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(_unique_dest(trash, crop)))
+                anno = d / FACE_ANNOTATED_SUBDIR / crop
+                if anno.is_file():
+                    shutil.move(str(anno), str(_unique_dest(trash, f"annotated_{crop}")))
+                _pop_face_set_entry(payload, PLAYER_IMAGE_SETS[current], crop)
+                deleted = payload.setdefault(DELETED_CROPS_KEY, [])
+                if crop not in deleted:
+                    deleted.append(crop)
+            elif op.op == "profile":
+                if current != FACE_SUBDIR:
+                    raise HTTPException(status_code=400, detail="Only positive images can be the profile picture.")
+                primary_dir, primary = person["folders"][0]
+                primary[PROFILE_CROP_KEY] = crop
+                touched[primary_dir.name] = (primary_dir, primary)
+                continue
+            else:
+                raise HTTPException(status_code=400, detail=f"Unknown op {op.op!r}.")
+            touched[d.name] = (d, payload)
+
+        if person["folders"]:
+            primary_dir, primary = person["folders"][0]
+            profile = _resolve_profile(person, _player_sets(person)[0])
+            settled = profile["crop"] if profile else None
+            if primary.get(PROFILE_CROP_KEY) != settled:
+                if settled:
+                    primary[PROFILE_CROP_KEY] = settled
+                else:
+                    primary.pop(PROFILE_CROP_KEY, None)
+                touched[primary_dir.name] = (primary_dir, primary)
+    finally:
+        for d, payload in touched.values():
+            _write_face_json_atomic(d, payload)
+
+
+def _ensure_face_db_idle() -> None:
+    with export_state.lock:
+        if export_state.running:
+            raise HTTPException(status_code=409, detail="An export is updating the face database — try again when it finishes.")
+    with face_db_rebuild_state.lock:
+        if face_db_rebuild_state.running:
+            raise HTTPException(status_code=409, detail="The face database is being rebuilt — try again when it finishes.")
+
+
+def _flush_team_face_db(team_dir: Path, say) -> dict:
+    """Permanently empty every person's Deleted/ folder and remove the
+    Annotated.<timestamp>/ debug folders left by earlier rebuilds."""
+    files = annotated = 0
+    for d in sorted(team_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        if d.name.startswith("Annotated."):
+            shutil.rmtree(d)
+            annotated += 1
+            continue
+        trash = d / DELETED_SUBDIR
+        if trash.is_dir():
+            count = sum(1 for p in trash.rglob("*") if p.is_file())
+            shutil.rmtree(trash)
+            files += count
+            if count:
+                say(f"  {d.name}: {count} deleted file(s) removed.")
+    say(f"Flushed {files} deleted file(s) and {annotated} old Annotated folder(s).")
+    return {"flushedFiles": files, "flushedAnnotated": annotated}
+
+
+def _run_face_db_rebuild(team_dir: Path) -> None:
+    state = face_db_rebuild_state
+
+    def say(msg: str) -> None:
+        state.log(msg)
+        log.info("[FaceDbRebuild] %s", msg)
+
+    try:
+        say("Step 1/2: flushing deleted faces...")
+        result = _flush_team_face_db(team_dir, say)
+        if not any(_is_person_dir(d) for d in team_dir.iterdir()):
+            say("Step 2/2: this team's face database has no players yet — nothing to rebuild.")
+        else:
+            say("Step 2/2: rebuilding embeddings and calibrating (RebuildFaceDB.py)...")
+            rc = _stream_subprocess([sys.executable, str(REPO_ROOT / "RebuildFaceDB.py"), str(team_dir)], log_fn=say)
+            if rc != 0:
+                raise RuntimeError(f"RebuildFaceDB.py failed with exit code {rc}")
+        say("Face DB rebuild complete.")
+        with state.lock:
+            state.done = True
+            state.result = result
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+        log.exception("[FaceDbRebuild] failed")
+        with state.lock:
+            state.error = str(exc)
+    finally:
+        state.mark_stopped()
 
 
 class ClusterOperation(BaseModel):
@@ -2385,10 +2708,11 @@ def _export_log(msg: str) -> None:
     log.info("[Export] %s", msg)
 
 
-def _stream_subprocess(cmd: list[str], on_line=None) -> int:
-    """Run *cmd*, forwarding each combined stdout/stderr line to _export_log
-    (and optionally *on_line* for progress-counter bookkeeping). Returns the
-    process's exit code."""
+def _stream_subprocess(cmd: list[str], on_line=None, log_fn=None) -> int:
+    """Run *cmd*, forwarding each combined stdout/stderr line to *log_fn*
+    (default _export_log) and optionally *on_line* for progress-counter
+    bookkeeping. Returns the process's exit code."""
+    log_fn = log_fn or _export_log
     proc = subprocess.Popen(
         cmd,
         cwd=str(REPO_ROOT),
@@ -2402,7 +2726,7 @@ def _stream_subprocess(cmd: list[str], on_line=None) -> int:
     assert proc.stdout is not None
     for line in proc.stdout:
         line = line.rstrip("\n")
-        _export_log(line)
+        log_fn(line)
         if on_line:
             on_line(line)
     proc.wait()
@@ -2468,11 +2792,17 @@ def _sync_named_clusters_to_system_db(album_path: Path, kept: set[str]) -> int:
 
         copied = 0
         skipped = 0
+        # Crops the user moved to Negative/ or deleted on the Players page
+        # must not come back as positives on the next export.
+        curated_out = set(_load_face_json(dest_dir).get(DELETED_CROPS_KEY) or [])
         for f in candidates:
             src_crop = cluster_dir / FACE_SUBDIR / f["cropFileName"]
             if not src_crop.is_file():
                 continue
             dest_crop = dest_face_dir / f["cropFileName"]
+            if f["cropFileName"] in curated_out or (dest_dir / NEGATIVE_SUBDIR / f["cropFileName"]).is_file():
+                skipped += 1
+                continue
             if dest_crop.is_file():
                 # Already synced in a previous export run — skip instead of
                 # copying a renamed duplicate (crop file names are
@@ -2713,7 +3043,7 @@ templates.env.globals["static_url"] = _static_url
 templates.env.globals["has_active_album"] = _has_active_album
 templates.env.globals["has_teams"] = _has_teams
 
-PAGE_STEPS: tuple[str, ...] = ("team", "select-album", "culling", "faces", "album-tools")
+PAGE_STEPS: tuple[str, ...] = ("team", "players", "select-album", "culling", "faces", "album-tools")
 
 
 @app.get("/")
@@ -2740,9 +3070,10 @@ def _render_page(step: str, request: Request) -> HTMLResponse:
 for _step in PAGE_STEPS:
     def _make_route(step: str):
         def _route(request: Request):
-            # Select Album needs a team (every import is tied to one), so
-            # first-time users are sent to the Team page to create one.
-            if step == "select-album" and not _has_teams():
+            # Select Album needs a team (every import is tied to one), and so
+            # does Players (it edits a team's face DB); first-time users are
+            # sent to the Team page to create one.
+            if step in ("select-album", "players") and not _has_teams():
                 return RedirectResponse(url="/team")
             return _render_page(step, request)
         return _route
@@ -3533,6 +3864,68 @@ def api_faces_commit(req: FacesCommitRequest) -> dict:
     return _commit_cluster_operations(album_path, req)
 
 
+@app.get("/api/players/data")
+def api_players_data(teamId: str = "") -> dict:
+    teams_file = _load_teams_file()
+    if not teams_file.Teams:
+        raise HTTPException(status_code=409, detail="No team exists yet — create one on the Team page first.")
+    team = _find_team(teams_file, teamId) if teamId else None
+    if team is None:
+        team = _default_players_team(teams_file)
+    return {
+        "teams": [{"id": t.id, "name": t.name} for t in teams_file.Teams],
+        "teamId": team.id,
+        "players": [_player_view(p) for p in _team_people(team)],
+    }
+
+
+@app.get("/api/players/img/{team_id}/{folder}/{image_set}/{crop}")
+def api_players_img(team_id: str, folder: str, image_set: str, crop: str) -> FileResponse:
+    team = _team_or_404(team_id)
+    if image_set not in PLAYER_IMAGE_SETS:
+        raise HTTPException(status_code=404, detail="Unknown image set")
+    fp = _team_face_db_path(team) / _safe_component(folder) / image_set / _safe_component(crop)
+    if not fp.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(fp)
+
+
+@app.post("/api/players/commit")
+def api_players_commit(req: PlayersCommitRequest) -> dict:
+    team = _team_or_404(req.teamId)
+    with players_lock:
+        _ensure_face_db_idle()
+        _apply_player_ops(_find_person(team, req.name), req.ops)
+        return {"player": _player_view(_find_person(team, req.name))}
+
+
+@app.post("/api/players/rebuild")
+def api_players_rebuild(req: PlayersRebuildRequest) -> dict:
+    """Flush the team's Deleted/ crops and re-run RebuildFaceDB.py (with
+    calibration) in the background; progress via /api/players/rebuild/status."""
+    team = _team_or_404(req.teamId)
+    team_dir = _team_face_db_path(team)
+    if not team_dir.is_dir():
+        raise HTTPException(status_code=400, detail="This team has no face database yet.")
+    with players_lock:
+        if not face_db_rebuild_state.claim():
+            raise HTTPException(status_code=409, detail="A face DB rebuild is already running.")
+        with export_state.lock:
+            exporting = export_state.running
+        if exporting:
+            face_db_rebuild_state.mark_stopped()
+            raise HTTPException(status_code=409, detail="An export is updating the face database — try again when it finishes.")
+        with face_db_rebuild_state.lock:
+            face_db_rebuild_state.team_id = team.id
+    threading.Thread(target=_run_face_db_rebuild, args=(team_dir,), daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/players/rebuild/status")
+def api_players_rebuild_status(since: int = 0) -> dict:
+    return face_db_rebuild_state.status(since)
+
+
 @app.get("/api/album-tools/summary")
 def api_album_tools_summary() -> dict:
     album_path = _current_album_path()
@@ -3688,6 +4081,11 @@ def api_start_export(req: ExportRequest) -> dict:
 
     if not export_state.claim():
         raise HTTPException(status_code=409, detail="Export is already running.")
+    with face_db_rebuild_state.lock:
+        rebuild_running = face_db_rebuild_state.running
+    if rebuild_running:
+        export_state.mark_stopped()
+        raise HTTPException(status_code=409, detail="A face DB rebuild is running — try again when it finishes.")
 
     min_stars = max(1, min(5, req.minStars))
     thread = threading.Thread(

@@ -22,13 +22,16 @@ function updateEditorVisibility() {
   $("#teamWelcome").toggle(!showEditor);
 }
 
-// Select Album is disabled in the (server-rendered) nav until a team exists;
-// enable it as soon as the first team is saved, without needing a reload.
+// Select Album and Players are disabled in the (server-rendered) nav until a
+// team exists; enable them as soon as the first team is saved, without
+// needing a reload.
 function enableSelectAlbumStep() {
-  $("#steps a.step[data-step='select-album']")
-    .removeClass("disabled")
-    .attr("href", "/select-album")
-    .removeAttr("aria-disabled tabindex title");
+  ["select-album", "players"].forEach((step) => {
+    $(`#steps a.step[data-step='${step}']`)
+      .removeClass("disabled")
+      .attr("href", "/" + step)
+      .removeAttr("aria-disabled tabindex title");
+  });
 }
 
 function renderJerseyList() {

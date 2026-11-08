@@ -20,8 +20,8 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | Path | Role |
 |---|---|
 | `culling_app.py` | **The app.** FastAPI server (default `127.0.0.1:8010`) plus all page routes and `/api/*` endpoints. Long-running work is started as subprocesses (see §3). |
-| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `select-album`, `add-new-album`, `culling`, `faces`, `album-tools`), all extending `base.html` (top bar and step navigation). |
-| `webui/culling/static/js/*.js` | One jQuery script per page, plus shared `common.js` (API helpers, log dialog, heartbeat), `viewport.js` (zoom/pan image window) and `ai-edit.js` (the AI Edit dialog, `AiEdit.run(key, { onResult })`). jQuery 3.7.1 and jQuery UI 1.13.2 load from code.jquery.com. |
+| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `album-tools`), all extending `base.html` (top bar and step navigation). |
+| `webui/culling/static/js/*.js` | One jQuery script per page, plus shared `common.js` (API helpers, `LogDialog`, heartbeat), `viewport.js` (zoom/pan image window) and `ai-edit.js` (the AI Edit dialog, `AiEdit.run(key, { onResult })`). jQuery 3.7.1 and jQuery UI 1.13.2 load from code.jquery.com. |
 | `webui/index.html`, `webui/static/` | Older single-page UI. Not served by `culling_app.py`. |
 | `1_prep_review.py` | Import/scoring worker. Turns a folder of photos into an album. |
 | `apply_export.py` | Export worker. Copies kept photos flat to a destination, writes `players.csv`, adds EXIF star ratings (piexif). |
@@ -56,9 +56,18 @@ Key `algo/` modules:
 - **Server:** `culling_app.py` serves the pages and a JSON API. Each page is a separate template and script,
   with no SPA router.
 - **Long jobs run as subprocesses** started with `sys.executable`: import (`1_prep_review.py`), export
-  (`apply_export.py`), AI Edit (`autoedit.py`), and face-DB rebuild (`RebuildFaceDB.py`). The UI polls
-  output endpoints such as `/api/processing-output?since=N` and shows the log in a dialog. A new endpoint
-  for heavy work should follow the same pattern rather than blocking a request.
+  (`apply_export.py`), AI Edit (`autoedit.py`), and face-DB rebuild (`RebuildFaceDB.py`, from export and
+  from the Players page). The UI polls output endpoints such as `/api/processing-output?since=N` and shows
+  the log in a dialog.
+- **Rule: use the log-dialog UX for anything slow.** Any UI action that runs another Python script, or is
+  likely to take more than about 3 seconds, must follow the same pattern:
+  - run in a background thread tracked by a `BackgroundJobState` subclass in `culling_app.py`, where
+    `claim()` returns 409 while it's busy;
+  - expose a `…/status?since=N` endpoint that returns `state.status(since)`;
+  - show progress on the page with `LogDialog.create({...})` from `common.js`.
+
+  Never block the request, and don't build a one-off spinner or progress UI.
+  `_stream_subprocess(cmd, log_fn=...)` forwards a script's output into any job log.
 - **Heartbeat:** every page pings `/api/heartbeat` every 10 s. After `--heartbeat-timeout` seconds
   (default 60; 0 disables) without a ping, the server **prints a relaunch link instead of exiting**, so a
   running job survives a closed tab.
@@ -104,7 +113,7 @@ All paths are relative to the app folder (`REPO_ROOT`, which is `<install root>\
 | ↳ `SaveCopy/<name>_<N>.jpg` | AI Edit "Save Copy" | Added to the album as a new photo, with detections re-framed onto the crop. |
 | ↳ `.FaceReco/<NNNN>/{Face/, Negative/, face.json}` | face reco | Per-album clusters. |
 | ↳ `blurry.csv`, `blur.lst`, `run.log` | import | Report, list and debug log. |
-| `.FaceReco/<team id>/<Player>/{face.json, Face/, Negative/}` | export (face-DB sync) | Face DB shared across albums, **one folder per team**. A player on two teams is stored as two separate people. |
+| `.FaceReco/<team id>/<Player>/{face.json, Face/, Negative/}` | export (face-DB sync), Players page | Face DB shared across albums, **one folder per team**. A player on two teams is stored as two separate people. See "Players page" below. |
 | `*.pt`, `*.pth`, `*.task`, `*.tflite` | first run | Model weights, downloaded at runtime and git-ignored. Never commit them. |
 
 Photo **key** = the file's full name (e.g. `IMG_0001.CR3`), so a RAW+JPEG pair of the same shot counts as
@@ -114,6 +123,29 @@ Export (`apply_export.py`) writes **flat** to the destination (kept photos plus 
 the album. `_apply_edits` is still a placeholder (a byte-for-byte `copy2` of the original), so accepted AI
 edits in `editedimages/` are **not** exported yet. Save Copy photos are exported because they are separate
 album entries.
+
+### Players page (team face-DB curation)
+
+`/players` (`players.html` / `players.js`, `/api/players/*` in `culling_app.py`) edits the
+`.FaceReco/<team id>/` folders directly.
+
+- **People.** Folders are grouped by their `face.json` `name`, so an alias folder `Ansel` named "Ansel Chang"
+  is merged into that player. The primary folder (`_sanitize_player_dirname(name)`) comes first. Roster
+  players with no folder are listed with no images.
+- **Move.** Moving a crop between `Face/` and `Negative/` also moves its embedding entry between `faces` and
+  `negative_faces`, so matching sees the change without a rebuild.
+- **Delete.** The crop moves to `<Player>/Deleted/`, its embedding is dropped, and its name is added to
+  `face.json` `deletedCrops`. Export sync (`_sync_named_clusters_to_system_db`) skips crops that are in
+  `deletedCrops` or in `Negative/`, so curated-out faces never come back.
+- **Profile picture.** It is stored as `profileCrop` in the primary folder's `face.json`. When that crop is
+  no longer a positive, the app falls back to the first positive, otherwise `null` (the UI then shows
+  `static/img/secret-player.png`).
+- **Rebuild.** `RebuildFaceDB.py` preserves `profileCrop` and `deletedCrops` when it rewrites `face.json`.
+  **Rebuild face DB** (`POST /api/players/rebuild`, `FaceDbRebuildState`):
+  1. permanently deletes every `Deleted/` and `Annotated.*` folder;
+  2. runs `RebuildFaceDB.py` with calibration and the normal retire step.
+- **Concurrency.** Commits and rebuilds return 409 while an export is running, and export refuses to start
+  during a rebuild.
 
 ## 5. Invariants and gotchas
 
@@ -132,6 +164,9 @@ album entries.
 - **Licensing:** keep the default path permissive (§10). Ultralytics/YOLO stays opt-in.
 - **Face recognition is consent-gated in the UI** (a COPPA/GDPR notice in `add-new-album.html`). Keep it.
 - `.gitignore` excludes `/.[0-9]*.md`, which is the naming convention for local scratch plan docs.
+- **jQuery element props:** in `$("<div>", { ... })`, any key that is also a jQuery method is *called*
+  rather than set as an attribute. With jQuery UI loaded, `draggable: true` therefore turns the element into
+  a jQuery UI draggable, not an HTML5 drag source. Use `.attr("draggable", "true")`.
 
 ## 6. Developing and testing
 

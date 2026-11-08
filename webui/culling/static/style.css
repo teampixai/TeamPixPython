@@ -1577,3 +1577,138 @@ input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255,
 .edit-confirm p { margin: 0 0 16px; font-size: 13px; line-height: 1.45; }
 .edit-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
+
+/* ------------------------------------------------------------------ *
+ * Players — curate a team's face database. Full-height layout like the
+ * Culling page: player nav on the left; Positive (top) and Negative
+ * (bottom) crop panes on the right.
+ * ------------------------------------------------------------------ */
+body.page-players {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+body.page-players #topbar { flex: 0 0 auto; position: static; }
+body.page-players #content {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-width: none;
+  margin: 0;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+}
+#playersApp { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.players-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+.players-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.players-status { font-size: 12px; margin-right: 6px; }
+.players-status-error { color: var(--danger); }
+.players-body { display: flex; gap: 16px; margin-top: 12px; flex: 1 1 auto; min-height: 0; }
+.players-nav {
+  flex: 0 0 240px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.players-nav-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.players-nav-row:hover { background: var(--surface-2); }
+.players-nav-row.active { background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent); }
+.players-avatar {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.players-nav-text { min-width: 0; }
+.players-nav-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.players-nav-meta { font-size: 11px; }
+.players-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: row; gap: 12px; }
+.players-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: box-shadow 0.1s ease, background 0.1s ease;
+}
+.players-pane.drop-target { background: var(--accent-soft); box-shadow: 0 0 0 2px var(--accent); }
+.players-pane-head { flex: 0 0 auto; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.players-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  align-items: flex-start;
+  gap: 8px;
+}
+.players-empty { margin: 6px; }
+/* Face crops aren't a fixed size (cut at native resolution from the
+   normalized photo), so each one is shown in a uniform 180×240 (W×H) box,
+   scaled to fit with its original proportions — never stretched or cut off.
+   Hovering shows the full-size crop (.players-hover-preview). */
+.players-tile {
+  position: relative;
+  flex: 0 0 auto;
+  width: 180px;
+  height: 240px;
+  box-sizing: border-box;
+  border-radius: 6px;
+  border: 3px solid transparent;
+  cursor: pointer;
+  user-select: none;
+  background: var(--surface-2);
+}
+.players-tile img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: 3px; }
+.players-hover-preview {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 8px 28px rgba(20, 20, 30, 0.35);
+}
+.players-hover-preview img { display: block; border-radius: 3px; }
+.players-tile:hover { border-color: #d4d4da; }
+.players-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.players-tile.profile:not(.selected) { border-color: #e2b93b; }
+.players-profile-badge {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  color: #e2b93b;
+  font-size: 16px;
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.7);
+}
+.players-hotkeys { flex: 0 0 auto; margin: 8px 0 0; font-size: 12px; }
