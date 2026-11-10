@@ -32,7 +32,7 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | `RerunLLMCulling.py` | Re-runs LLM burst culling on an existing album. |
 | `algo/` | Core library (see below). |
 | `algo/stages/` | Pipeline stages: `image_analysis`, `grading`, `jersey_counting`, `face_reco`, `llm_culling`, `auto_adjust`, plus `annotation` (on-demand preview renderer, not a stage). |
-| `algo/llm/` | OpenAI provider (`culling_provider.py`, default model `gpt-4.1-mini`, pricing tables) and prompts. |
+| `algo/llm/` | OpenAI provider (`culling_provider.py`, default model `gpt-6-luna`, pricing tables) and prompts. |
 | `tests/` | pytest suite (`conftest.py` puts the repo root on `sys.path`). `test/` and `TestImages/` are local, git-ignored scratch areas. |
 | `InitPhotoProcessing.bat` | End-user Windows installer and updater (§8). |
 
@@ -85,7 +85,7 @@ photo → normalise (long edge 1800 px, never upscale; RAW decoded via rawpy)
       → GradingStage         sharpness of each face crop → per-person pass/fail
       → JerseyCountingStage  dominant team colour (CIE L*a*b*) → drop off-team people (unless "ignore jersey")
       → FaceRecoStage        (optional) match to team face DB, cluster the rest into <album>/.FaceReco/
-      → LLMCullingStage      (optional, needs OpenAI key) rank bursts / grade sharp frames 0–1 → keep + star ratings
+      → LLMCullingStage      (optional, needs OpenAI key) rank bursts / grade sharp + near-sharp frames 0–1 → star ratings (1–5) + keep
       → write album.json, info.json, thumbnails/, blurry.csv, blur.lst, run.log
 ```
 
@@ -209,7 +209,7 @@ The app builds this command line itself. It's useful for debugging an import wit
 | `--min-face-crop-px` | `32` | Smaller face crops are ignored for reco |
 | `--debug-align` | off | Alignment QA images in `.FaceReco/.debug` |
 | `--openaikey KEY` | `OPENAI_API_KEY` env var | Enables LLM burst culling |
-| `--llm-model`, `--skip-llm-cull` | `gpt-4.1-mini` | LLM model, or opt out |
+| `--llm-model`, `--skip-llm-cull` | `gpt-6-luna` | LLM model, or opt out |
 | `--autoadjust`, `--cpu-only`, `--enable-long-paths` | off | Auto exposure, force CPU, Windows long-path registry opt-in |
 | `--rerun-facereco-only`, `--regrade-only` | off | Partial re-runs on an existing album (used by Album Tools) |
 
@@ -223,8 +223,12 @@ Run `python 1_prep_review.py --help` for the full, authoritative list.
   and over-sharpening. See `algo/sharpness.py`.
 - **Jersey filter:** the jersey patch colour is compared in L\*a\*b\* with brightness down-weighted
   (`jersey_lab_l_weight` 0.15, `jersey_lab_max_dist` 28), and the team colour is the most common one among
-  sharp bodies. `extended_threshold_offset` (0.3) also tags near-sharp bodies with `is_teammate`, which
-  AI Edit uses to pre-select players to sharpen.
+  sharp bodies (a pinned team colour, which may be a bare hue like `White`, gets its anchor from the bodies
+  matching it, or from the reference colour). Forced (`+`) colours pass by label, or by LAB distance only when
+  the forced colour is also the closest reference colour to the body. The extended threshold, `min(sharp, max(0.3, sharp − 0.2))` (`extended_threshold_floor` /
+  `extended_threshold_offset` in `AppConfig`; an album may store its own offset), also tags near-sharp bodies
+  with `is_teammate`, which AI Edit uses to pre-select players to sharpen, and splits blurry photos into
+  2 stars (graded by the LLM) and 1 star.
 - **Face-DB matching:** each person's reference embeddings are split into prototypes (agglomerative
   clustering). A face matches a person only if (1) its best prototype similarity ≥ the threshold, (2) it
   beats the best *other* person by the margin, and (3) the person's `Negative/` examples don't veto it.
@@ -233,16 +237,29 @@ Run `python 1_prep_review.py --help` for the full, authoritative list.
   leave-one-out calibration that recommends a threshold and margin and lists confusable photos.
   A rebuilt DB's `face.json` uses a flatter `faces` schema (`{dtype, shape, encoding, value}`), which is the
   form `FaceDb.load` reads.
-- **LLM culling:** runs whenever a key is available. The app passes the team's key; otherwise the
-  `OPENAI_API_KEY` environment variable is used. Every photo graded *sharp* is sent (bursts are ranked
-  together and standalone frames are graded individually), as JPEGs downscaled to a 999 px long edge at
-  quality 80. The result is a ranking and a 0–1 grade, which drive star ratings. Cost is estimated from the
-  per-model token tables in `algo/llm/culling_provider.py`.
+- **LLM culling and star ratings:** runs whenever a key is available. The app passes the team's key;
+  otherwise the `OPENAI_API_KEY` environment variable is used. Every *gradable* photo is sent (sharp, or
+  blurry above the extended threshold; bursts are ranked together and standalone frames are graded
+  individually), as JPEGs downscaled to a 999 px long edge at quality 80. The default model is
+  `gpt-6-luna`; the model that produced an album's grades is stored as `llm_model` in `album.json`. Cost is
+  estimated from the per-model token tables in `algo/llm/culling_provider.py` (the `gpt-6-luna` rows are
+  assumed equal to `gpt-5.6-luna`).
+  - **Base stars:** sharp = 3; blurry above the extended threshold = 2; blurry at/below it, or no face = 1.
+    `keep` = stars ≥ 3 (set with `AlbumImage.apply_auto_rating`, which skips hand-rated photos).
+  - **High stars** (`algo/star_rules.py`, tunables `CLUSTERED_STAR_PARAMS` / `STANDALONE_STAR_PARAMS` in
+    `algo/stages/llm_culling.py`): decided top-down. 5 stars = top 3% of the pool by `llm_grade` AND the best
+    photo within ±1.5 s. The 5-star photos are then removed from the pool, and 4 stars = top 20% of what is
+    left AND the best within ±0.5 s. A pool is one qualifying burst sequence (> 0.5 s or > 8 frames), or all
+    standalone photos together. Each pool always yields at least one 5-star (its best photo). 2-star photos
+    can be promoted; an ungraded photo keeps its base stars.
+  - **Capture time** (`algo/utils.py::image_capture_timestamp`) carries sub-seconds (EXIF SubSecTime*, else
+    the `-NNN` hundredths suffix of the file name, else `+0.0005 s`). A cached `capture_ts` without a
+    millisecond part is invalid (`AlbumImage.capture_ts` returns None) and is re-read from the source.
 
 `AppConfig` (`algo/config.py`) holds the tunables: `normalized_img_max_long_edge` (1800),
 `use_narrow_face_box`, `face_min_size_fraction` (0.025), `face_crop_{min,max}_long_edge_px` (96),
 `sharpness_contrast_*`, `face_detection_min_confidence` (0.1), `face_keypoint_fallback`,
-`face_coverage_min_visible` (2), `jersey_lab_*`, `extended_threshold_offset`, `annotation_alpha` (0.25)
+`face_coverage_min_visible` (2), `jersey_lab_*`, `extended_threshold_offset` (0.2), `extended_threshold_floor` (0.3), `annotation_alpha` (0.25)
 and `annotation_top_n_bodies` (5). Read the file for defaults and comments.
 
 Known limitation: MediaPipe gives no per-landmark visibility score, so `face_coverage_min_visible` has no

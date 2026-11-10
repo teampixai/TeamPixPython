@@ -1176,12 +1176,15 @@ def _run_deep_regrade(album_dir: Path, sensitivity: str) -> None:
 
 
 def _llm_recull_command(album_dir: Path) -> tuple[list[str], Optional[str]]:
-    """(command, openai key) for RerunLLMCulling.py against *album_dir*."""
+    """(command, openai key) for RerunLLMCulling.py against *album_dir*, with
+    the album's own sharpness threshold (it sets the extended threshold that
+    decides which blurry photos get graded)."""
     team = _resolve_team(_album_team_id(album_dir))
     cmd = [
         sys.executable,
         str(REPO_ROOT / "RerunLLMCulling.py"),
         str(album_dir),
+        "--threshold", str(_album_sharpness_threshold(album_for(album_dir).run_settings)),
     ]
     if team.openaiApiKey:
         cmd += ["--openaikey", team.openaiApiKey]

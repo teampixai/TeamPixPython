@@ -28,16 +28,18 @@ PINK_LAB = [28.0, 48.0, -12.0]
 # --------------------------------------------------------------------------- #
 # ExtendedThreshold
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("sharp,offset,expected", [
-    (0.5, 0.3, 0.2),
-    (0.62, 0.3, 0.32),
-    (0.2, 0.3, 0.0),     # never below zero
-    (0.0, 0.3, 0.0),
-    (0.5, 0.0, 0.5),
-    (0.5, -0.1, 0.5),    # a negative offset must not push it above the sharp threshold
+@pytest.mark.parametrize("sharp,offset,floor,expected", [
+    (0.5, 0.2, 0.3, 0.3),    # medium: sharp - offset lands on the floor
+    (0.4, 0.2, 0.3, 0.3),    # low: sharp - offset (0.2) is under the floor
+    (0.62, 0.2, 0.3, 0.42),  # high
+    (0.2, 0.2, 0.3, 0.2),    # never above the sharp threshold
+    (0.0, 0.2, 0.3, 0.0),
+    (0.5, 0.3, 0.0, 0.2),    # no floor: plain sharp - offset
+    (0.5, 0.0, 0.3, 0.5),
+    (0.5, -0.1, 0.3, 0.5),   # a negative offset must not push it above the sharp threshold
 ])
-def test_extended_threshold_value(sharp, offset, expected):
-    assert ExtendedThreshold(sharp, offset).value == pytest.approx(expected)
+def test_extended_threshold_value(sharp, offset, floor, expected):
+    assert ExtendedThreshold(sharp, offset, floor).value == pytest.approx(expected)
 
 
 def test_extended_threshold_passes_is_strictly_greater_than():
@@ -45,21 +47,24 @@ def test_extended_threshold_passes_is_strictly_greater_than():
     assert ext.passes(0.31)
     assert not ext.passes(0.30)
     assert not ext.passes(0.0)
-    assert ExtendedThreshold(0.1, 0.3).passes(0.01)  # threshold floored at 0
+    assert ExtendedThreshold(0.1, 0.3).passes(0.11)  # capped at the sharp threshold, 0.1
+    assert not ExtendedThreshold(0.1, 0.3).passes(0.1)
 
 
-def test_extended_threshold_defaults_to_the_app_config_offset():
-    assert ExtendedThreshold(0.5).offset == app_config.extended_threshold_offset == 0.3
-    assert ExtendedThreshold.for_album(0.5).value == pytest.approx(0.2)
+def test_extended_threshold_defaults_to_the_app_config_offset_and_floor():
+    assert ExtendedThreshold(0.5).offset == app_config.extended_threshold_offset == 0.2
+    assert ExtendedThreshold(0.5).floor == app_config.extended_threshold_floor == 0.3
+    assert ExtendedThreshold.for_album(0.5).value == pytest.approx(0.3)
+    assert ExtendedThreshold.for_album(0.62).value == pytest.approx(0.42)
 
 
 @pytest.mark.parametrize("settings,expected_offset", [
     ({RUN_SETTINGS_KEY: 0.1}, 0.1),
     ({RUN_SETTINGS_KEY: "0.25"}, 0.25),
-    ({RUN_SETTINGS_KEY: "garbage"}, 0.3),
-    ({RUN_SETTINGS_KEY: None}, 0.3),
-    ({}, 0.3),
-    (None, 0.3),
+    ({RUN_SETTINGS_KEY: "garbage"}, 0.2),
+    ({RUN_SETTINGS_KEY: None}, 0.2),
+    ({}, 0.2),
+    (None, 0.2),
 ])
 def test_extended_threshold_for_album_reads_the_per_album_offset(settings, expected_offset):
     assert ExtendedThreshold.for_album(0.5, settings).offset == pytest.approx(expected_offset)
@@ -247,17 +252,16 @@ def test_regrade_writes_is_teammate_and_keeps_verdicts(album_dir):
     assert [b.is_teammate for b in bodies] == [True, True, True, False, False, False]
     assert [b.passed for b in bodies] == [True, True, False, False, False, False]
     assert bodies[2].rejection_reason == _sharpness_reason(0.35)
-    assert Album(album_dir).run_settings[RUN_SETTINGS_KEY] == 0.3
+    assert Album(album_dir).run_settings[RUN_SETTINGS_KEY] == 0.2
 
 
 def test_regrade_honours_a_per_album_offset(album_dir):
-    # Offset 0.45 -> extended threshold 0.05: the 0.10-score body is now in range.
-    _write_regrade_album(album_dir, **{RUN_SETTINGS_KEY: 0.45})
+    # Offset 0.0 -> extended threshold = the sharp threshold (0.5): the 0.35-score bodies drop out of range.
+    _write_regrade_album(album_dir, **{RUN_SETTINGS_KEY: 0.0})
     regrade_sensitivity(album_dir, 0.5)
     bodies = Album(album_dir).images["IMG_0001.jpg"].bodies
-    assert bodies[4].is_teammate is True
-    assert bodies[5].is_teammate is False  # failed an earlier gate: never in range
-    assert Album(album_dir).run_settings[RUN_SETTINGS_KEY] == 0.45
+    assert [b.is_teammate for b in bodies] == [True, True, False, False, False, False]
+    assert Album(album_dir).run_settings[RUN_SETTINGS_KEY] == 0.0
 
 
 def test_regrade_noteam_flags_every_body_in_range(album_dir):
@@ -310,7 +314,7 @@ def test_regrade_logs_each_setting_it_changes(album_dir, caplog):
     _summary, text = _regrade_log(album_dir, caplog, threshold=0.55)
 
     assert "setting changed - sensitivity: '0.5' -> '0.55'" in text
-    assert f"setting changed - {RUN_SETTINGS_KEY}: (not set) -> 0.3" in text
+    assert f"setting changed - {RUN_SETTINGS_KEY}: (not set) -> 0.2" in text
     assert "setting changed - our_jersey_color: 'Blue:Royal' -> 'White:Bright'" in text
     assert "team_color_override" not in text  # '' -> '' is not a change
 

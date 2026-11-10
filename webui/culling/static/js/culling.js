@@ -445,6 +445,7 @@ function setActiveStars(stars) {
 // Hotkeys — w/s move between groups, a/d move within a group, space toggles.
 // Arrow keys are aliases: Up=w, Down=s, Left=a, Right=d. x toggles the main
 // pane between the annotated and original image (page-wide, persisted).
+// Ctrl/Cmd+E opens AI edit for the active photo (same as the AI edit button).
 // ------------------------------------------------------------------ //
 const ARROW_KEY_ALIASES = { ArrowUp: "w", ArrowDown: "s", ArrowLeft: "a", ArrowRight: "d" };
 
@@ -452,6 +453,12 @@ $(document).on("keydown", (e) => {
   const activeTag = (document.activeElement && document.activeElement.tagName || "").toLowerCase();
   if (activeTag === "select" || activeTag === "input" || activeTag === "textarea") return;
   if (!$("#cullingApp").is(":visible")) return;
+
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "e") {
+    e.preventDefault();
+    $("#cullingAiEditBtn").trigger("click");
+    return;
+  }
 
   const data = currentData;
   if (!data) return;

@@ -14,15 +14,16 @@ Usage:
         rough per-burst cost estimate, then exits without processing anything)
 
 <output_dir> must already have a valid `Album` (see algo/album.py), produced
-by 1_prep_review.py. Every qualifying sequence of consecutive "sharp" frames
-(grouped by capture-timestamp gap, then required to span more than
+by 1_prep_review.py. Every qualifying sequence of consecutive gradable frames
+(sharp, or blurry above the extended threshold; grouped by capture-timestamp
+gap, then required to span more than
 --min-sequence-seconds or have more than --min-sequence-frames frames) is
 re-ranked from scratch by an OpenAI-backed CullingProvider (see
 algo/llm/culling_provider.py) via the existing
 algo/stages/llm_culling.py::LLMCullingStage. The Album is overwritten in
-place: "keep" and "burst_ranking" on every frame in a qualifying sequence
-are fully replaced (not merged) with the new verdict, and llm_cost_summary
-is updated with this run's token usage/cost.
+place: "burst_ranking", "llm_grade", "stars" and "keep" are fully replaced
+(not merged) with the new verdict -- except photos rated by hand -- and
+llm_cost_summary / llm_model are updated with this run's usage.
 
 Note on cost estimates: OpenAI does not expose a pricing or token-counting
 API, so nothing here is queried "live" from OpenAI except the list of
@@ -62,6 +63,7 @@ from algo.stages.llm_culling import (
     LLMCullingStage,
     load_qualifying_bursts,
 )
+from algo.thresholds import ExtendedThreshold
 
 log = logging.getLogger("TeamPixPython")
 
@@ -180,9 +182,11 @@ def main() -> None:
         metavar="F",
         help=(
             "Blur-sensitivity threshold (0-1) originally used for this album's "
-            "sharp/blurry split (see 1_prep_review.py's --sensitivity) -- reused "
-            "here to assign 1 vs 2 stars to blurry/skipped frames. Should match "
-            "the value the album was actually processed with (default: 0.50)."
+            "sharp/blurry split (see 1_prep_review.py's --sensitivity) -- the "
+            "extended threshold derived from it (max(0.3, threshold - 0.2), or the "
+            "album's own stored offset) decides which blurry frames are graded and "
+            "get 2 stars instead of 1. Should match the value the album was actually "
+            "processed with (default: 0.50)."
         ),
     )
     parser.add_argument(
@@ -276,8 +280,9 @@ def main() -> None:
             "proceeding anyway since you asked for it explicitly.", model,
         )
 
+    extended = ExtendedThreshold.for_album(args.threshold, Album(output_dir).run_settings)
     bursts = load_qualifying_bursts(
-        output_dir, args.burst_gap_seconds, args.min_sequence_seconds, args.min_sequence_frames,
+        output_dir, extended, args.burst_gap_seconds, args.min_sequence_seconds, args.min_sequence_frames,
     )
     if bursts:
         total_input = total_output = 0
@@ -315,6 +320,7 @@ def main() -> None:
         min_sequence_seconds=args.min_sequence_seconds,
         min_sequence_frames=args.min_sequence_frames,
         image_max_long_edge=args.image_max_long_edge,
+        extended=extended,
     )
     stage.process([], app_config)
 

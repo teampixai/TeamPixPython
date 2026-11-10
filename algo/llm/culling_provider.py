@@ -237,19 +237,19 @@ _MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
     # Verified against https://openai.com/api/pricing/ on 2026-08-31.
     "gpt-5.4-mini": (0.75, 4.50),
     "gpt-5.6-luna": (0.20, 1.20),
+    # ASSUMPTION: gpt-6-luna is priced like gpt-5.6-luna; unverified -- check
+    # https://openai.com/api/pricing/. Without an entry the cost falls back to
+    # gpt-4o-mini pricing.
+    "gpt-6-luna":   (0.20, 1.20),
 }
 _DEFAULT_PRICING_PER_MILLION = _MODEL_PRICING_PER_MILLION["gpt-4o-mini"]
 
 # Default OpenAI model used when a caller doesn't specify one — shared by
 # OpenAIProvider's constructor default, 1_prep_review.py's --llm-model default,
-# and RunLLMCulling.py's CLI default so all three can never drift apart.
-# gpt-4.1-mini (not gpt-4o-mini): real A/B testing on a full 768-image album
-# (2026-08-30) showed gpt-4.1-mini is ~7x cheaper (patch-based vision tokenizer
-# vs gpt-4o-mini's unusually expensive tile-based one) and noticeably faster
-# under the same rate-limit budget, with comparable average grades — chosen
-# as the new default per explicit user decision after gpt-4o-mini's grading
-# was judged "not too reliable anyway".
-DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+# and RerunLLMCulling.py's CLI default so all three can never drift apart.
+# gpt-6-luna replaced gpt-4.1-mini (2026-11-09) per explicit user decision;
+# its pricing and image-token tables are below.
+DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 
 
 def known_model_pricing() -> dict[str, tuple[float, float]]:
@@ -321,6 +321,7 @@ _PATCH_BASED_TOKEN_MULTIPLIERS: dict[str, float] = {
     "o4-mini":      1.72,
     "gpt-5.4-mini": 1.2,
     "gpt-5.6-luna": 1.2,
+    "gpt-6-luna": 1.2,  # assumed to tokenize images like gpt-5.6-luna
 }
 # Per-model patch-budget override for models whose "high" (or capped) patch
 # budget differs from the 1536-patch default verified for gpt-4.1-mini/-nano
@@ -332,6 +333,7 @@ _PATCH_BASED_TOKEN_MULTIPLIERS: dict[str, float] = {
 _PATCH_BUDGET_BY_MODEL: dict[str, int] = {
     "gpt-5.4-mini": 2500,
     "gpt-5.6-luna": 2500,
+    "gpt-6-luna": 2500,
 }
 # Typical DSLR aspect ratio (3:2), used when the caller has no real image to
 # measure (e.g. estimating cost before any images have even been listed).
@@ -608,6 +610,14 @@ class OpenAIProvider(CullingProvider):
         self._limits_lock = threading.Lock()
         self.observed_tpm_limit: int | None = None
         self.observed_rpm_limit: int | None = None
+        # None (unknown) until the first real response tells us otherwise --
+        # see _post_chat_completion. Newer "reasoning"-style models (seen so
+        # far: gpt-6-luna) 400 on any temperature other than their default
+        # (1), unlike every model this provider originally shipped with.
+        # Detected lazily from that real error instead of hardcoded by model
+        # name/prefix, so a not-yet-seen model degrades gracefully instead of
+        # silently guessing wrong.
+        self._temperature_supported: bool | None = None
 
     def get_observed_limits(self) -> dict:
         """Best-effort snapshot of the real account RPM/TPM limits observed
@@ -720,17 +730,39 @@ class OpenAIProvider(CullingProvider):
         if self._token_limiter is not None:
             self._token_limiter.acquire(estimated_tokens)
         t0 = time.monotonic()
-        raw_response = self._client.chat.completions.with_raw_response.create(
-            model=self.model,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
+        raw_response = self._post_chat_completion(messages)
         elapsed = time.monotonic() - t0
         self._observe_rate_limits(raw_response.headers)
         response = raw_response.parse()
         self._record_usage(response)
         return response.choices[0].message.content, elapsed
+
+    def _post_chat_completion(self, messages: list[dict]):
+        """POST the actual chat-completions request, with ``temperature=0``
+        omitted once this model is known to reject it (see
+        ``_temperature_supported``). On the very first call for a model that
+        turns out not to support it, catches the resulting 400, flips that
+        flag, and retries once without ``temperature`` so the request still
+        succeeds instead of the whole run failing burst after burst.
+        """
+        import openai
+        kwargs = dict(model=self.model, messages=messages, response_format={"type": "json_object"})
+        if self._temperature_supported is not False:
+            kwargs["temperature"] = 0
+        try:
+            return self._client.chat.completions.with_raw_response.create(**kwargs)
+        except openai.BadRequestError as exc:
+            if self._temperature_supported is False or exc.param != "temperature" or exc.code != "unsupported_value":
+                raise
+            with self._limits_lock:
+                if self._temperature_supported is None:
+                    log.warning(
+                        "[OpenAIProvider] model %r rejected a custom temperature (%s) -- retrying without it "
+                        "and using the API default for every further call this run", self.model, exc.message,
+                    )
+                self._temperature_supported = False
+            kwargs.pop("temperature", None)
+            return self._client.chat.completions.with_raw_response.create(**kwargs)
 
     def _observe_rate_limits(self, headers) -> None:
         """Recalibrate the token/request budgets from a real response's

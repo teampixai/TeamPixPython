@@ -3,7 +3,9 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import math
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -154,13 +156,63 @@ def atomic_save_and_backup(content: str, path: Union[str, Path], *, backup: bool
 _EXIF_TAG_DATETIME = 306
 _EXIF_TAG_DATETIME_ORIGINAL = 36867
 _EXIF_TAG_DATETIME_DIGITIZED = 36868
+# Sub-second companions of the three date tags above (digits after the
+# decimal point, e.g. "16" = 0.16 s), checked in this order.
+_EXIF_TAG_SUBSEC_ORIGINAL = 37521
+_EXIF_TAG_SUBSEC_DIGITIZED = 37522
+_EXIF_TAG_SUBSEC = 37520
+
+# Added to a capture time that has no sub-second part, so every stored
+# capture time carries a millisecond part (see has_millisecond_part()).
+_NO_SUBSEC_SENTINEL_S = 0.0005
+
+# Camera file names like "20250802-123358-016.JPG" end in the hundredths of
+# the second the frame was taken in.
+_FILENAME_HUNDREDTHS_RE = re.compile(r"-(\d{3})$")
+
+
+def has_millisecond_part(timestamp: float | None) -> bool:
+    """Whether *timestamp* carries a sub-second part. A cached capture time
+    without one predates sub-second recording and must be re-read."""
+    return timestamp is not None and timestamp != math.floor(timestamp)
+
+
+def _with_millisecond_part(timestamp: float) -> float:
+    return timestamp if has_millisecond_part(timestamp) else timestamp + _NO_SUBSEC_SENTINEL_S
+
+
+def _exif_subsecond_fraction(exif) -> float | None:
+    """The fraction of a second from EXIF's sub-second tags, None if absent."""
+    sub = exif.get_ifd(_PILExifTags.IFD.Exif)
+    for tag in (_EXIF_TAG_SUBSEC_ORIGINAL, _EXIF_TAG_SUBSEC_DIGITIZED):
+        raw = sub.get(tag)
+        if raw is None:
+            raw = exif.get(tag)
+        digits = str(raw).strip() if raw is not None else ""
+        if digits.isdigit():
+            return int(digits) / 10 ** len(digits)
+    raw = exif.get(_EXIF_TAG_SUBSEC)
+    digits = str(raw).strip() if raw is not None else ""
+    return int(digits) / 10 ** len(digits) if digits.isdigit() else None
+
+
+def _filename_subsecond_fraction(path: Path) -> float | None:
+    match = _FILENAME_HUNDREDTHS_RE.search(path.stem)
+    if not match or int(match.group(1)) > 99:
+        return None
+    return int(match.group(1)) / 100
 
 
 def image_capture_timestamp(path: Path) -> float:
     """Best-effort capture time (as a Unix timestamp) for burst grouping:
-    EXIF capture time first, falling back to min(file create time, file
-    modified time) when EXIF is missing/unreadable (non-JPEG source, no
-    camera metadata, Pillow not installed, etc.)."""
+    EXIF capture time plus its sub-second part (EXIF sub-second tags, else
+    the file name's hundredths suffix), falling back to min(file create time,
+    file modified time) when EXIF is missing/unreadable (non-JPEG source, no
+    camera metadata, Pillow not installed, etc.).
+
+    The result always has a millisecond part (has_millisecond_part()): when
+    no sub-second is known, 0.0005 s is added so the value reads as valid."""
+    path = Path(path)
     if _PILImage is not None:
         try:
             with _PILImage.open(path) as img:
@@ -170,15 +222,18 @@ def image_capture_timestamp(path: Path) -> float:
                     sub = exif.get_ifd(_PILExifTags.IFD.Exif)
                     raw = sub.get(_EXIF_TAG_DATETIME_ORIGINAL) or sub.get(_EXIF_TAG_DATETIME_DIGITIZED)
                 if raw:
-                    from datetime import datetime
-                    return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S").timestamp()
+                    seconds = datetime.strptime(raw, "%Y:%m:%d %H:%M:%S").timestamp()
+                    fraction = _exif_subsecond_fraction(exif)
+                    if fraction is None:
+                        fraction = _filename_subsecond_fraction(path)
+                    return _with_millisecond_part(seconds + (fraction or 0.0))
         except Exception:
             pass
     try:
         stat = path.stat()
-        return min(stat.st_ctime, stat.st_mtime)
+        return _with_millisecond_part(min(stat.st_ctime, stat.st_mtime))
     except OSError:
-        return 0.0
+        return _NO_SUBSEC_SENTINEL_S
 
 
 def apply_auto_adjustment(image: np.ndarray, adjustment: AutoAdjustment | None) -> np.ndarray:

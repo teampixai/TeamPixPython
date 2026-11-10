@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import logging
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,17 +11,20 @@ from algo.album import Album, AlbumImage
 from algo.config import AppConfig
 from algo.frame import Frame
 from algo.llm.culling_provider import BurstFrameInput, BurstRankingResult, CullingProvider
+from algo.results import baseline_stars
 from algo.stage import ProcessStage
 from algo.stages.image_analysis import _read_image
+from algo.star_rules import GradedShot, HighStarParams, promote_high_stars
+from algo.thresholds import ExtendedThreshold
 from algo.utils import cap_long_edge, image_capture_timestamp
 
 log = logging.getLogger("TeamPixPython")
 
-# Consecutive sharp photos within this many seconds of each other are treated
-# as the same "burst" — mirrors culling_app.py's review-page grouping
-# (BURST_GAP_SECONDS), but computed here over sharp frames only: a burst is a
-# run of *already-qualified* shots, so one sharp frame surrounded by 100
-# blurry ones is never treated as part of a "sequence".
+# Consecutive gradable photos within this many seconds of each other are
+# treated as the same "burst" — mirrors culling_app.py's review-page grouping
+# (BURST_GAP_SECONDS), but computed here over gradable frames only (sharp, or
+# blurry yet above the extended threshold): one gradable frame surrounded by
+# 100 hopeless ones is never treated as part of a "sequence".
 DEFAULT_BURST_GAP_SECONDS = 1.0
 # A burst only qualifies as a "sequence" (see _is_qualifying_sequence) once
 # its duration exceeds this many seconds OR it has more than
@@ -33,32 +35,28 @@ DEFAULT_MIN_SEQUENCE_SECONDS = 0.5
 DEFAULT_MIN_SEQUENCE_FRAMES = 8
 # Long-edge size (px) of the down-sized copy sent to the LLM.
 DEFAULT_IMAGE_MAX_LONG_EDGE = 999
-# Sharp frames that don't belong to a qualifying sequence (see
+# Gradable frames that don't belong to a qualifying sequence (see
 # _is_qualifying_sequence) are still sent to the LLM, but graded
 # independently rather than ranked/captioned as a group — they're batched
 # together purely to amortize each request's fixed overhead (system prompt,
 # instructions) across multiple images, not because they're related.
 DEFAULT_SINGLETON_BATCH_SIZE = 6
-# Fraction of those standalone images marked as keepers, highest llm_grade
-# first. Every standalone image keeps its llm_grade regardless of whether it
-# lands in the kept fraction, so the score stays visible for manual review.
-DEFAULT_SINGLETON_KEEP_FRACTION = 0.6
 
-# Star-rating thresholds for standalone (non-sequence) sharp frames —
-# fraction of all LLM-graded standalone frames, by llm_grade, highest
-# first — see _assign_star_ratings. No 5-star tier: top STAR_4_TOP_FRACTION
-# get 4 stars, the next slice up to STAR_3_TOP_FRACTION get 3 stars, the
-# rest get 2.
-STAR_4_TOP_FRACTION = 0.1
-STAR_3_TOP_FRACTION = 0.3
-
-# Star-rating tiers for frames inside a qualifying sequence (see
-# _assign_sequence_stars): round(SEQUENCE_STAR_4_ROUND_OFFSET + duration)
-# frames get 4 stars, then max(1, SEQUENCE_STAR_3_TOP_FRACTION) of what's
-# left get 3 stars, everything else gets 1 star. No 5-star tier applies
-# within a sequence.
-SEQUENCE_STAR_4_ROUND_OFFSET = 0.5
-SEQUENCE_STAR_3_TOP_FRACTION = 0.05
+# High-star rules (see algo/star_rules.py), decided top-down: a graded photo
+# earns 5 stars when it is in the top ``five_star_top_fraction`` of its pool by
+# llm_grade AND the best photo within +/- ``five_star_window_s`` seconds of it;
+# the 5-star photos are then removed from the pool and 4 stars is decided the
+# same way on the rest with the four_star_* values. A pool is one qualifying
+# sequence (clustered), or all of the album's standalone photos together. The
+# two sets are kept separate so either can be tuned without touching the other.
+CLUSTERED_STAR_PARAMS = HighStarParams(
+    four_star_top_fraction=0.20, four_star_window_s=0.5,
+    five_star_top_fraction=0.03, five_star_window_s=1.5,
+)
+STANDALONE_STAR_PARAMS = HighStarParams(
+    four_star_top_fraction=0.20, four_star_window_s=0.5,
+    five_star_top_fraction=0.03, five_star_window_s=1.5,
+)
 
 
 @dataclass(frozen=True)
@@ -79,22 +77,44 @@ class TimedImage:
         return self.image.key
 
 
-def _sorted_sharp_images(album: Album) -> list[TimedImage]:
-    """Every sharp photo in *album*, chronologically."""
+def _capture_time(image: AlbumImage) -> float:
+    """*image*'s capture time with sub-second precision: the cached
+    ``capture_ts`` when valid, else re-read from the source and cached on the
+    entry (saved with the album) so EXIF is never read twice."""
+    timestamp = image.capture_ts
+    if timestamp is None:
+        timestamp = image_capture_timestamp(Path(image.source_file))
+        image.capture_ts = timestamp
+    return timestamp
+
+
+def _is_gradable(image: AlbumImage, extended: ExtendedThreshold) -> bool:
+    """Whether *image* is worth an LLM grade: every sharp photo, plus every
+    blurry one whose sharpness score is above the extended threshold (the
+    2-star tier). Everything else stays at 1 star ungraded."""
+    if image.is_sharp:
+        return True
+    score = image.sharpness_score
+    return image.is_blurry and score is not None and extended.passes(score)
+
+
+def _sorted_gradable_images(album: Album, extended: ExtendedThreshold) -> list[TimedImage]:
+    """Every photo of *album* worth grading (see :func:`_is_gradable`),
+    chronologically."""
     timed = [
-        TimedImage(image, image_capture_timestamp(Path(image.source_file)))
-        for image in album.image_list if image.is_sharp
+        TimedImage(image, _capture_time(image))
+        for image in album.image_list if _is_gradable(image, extended)
     ]
     timed.sort(key=lambda t: (t.timestamp, t.image.source_file))
     return timed
 
 
-def _group_bursts(sharp_images: list[TimedImage], burst_gap_seconds: float) -> list[list[TimedImage]]:
-    """Group chronologically-sorted *sharp_images* (as returned by
-    :func:`_sorted_sharp_images`) into bursts, splitting wherever the gap to
-    the previous frame exceeds *burst_gap_seconds*."""
+def _group_bursts(gradable_images: list[TimedImage], burst_gap_seconds: float) -> list[list[TimedImage]]:
+    """Group chronologically-sorted *gradable_images* (as returned by
+    :func:`_sorted_gradable_images`) into bursts, splitting wherever the gap
+    to the previous frame exceeds *burst_gap_seconds*."""
     bursts: list[list[TimedImage]] = []
-    for timed in sharp_images:
+    for timed in gradable_images:
         if bursts and timed.timestamp - bursts[-1][-1].timestamp <= burst_gap_seconds:
             bursts[-1].append(timed)
         else:
@@ -109,8 +129,8 @@ def _is_qualifying_sequence(
 ) -> bool:
     """Whether *burst* (a group from :func:`_group_bursts`) is long/large
     enough to be treated as a "sequence" (ranked as a group, and star-rated
-    via :meth:`LLMCullingStage._assign_sequence_stars`) rather than as a set
-    of standalone images. Requires the burst's capture-time span to exceed
+    against the rest of that sequence only) rather than as a set of
+    standalone images. Requires the burst's capture-time span to exceed
     *min_seconds*, OR its frame count to exceed *min_frames*."""
     if len(burst) < 2:
         return False
@@ -120,18 +140,19 @@ def _is_qualifying_sequence(
 
 def load_qualifying_bursts(
     album_dir: Path,
+    extended: ExtendedThreshold,
     burst_gap_seconds: float = DEFAULT_BURST_GAP_SECONDS,
     min_sequence_seconds: float = DEFAULT_MIN_SEQUENCE_SECONDS,
     min_sequence_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
 ) -> list[list[TimedImage]]:
     """Read *album_dir*'s `Album` (read-only — nothing is written back) and
-    return the bursts of consecutive sharp frames that qualify as sequences
+    return the bursts of consecutive gradable frames that qualify as sequences
     (see :func:`_is_qualifying_sequence`) for LLM group-ranking. Shared by
     :meth:`LLMCullingStage.process` and pre-flight cost estimates (e.g.
     RerunLLMCulling.py) so the two can never drift out of sync with each
     other's burst definition."""
-    sharp_images = _sorted_sharp_images(Album(album_dir))
-    bursts = _group_bursts(sharp_images, burst_gap_seconds)
+    gradable = _sorted_gradable_images(Album(album_dir), extended)
+    bursts = _group_bursts(gradable, burst_gap_seconds)
     return [b for b in bursts if _is_qualifying_sequence(b, min_sequence_seconds, min_sequence_frames)]
 
 
@@ -153,32 +174,27 @@ class LLMCullingStage(ProcessStage):
     more than ``min_sequence_frames`` frames — smaller bursts don't qualify
     for group ranking; those frames are instead graded individually (never
     ranked or captioned against each other) by
-    :meth:`_grade_standalone_entries`, batched only for request efficiency:
-    the top ``singleton_keep_fraction`` of them (by ``llm_grade``) are marked
-    keepers, the rest dropped, and every one of them keeps its ``llm_grade``
-    regardless for manual review.
+    :meth:`_grade_standalone_images`, batched only for request efficiency;
+    every one of them gets an ``llm_grade``.
 
     All qualifying sequences are handed to ``provider.rank_bursts`` in one
     call so a provider that supports it (e.g. :class:`~algo.llm.culling_provider.
     OpenAIProvider`) can fan the LLM calls out concurrently instead of
     waiting on each burst's round-trip one at a time. For each sequence the
-    provider picks the top ``min(3, len(burst))`` shots. Rank 1 gets
-    ``keep=True``; every other frame in the burst — ranked #2/#3 or not
-    ranked at all — gets ``keep=False``. Ranked (but not #1) frames
-    additionally get a ``burst_ranking`` entry (rank + reason) recorded so
-    the review UI can still show why they were close contenders, even
-    though they're dropped. Separately, EVERY frame in the burst (not just
+    provider picks the top ``min(3, len(burst))`` shots; ranked frames get a
+    ``burst_ranking`` entry (rank + reason) so the review UI can show why they
+    were close contenders. Separately, EVERY frame in the burst (not just
     the ranked top picks) gets an ``llm_grade`` (0.0-1.0 quality score) when
     the provider returns one, and every frame in the burst gets the same
     ``burst_caption`` (a short, punchy caption for the burst as a whole)
-    when the provider returns one. Star ratings within a qualifying sequence
-    are then assigned by :meth:`_assign_sequence_stars` instead of the
-    global-percentile rule used for standalone frames — see
-    :meth:`_assign_star_ratings`.
+    when the provider returns one.
+
+    Star ratings and ``keep`` come from :meth:`_assign_star_ratings`, not from
+    the ranking: see its docstring for the rules.
 
     A token-usage/cost summary (``provider.get_cost_summary()``) is logged
-    and written to the `Album` as ``llm_cost_summary`` once processing
-    finishes.
+    and written to the `Album` as ``llm_cost_summary`` (with the model name as
+    ``llm_model``) once processing finishes.
     """
 
     def __init__(
@@ -191,22 +207,25 @@ class LLMCullingStage(ProcessStage):
         min_sequence_frames: int = DEFAULT_MIN_SEQUENCE_FRAMES,
         image_max_long_edge: int = DEFAULT_IMAGE_MAX_LONG_EDGE,
         singleton_batch_size: int = DEFAULT_SINGLETON_BATCH_SIZE,
-        singleton_keep_fraction: float = DEFAULT_SINGLETON_KEEP_FRACTION,
         new_keys: frozenset[str] | None = None,
+        extended: ExtendedThreshold | None = None,
+        clustered_star_params: HighStarParams = CLUSTERED_STAR_PARAMS,
+        standalone_star_params: HighStarParams = STANDALONE_STAR_PARAMS,
     ) -> None:
         self.output_dir = output_dir
         self.provider = provider
         # The same blur-sensitivity threshold used earlier (GradingStage) to
-        # split sharp/blurry — reused here to split the *discard* side of the
-        # star scale (1 vs 2 stars) between "clearly bad" and "close to the
-        # keep line". See _assign_star_ratings.
+        # split sharp/blurry. The extended threshold derived from it (or
+        # passed in) splits blurry photos into 2 stars (graded) and 1 star.
         self.threshold = threshold
+        self.extended = extended
         self.burst_gap_seconds = burst_gap_seconds
         self.min_sequence_seconds = min_sequence_seconds
         self.min_sequence_frames = min_sequence_frames
         self.image_max_long_edge = image_max_long_edge
         self.singleton_batch_size = singleton_batch_size
-        self.singleton_keep_fraction = singleton_keep_fraction
+        self.clustered_star_params = clustered_star_params
+        self.standalone_star_params = standalone_star_params
         # Bookkeeping keys (see algo/utils.py::make_unique_import_key) of the
         # frames processed THIS run. When provided, only bursts/standalone
         # entries containing at least one of these are sent to the LLM --
@@ -222,17 +241,18 @@ class LLMCullingStage(ProcessStage):
             log.warning("[LLMCullingStage] no Album found at %s — skipping", album.path)
             return frames
 
-        sharp_images = _sorted_sharp_images(album)
-        bursts = _group_bursts(sharp_images, self.burst_gap_seconds)
+        extended = self.extended or ExtendedThreshold.for_album(self.threshold, album.run_settings)
+        gradable_images = _sorted_gradable_images(album, extended)
+        bursts = _group_bursts(gradable_images, self.burst_gap_seconds)
 
         sequences = [
             b for b in bursts
             if _is_qualifying_sequence(b, self.min_sequence_seconds, self.min_sequence_frames)
         ]
         log.info(
-            "[LLMCullingStage] %d sharp frame(s) -> %d burst(s), %d qualify as sequences "
-            "(duration > %.1fs or > %d frames)",
-            len(sharp_images), len(bursts), len(sequences),
+            "[LLMCullingStage] %d gradable frame(s) (sharp, or blurry above extended threshold %.2f) "
+            "-> %d burst(s), %d qualify as sequences (duration > %.1fs or > %d frames)",
+            len(gradable_images), extended.value, len(bursts), len(sequences),
             self.min_sequence_seconds, self.min_sequence_frames,
         )
 
@@ -298,12 +318,10 @@ class LLMCullingStage(ProcessStage):
             log.info("[LLMCullingStage] grading %d standalone image(s) …", len(standalone_images))
             self._grade_standalone_images([t.image for t in standalone_images])
 
-        all_images = album.image_list
-        blurry_images = [i for i in all_images if i.is_blurry]
-        skipped_images = [i for i in all_images if i.status in ("skipped", "error")]
-        self._assign_star_ratings(sharp_images, blurry_images, skipped_images, sequences)
+        self._assign_star_ratings(album.image_list, extended, bursts, sequences)
 
         cost_summary = self.provider.get_cost_summary()
+        album.llm_model = getattr(self.provider, "model", None)
         album.llm_cost_summary = {
             "session_count": cost_summary.session_count,
             "total_input_tokens": cost_summary.total_input_tokens,
@@ -324,118 +342,63 @@ class LLMCullingStage(ProcessStage):
 
     def _assign_star_ratings(
         self,
-        sharp_images: list[TimedImage],
-        blurry_images: list[AlbumImage],
-        skipped_images: list[AlbumImage],
+        album_images: list[AlbumImage],
+        extended: ExtendedThreshold,
+        bursts: list[list[TimedImage]],
         sequences: list[list[TimedImage]],
     ) -> None:
-        """Assign a 1-4 star rating to every analysed entry (sharp, blurry,
-        or skipped) so the whole album can be ranked on one scale (5 stars
-        is reserved for manual review — see ``apply_auto_rating``):
+        """Assign a 1-5 star rating, and ``keep`` (= stars >= 3), to every
+        analysed photo. A photo the user rated by hand is left alone
+        (``apply_auto_rating``).
 
-        - 1 star:  no face detected (``skipped``/``error``), or a blurry
-          frame whose sharpness_score is below ``min(threshold, 0.4)`` —
-          clearly discard.
-        - 2 stars: a blurry frame whose sharpness_score is between
-          ``min(threshold, 0.4)`` and ``threshold`` — still below the keep
-          line, but close to it.
-        - 3 stars: baseline for every ``sharp`` frame (it already qualified
-          as a keeper).
+        Base stars, from the verdict and the *extended* threshold:
 
-        Sharp frames belonging to a qualifying *sequence* (see
-        :func:`_is_qualifying_sequence`) then get their 1/3/4-star tier
-        overridden by :meth:`_assign_sequence_stars` instead — sequences
-        never compete against the rest of the album on one global
-        percentile, and have no 5-star tier.
+        - 3 stars: every sharp photo.
+        - 2 stars: a blurry photo whose sharpness score is above *extended*.
+        - 1 star:  a blurry photo at or below *extended*, or one with no face
+          (``skipped``/``error``).
 
-        Every OTHER sharp frame (standalone images, and frames in a burst
-        too short/small to qualify as a sequence) keeps the original
-        global-percentile rule, with no 5-star tier:
-
-        - 4 stars: top ``STAR_4_TOP_FRACTION`` of those frames by
-          ``llm_grade`` percentile.
-        - 3 stars: the next slice, up to ``STAR_3_TOP_FRACTION``.
-        - 2 stars: everything past ``STAR_3_TOP_FRACTION``.
+        The LLM grades every sharp and 2-star photo. Graded photos can then be
+        promoted above their base (see algo/star_rules.py), top-down: 5 stars when
+        in the top 3% by grade AND the best within +/-1.5 s; then, with the 5-star
+        photos removed from the pool, 4 stars when in the top 20% of the rest AND
+        the best within +/-0.5 s. Photos are only ever compared inside
+        their pool: one qualifying sequence at a time (``clustered_star_params``),
+        and all standalone photos together (``standalone_star_params``).
+        A photo with no grade (LLM failure) keeps its base stars.
         """
-        low_cutoff = min(self.threshold, 0.4)
-        for image in skipped_images:
-            image.stars = 1
-        for image in blurry_images:
-            score = image.sharpness_score
-            image.stars = 1 if score is None or score < low_cutoff else 2
-
-        for timed in sharp_images:
-            timed.image.stars = 3
-
+        promoted: dict[str, int] = {}
+        in_sequence: set[str] = set()
         for burst in sequences:
-            self._assign_sequence_stars(burst)
+            in_sequence.update(t.key for t in burst)
+            promoted.update(promote_high_stars(self._graded_shots(burst), self.clustered_star_params))
+        standalone = [t for burst in bursts for t in burst if t.key not in in_sequence]
+        promoted.update(promote_high_stars(self._graded_shots(standalone), self.standalone_star_params))
 
-        sequence_keys = {t.key for burst in sequences for t in burst}
-        non_sequence_sharp = [t.image for t in sharp_images if t.key not in sequence_keys]
-
-        graded = [i for i in non_sequence_sharp if i.llm_grade is not None]
-        graded.sort(key=lambda i: i.llm_grade, reverse=True)
-        top_4_count = math.ceil(len(graded) * STAR_4_TOP_FRACTION)
-        top_3_count = math.ceil(len(graded) * STAR_3_TOP_FRACTION)
-        for image in graded[top_4_count:top_3_count]:
-            image.stars = 3
-        for image in graded[top_3_count:]:
-            image.stars = 2
-        for image in graded[:top_4_count]:
-            image.stars = 4
-
-        sharp = [t.image for t in sharp_images]
-        log.info(
-            "[LLMCullingStage] star ratings: %d1\u2605, %d2\u2605, %d3\u2605, %d4\u2605 (%d sharp/%d blurry/%d skipped)",
-            sum(1 for i in skipped_images + blurry_images + sharp if i.stars == 1),
-            sum(1 for i in blurry_images + sharp if i.stars == 2),
-            sum(1 for i in sharp if i.stars == 3),
-            sum(1 for i in sharp if i.stars == 4),
-            len(sharp), len(blurry_images), len(skipped_images),
-        )
-
-    def _assign_sequence_stars(self, burst: list[TimedImage]) -> None:
-        """Star tiers for one qualifying burst sequence, scored independently
-        per-sequence (never pooled against other sequences or the rest of
-        the album):
-
-        - 4 stars: the top ``round(SEQUENCE_STAR_4_ROUND_OFFSET + duration)``
-          frames by ``llm_grade`` (clamped to at least 1, and at most every
-          graded frame in the burst) — e.g. a 1.5s sequence picks its top 2.
-        - 3 stars: ``max(1, ceil(SEQUENCE_STAR_3_TOP_FRACTION * remaining))``
-          of whatever's left (by ``llm_grade``).
-        - 1 star: everything else in the sequence.
-
-        There is no 2 or 5-star tier here. If the burst has no graded frames
-        at all (e.g. the LLM call failed), it's left at the baseline 3 stars
-        every sharp frame already got, rather than guessing.
-        """
-        graded = [t for t in burst if t.image.llm_grade is not None]
-        if not graded:
-            return
-        graded.sort(key=lambda t: t.image.llm_grade, reverse=True)
-
-        duration = burst[-1].timestamp - burst[0].timestamp
-        four_star_count = min(
-            max(round(SEQUENCE_STAR_4_ROUND_OFFSET + duration), 1),
-            len(graded),
-        )
-        four_star_keys = {t.key for t in graded[:four_star_count]}
-
-        remaining = graded[four_star_count:]
-        three_star_count = min(
-            max(1, math.ceil(len(remaining) * SEQUENCE_STAR_3_TOP_FRACTION)),
-            len(remaining),
-        )
-        three_star_keys = {t.key for t in remaining[:three_star_count]}
-
-        for timed in burst:
-            if timed.key in four_star_keys:
-                timed.image.stars = 4
-            elif timed.key in three_star_keys:
-                timed.image.stars = 3
+        counts: dict[int, int] = {}
+        for image in album_images:
+            if image.status not in ("sharp", "blurry", "skipped", "error"):
+                continue
+            if image.status in ("sharp", "blurry"):
+                base = baseline_stars(image.sharpness_score, image.status, extended)
             else:
-                timed.image.stars = 1
+                base = 1
+            image.apply_auto_rating(promoted.get(image.key, base))
+            counts[image.stars] = counts.get(image.stars, 0) + 1
+
+        log.info(
+            "[LLMCullingStage] star ratings: %s (%d clustered pool(s), %d standalone photo(s); "
+            "extended threshold %.2f)",
+            ", ".join(f"{n}\u2605 x{counts.get(n, 0)}" for n in range(1, 6)),
+            len(sequences), len(standalone), extended.value,
+        )
+
+    @staticmethod
+    def _graded_shots(timed_images: list[TimedImage]) -> list[GradedShot]:
+        return [
+            GradedShot(t.key, t.timestamp, t.image.llm_grade)
+            for t in timed_images if t.image.llm_grade is not None
+        ]
 
     def _apply_rankings(self, burst: list[TimedImage], group_id: str, result: BurstRankingResult) -> None:
         rank_by_file = {r.file: r for r in result.rankings}
@@ -447,14 +410,11 @@ class LLMCullingStage(ProcessStage):
             image = timed.image
             ranked = rank_by_file.get(timed.key)
             if ranked is not None:
-                image.keep = ranked.rank == 1
                 image.burst_ranking = {
                     "rank": ranked.rank,
                     "reason": ranked.reason,
                     "group_id": group_id,
                 }
-            else:
-                image.keep = False
             grade = result.grades.get(timed.key)
             if grade is not None:
                 image.llm_grade = grade
@@ -465,18 +425,16 @@ class LLMCullingStage(ProcessStage):
         log.info("[LLMCullingStage] %s: %d frame(s) ranked, top pick=%s", group_id, len(result.rankings), top)
 
     def _grade_standalone_images(self, images: list[AlbumImage]) -> None:
-        """Grade sharp frames that don't belong to a qualifying burst
+        """Grade gradable frames that don't belong to a qualifying burst
         (``images``) individually via ``provider.grade_image_batches``.
         Images are chunked into ``singleton_batch_size``-sized groups purely
         to amortize each request's fixed overhead across multiple images —
         the LLM still grades each one independently, never comparing them.
 
-        Every image that gets a grade back has its ``llm_grade`` recorded.
-        The top ``singleton_keep_fraction`` of *graded* images (by grade,
-        highest first) are marked ``keep=True``, the rest ``keep=False`` —
-        every graded image keeps its ``llm_grade`` regardless, so the score
-        stays visible for manual review even when dropped. Images whose
-        batch fails (no grade returned) are left untouched.
+        Every image that gets a grade back has its ``llm_grade`` recorded;
+        stars and ``keep`` follow from the grades in
+        :meth:`_assign_star_ratings`. Images whose batch fails (no grade
+        returned) are left untouched.
         """
         batches: list[list[BurstFrameInput]] = []
         by_name_per_batch: list[dict[str, AlbumImage]] = []
@@ -505,31 +463,23 @@ class LLMCullingStage(ProcessStage):
             log.error("[LLMCullingStage] provider.grade_image_batches failed: %s", exc, exc_info=True)
             grade_results = [{} for _ in batches]
 
-        graded_images: list[AlbumImage] = []
+        graded_count = 0
         for by_name, grades in zip(by_name_per_batch, grade_results):
             for filename, grade in grades.items():
                 image = by_name.get(filename)
                 if image is None:
                     continue
                 image.llm_grade = grade
-                graded_images.append(image)
+                graded_count += 1
 
-        if not graded_images:
+        if not graded_count:
             log.warning(
                 "[LLMCullingStage] standalone grading returned no usable grade for any of %d image(s)",
                 len(images),
             )
             return
 
-        graded_images.sort(key=lambda i: i.llm_grade, reverse=True)
-        keep_count = round(len(graded_images) * self.singleton_keep_fraction)
-        for idx, image in enumerate(graded_images):
-            image.keep = idx < keep_count
-
-        log.info(
-            "[LLMCullingStage] standalone: %d/%d image(s) graded, top %d (%.0f%%) marked keep",
-            len(graded_images), len(images), keep_count, self.singleton_keep_fraction * 100,
-        )
+        log.info("[LLMCullingStage] standalone: %d/%d image(s) graded", graded_count, len(images))
 
     def _build_frame_input(self, album_image: AlbumImage) -> BurstFrameInput | None:
         file_path = album_image.original_path
@@ -546,7 +496,10 @@ class LLMCullingStage(ProcessStage):
         image_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
         passing = [b for b in album_image.bodies if b.passed]
-        best_body = max(passing, key=lambda b: b.sharpness_score, default=None)
+        # A blurry (2-star) photo has no passing body: fall back to its best one.
+        best_body = max(
+            passing or album_image.bodies, key=lambda b: b.sharpness_score, default=None,
+        )
         face_bbox = None
         if best_body is not None:
             box = best_body.narrow_face_bbox or best_body.face_bbox

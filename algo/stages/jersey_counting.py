@@ -182,6 +182,29 @@ def _matches_lab_refs(
     )
 
 
+def _nearest_reference_matches(
+    body: Body, colors: frozenset[str], config: AppConfig
+) -> bool:
+    """True when the reference colour closest to *body*'s measured L*a*b*
+    (under the same brightness-forgiving distance) is one of *colors*.
+
+    A within-tolerance test alone is too loose for dark jerseys: a navy
+    jersey is well inside the tolerance of a forced "violet", so it would be
+    accepted as the goalkeeper's colour. Requiring that the forced colour is
+    also the closest one keeps the rescue for a forced-colour jersey seen in
+    shadow, without letting a nearby but different colour through."""
+    blab = _body_lab(body)
+    if blab is None:
+        return False
+    nearest = min(
+        ClothColorPredictor._COLORS,
+        key=lambda c: _weighted_lab_distance(
+            blab, c.lab, config.jersey_lab_l_weight, config.jersey_lab_c_weight, config.jersey_lab_h_weight
+        ),
+    )
+    return _matches_allowed_jersey_color(ColorLab(nearest.hue, nearest.shade), colors)
+
+
 def _poll_team_target_lab(
     frames: list[Frame], our_label: str
 ) -> tuple[float, float, float] | None:
@@ -208,6 +231,48 @@ def _poll_team_target_lab(
             statistics.median(s[2] for s in samples),
         )
     return _REF_LAB_BY_LABEL.get(our_label)
+
+
+def pinned_target_lab(
+    pinned_label: str, labs_by_label: dict[str, list[tuple[float, float, float]]],
+) -> tuple[float, float, float] | None:
+    """The L*a*b* anchor for a user-pinned team colour.
+
+    The pin is typed on the Team page, so it is often only a hue ("White") or
+    a shade ("Navy") rather than a full "Hue:Shade" label, and no body is
+    labelled exactly that. It is matched the way the allow-list is (hue,
+    shade or full label): the median measured LAB of the bodies whose
+    predicted colour matches it, else the reference colours it names. None
+    when it names no known colour.
+    """
+    samples = list(labs_by_label.get(pinned_label) or [])
+    if not samples:
+        wanted = frozenset({pinned_label})
+        for label, labs in labs_by_label.items():
+            if _matches_allowed_jersey_color(_color_from_label(label), wanted):
+                samples.extend(labs)
+    if not samples:
+        ref = _REF_LAB_BY_LABEL.get(pinned_label)
+        samples = [ref] if ref else _allowed_reference_labs(frozenset({pinned_label}))
+    if not samples:
+        return None
+    return (
+        statistics.median(s[0] for s in samples),
+        statistics.median(s[1] for s in samples),
+        statistics.median(s[2] for s in samples),
+    )
+
+
+def _candidate_labs_by_label(frames: list[Frame]) -> dict[str, list[tuple[float, float, float]]]:
+    """Measured mean LABs of every jersey candidate, grouped by predicted label."""
+    labs: dict[str, list[tuple[float, float, float]]] = {}
+    for frame in frames:
+        for body in frame.bodies:
+            if _is_jersey_candidate(body):
+                mean = (body.cloth_color_detail or {}).get("mean_lab")
+                if mean and len(mean) == 3:
+                    labs.setdefault(body.cloth_color, []).append((float(mean[0]), float(mean[1]), float(mean[2])))
+    return labs
 
 
 def _poll_jersey_color(frames: list[Frame]) -> ColorLab | None:
@@ -253,9 +318,11 @@ def classify_body_jersey(
     bcolor = _color_from_label(body.cloth_color)
 
     # Forced colors (e.g. goalies) always pass — skip further checks.
-    # In LAB mode, also accept a brightness-forgiving distance match.
+    # In LAB mode, also accept a brightness-forgiving distance match, as long
+    # as the forced colour is also the body's closest reference colour.
     if (_matches_allowed_jersey_color(bcolor, forced_colors)
-            or _matches_lab_refs(body, forced_labs, config)):
+            or (_matches_lab_refs(body, forced_labs, config)
+                and _nearest_reference_matches(body, forced_colors, config))):
         log.debug("[JerseyCountingStage] %s — body cloth=%s in forced-colors → pass",
                   log_prefix, body.cloth_color)
         return
@@ -381,7 +448,11 @@ class JerseyCountingStage(ProcessStage):
         forced_labs: list[tuple[float, float, float]] = []
         allowed_labs: list[tuple[float, float, float]] = []
         if config.jersey_lab_match:
-            team_target_lab = _poll_team_target_lab(frames, our_color.label)
+            team_target_lab = (
+                pinned_target_lab(our_color.label, _candidate_labs_by_label(frames))
+                if self.team_color_override
+                else _poll_team_target_lab(frames, our_color.label)
+            )
             forced_labs = _allowed_reference_labs(self.forced_colors)
             allowed_labs = _allowed_reference_labs(self.allowed_colors)
             log.info("[JerseyCountingStage] LAB-distance mode — team target L*a*b*: %s "
@@ -393,10 +464,10 @@ class JerseyCountingStage(ProcessStage):
             # A pinned colour must anchor the bucket too, otherwise this
             # strategy would still judge against the polled majority.
             if self.team_color_override:
-                ref = _REF_LAB_BY_LABEL.get(our_color.label)
+                target = pinned_target_lab(our_color.label, _candidate_labs_by_label(frames))
                 team_bucket = _lightness_class(
-                    ref, config.jersey_light_l_min, config.jersey_light_chroma_max
-                ) if ref else None
+                    target, config.jersey_light_l_min, config.jersey_light_chroma_max
+                ) if target else None
             else:
                 team_bucket = _poll_lightness_bucket(frames, config)
             self.our_bucket = team_bucket

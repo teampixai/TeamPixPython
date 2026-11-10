@@ -49,11 +49,11 @@ def test_quick_regrade_streams_its_log_and_returns_the_summary(client, album_dir
 
     lines, final = _wait_for_job(client)
     text = "\n".join(lines)
-    assert "[regrade] sharpness threshold 0.50, extended threshold 0.20" in text
+    assert "[regrade] sharpness threshold 0.50, extended threshold 0.30" in text
     assert "applying verdicts and teammate flags" in text
     assert "is_teammate False -> True" in text
     assert "teammates: 3 total (3 newly flagged, 0 no longer teammates" in text
-    assert "setting changed - extended_threshold_offset: (not set) -> 0.3" in text
+    assert "setting changed - extended_threshold_offset: (not set) -> 0.2" in text
     assert "Regrade finished" in text
     assert final["returnCode"] == 0
     assert final["result"]["imagesConsidered"] == 1

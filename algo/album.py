@@ -41,6 +41,7 @@ from algo.utils import (
     THUMBNAILS_SUBDIR,
     atomic_save_and_backup,
     ensure_cover_thumbnail,
+    has_millisecond_part,
     make_unique_import_key,
     unique_path,
 )
@@ -562,9 +563,8 @@ class AlbumImage:
     def keep(self, value: bool) -> None:
         """Whether this photo survives culling.
 
-        NOT derived from `stars`: LLM culling sets it from burst rank (only
-        the best frame in a burst is kept, whatever its rating). The
-        stars-based rule is one of several writers — see `apply_auto_rating`.
+        The stars-based rule is one of several writers — see `apply_auto_rating`
+        (which LLM culling also uses, so for an auto-rated photo keep == stars >= 3).
         """
         self._d["keep"] = bool(value)
 
@@ -581,11 +581,15 @@ class AlbumImage:
 
     @property
     def capture_ts(self) -> Optional[float]:
-        """When the photo was taken (Unix timestamp), cached at import so
-        burst grouping never has to re-read EXIF from the source. None for
-        albums written before it was recorded."""
+        """When the photo was taken (Unix timestamp, with a sub-second part),
+        cached at import so burst grouping never has to re-read EXIF from
+        the source. None for albums written before it was recorded, and for
+        a cached whole-second value (no millisecond part): that predates
+        sub-second capture times and has to be re-read from EXIF."""
         ts = self._d.get("capture_ts")
-        return float(ts) if ts is not None else None
+        if ts is None or not has_millisecond_part(float(ts)):
+            return None
+        return float(ts)
 
     @capture_ts.setter
     def capture_ts(self, value: Optional[float]) -> None:
@@ -1013,6 +1017,17 @@ class Album:
     def llm_cost_summary(self, value: dict) -> None:
         with self._lock:
             self.payload["llm_cost_summary"] = value
+
+    @property
+    def llm_model(self) -> str:
+        """The model that produced the LLM grades, ``""`` if unknown."""
+        return self.payload.get("llm_model") or ""
+
+    @llm_model.setter
+    def llm_model(self, value: str | None) -> None:
+        with self._lock:
+            if value:
+                self.payload["llm_model"] = value
 
     @property
     def exists(self) -> bool:

@@ -40,7 +40,7 @@ def exif_reads(monkeypatch):
 
     def fake(path):
         calls.append(Path(path))
-        return 1000.0 + len(calls)
+        return 1000.5 + len(calls)
 
     monkeypatch.setattr(culling_app, "image_capture_timestamp", fake)
     return calls
@@ -62,10 +62,62 @@ def test_capture_ts_roundtrips_and_defaults_to_none(album_dir):
 
 
 def test_cached_timestamps_are_used_without_reading_sources(album_dir, tmp_path, exif_reads):
-    _album(album_dir, tmp_path, capture_ts=500.0)
+    _album(album_dir, tmp_path, capture_ts=500.25)
     images = culling_app._all_culling_images(album_dir)
-    assert [im["timestamp"] for im in images] == [500.0, 500.0]
+    assert [im["timestamp"] for im in images] == [500.25, 500.25]
     assert exif_reads == []
+
+
+def test_whole_second_cached_timestamps_are_invalid_and_refreshed(album_dir, tmp_path, exif_reads):
+    album_json = _album(album_dir, tmp_path, capture_ts=500.0)
+    assert Album(album_dir).image("A.jpg").capture_ts is None
+
+    images = culling_app._all_culling_images(album_dir)
+
+    assert len(exif_reads) == 2
+    assert all(im["timestamp"] > 1000 for im in images)
+    saved = json.loads(album_json.read_text(encoding="utf-8"))["results"]
+    assert [e["capture_ts"] for e in saved] == [im["timestamp"] for im in images]
+
+
+def _jpeg_with_exif(path: Path, subsec: str | None, taken: str = "2025:08:02 12:33:58") -> Path:
+    from PIL import Image
+
+    img = Image.new("RGB", (8, 8))
+    exif = img.getexif()
+    exif[306] = taken
+    sub = exif.get_ifd(0x8769)
+    sub[36867] = taken
+    if subsec is not None:
+        sub[37521] = subsec
+    img.save(path, exif=exif)
+    return path
+
+
+def test_capture_timestamp_adds_the_exif_subsecond(tmp_path):
+    from algo.utils import has_millisecond_part, image_capture_timestamp
+
+    whole = image_capture_timestamp(_jpeg_with_exif(tmp_path / "a.jpg", None))
+    sub = image_capture_timestamp(_jpeg_with_exif(tmp_path / "b.jpg", "16"))
+    assert has_millisecond_part(whole) and has_millisecond_part(sub)
+    assert sub - whole == pytest.approx(0.16 - 0.0005, abs=1e-3)
+
+
+def test_capture_timestamp_falls_back_to_the_file_name_hundredths(tmp_path):
+    from algo.utils import image_capture_timestamp
+
+    plain = image_capture_timestamp(_jpeg_with_exif(tmp_path / "IMG.jpg", None))
+    named = image_capture_timestamp(_jpeg_with_exif(tmp_path / "20250802-123358-073.jpg", None))
+    assert named - plain == pytest.approx(0.73 - 0.0005, abs=1e-3)
+
+
+def test_capture_timestamp_without_any_subsecond_still_has_a_millisecond_part(tmp_path):
+    from algo.utils import has_millisecond_part, image_capture_timestamp
+
+    exact = image_capture_timestamp(_jpeg_with_exif(tmp_path / "IMG.jpg", "00"))
+    assert has_millisecond_part(exact)
+    assert exact == pytest.approx(int(exact) + 0.0005, abs=1e-6)
+    assert has_millisecond_part(image_capture_timestamp(tmp_path / "not-an-image.txt"))
 
 
 def test_missing_timestamps_are_read_once_and_persisted(album_dir, tmp_path, exif_reads):

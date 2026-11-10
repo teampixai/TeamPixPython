@@ -18,6 +18,7 @@ from algo.album import PersonRecord
 from algo.frame import Frame
 from algo.models import AutoAdjustment, Body, Box, Face, Point, PredictedKeyPoint
 from algo.results import baseline_stars, build_result_entries
+from algo.thresholds import ExtendedThreshold
 
 
 def _body(passed: bool = True) -> Body:
@@ -153,10 +154,12 @@ def test_person_record_wire_is_json_serializable_and_passed_through():
 
 
 def test_baseline_stars_matches_the_documented_rule():
-    assert baseline_stars(0.01, "sharp", 0.35) == 3
-    assert baseline_stars(0.5, "blurry", 0.35) == 2
-    assert baseline_stars(0.1, "blurry", 0.35) == 1
-    assert baseline_stars(None, "blurry", 0.35) == 1
-    # The floor is capped at 0.4 however strict the album's setting is.
-    assert baseline_stars(0.45, "blurry", 0.9) == 2
-    assert baseline_stars(0.3, "blurry", 0.9) == 1
+    ext = ExtendedThreshold(0.5, 0.2)  # 0.3
+    assert baseline_stars(0.01, "sharp", ext) == 3
+    assert baseline_stars(0.5, "blurry", ext) == 2
+    assert baseline_stars(0.31, "blurry", ext) == 2
+    assert baseline_stars(0.3, "blurry", ext) == 1   # not strictly above the extended threshold
+    assert baseline_stars(0.1, "blurry", ext) == 1
+    assert baseline_stars(None, "blurry", ext) == 1
+    assert baseline_stars(0.45, "blurry", ExtendedThreshold(0.9, 0.2)) == 1  # extended 0.7
+    assert baseline_stars(0.75, "blurry", ExtendedThreshold(0.9, 0.2)) == 2

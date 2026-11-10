@@ -344,10 +344,11 @@ const Viewport = (function () {
     $closeBtn.on("click", close);
 
     // Any keydown closes the window, except '1' (zoom to actual, matching
-    // the shared viewport hotkey) and Left/A / Right/D (navigate, when
-    // there's a group) — captured ahead of any other page-level keydown
-    // handler (e.g. the cluster page's Delete-key handler) so it never also
-    // fires while the window is open.
+    // the shared viewport hotkey), Ctrl/Cmd+E (AI edit, matching the
+    // toolbar button) and Left/A / Right/D (navigate, when there's a
+    // group) — captured ahead of any other page-level keydown handler
+    // (e.g. the cluster page's Delete-key handler) so it never also fires
+    // while the window is open.
     function onKeydown(e) {
       // Let normal typing/selection (e.g. Ctrl+A/Ctrl+C on the readonly path
       // box) work while focus is in the toolbar, instead of closing the
@@ -360,6 +361,11 @@ const Viewport = (function () {
         return;
       }
       const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === "e") {
+        e.preventDefault();
+        if (currentAiEditKey) AiEdit.run(currentAiEditKey, { onResult: onAiEditResult });
+        return;
+      }
       if (images.length > 1) {
         if (key === "arrowleft" || key === "a") {
           goTo(current - 1);

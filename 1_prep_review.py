@@ -385,7 +385,7 @@ _REGRADE_PRESERVED_FIELDS = (
 
 
 def _merge_preserved_fields(
-    new_entries: list[dict], old_entries: list[dict], threshold: float
+    new_entries: list[dict], old_entries: list[dict], extended: ExtendedThreshold
 ) -> list[dict]:
     old_by_key = {
         (e.get("key") or Path(e.get("file", "")).name): e
@@ -403,7 +403,7 @@ def _merge_preserved_fields(
         # user rated it by hand (culling_app.py's "stars_manual" marker).
         if old.get("status") != entry.get("status") and not entry.get("stars_manual"):
             entry["stars"] = baseline_stars(
-                entry.get("sharpness_score"), entry.get("status", "blurry"), threshold
+                entry.get("sharpness_score"), entry.get("status", "blurry"), extended
             )
             entry["keep"] = entry["stars"] >= 3
     return new_entries
@@ -1009,7 +1009,7 @@ def main() -> None:
         # the freshly-built entries before the single Album write below --
         # a deep regrade never needs more than one write.
         merged_results = _merge_preserved_fields(
-            build_result_entries(frames), existing_entries, sensitivity_threshold
+            build_result_entries(frames), existing_entries, extended_threshold
         )
         Album(output_dir).write_results(
             merged_results,
@@ -1091,6 +1091,7 @@ def main() -> None:
             provider = OpenAIProvider(api_key=openai_api_key, model=args.llm_model)
             LLMCullingStage(
                 working_dir, provider=provider, threshold=sensitivity_threshold,
+                extended=extended_threshold,
             ).process(frames, app_config)
         except Exception as exc:
             log.error("LLM-assisted burst culling failed: %s", exc, exc_info=True)

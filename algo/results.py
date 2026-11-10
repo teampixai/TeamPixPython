@@ -13,6 +13,7 @@ from __future__ import annotations
 from algo.album import PersonRecord
 from algo.frame import Frame
 from algo.models import Box, Face, NumpyEncoder, PredictedKeyPoint
+from algo.thresholds import ExtendedThreshold
 from algo.utils import image_capture_timestamp
 
 __all__ = ["NumpyEncoder", "baseline_stars", "build_result_entries",
@@ -31,20 +32,21 @@ def serial_face(f: Face) -> dict:
     return f.to_wire()
 
 
-def baseline_stars(sharpness_score: float | None, status: str, threshold: float) -> int:
-    """Star rating for a photo whose verdict just changed.
+def baseline_stars(sharpness_score: float | None, status: str, extended: ExtendedThreshold) -> int:
+    """Star rating before any LLM grade is applied.
 
     Mirrors the floor of algo/stages/llm_culling.py::_assign_star_ratings:
-    3 for sharp, and for blurry 2 if it's close to the keep line or 1 if
-    clearly bad. The 4/5 tiers there come from llm_grade percentiles across
-    the whole album, which only that stage can recompute -- a regrade drops
-    a re-verdicted photo back to the baseline rather than guessing.
+    3 for sharp, and for blurry 2 if its score is above the *extended*
+    threshold or 1 if not (a photo without a score or a face is 1). The 4/5
+    tiers there come from LLM grades, which only that stage can recompute -- a
+    regrade drops a re-verdicted photo back to the baseline rather than
+    guessing.
     """
     if status == "sharp":
         return 3
     if sharpness_score is None:
         return 1
-    return 1 if float(sharpness_score) < min(threshold, 0.4) else 2
+    return 2 if extended.passes(float(sharpness_score)) else 1
 
 
 def build_result_entries(frames: list[Frame]) -> list[dict]:

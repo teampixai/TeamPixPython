@@ -54,6 +54,7 @@ from algo.stages.jersey_counting import (
     _allowed_reference_labs,
     _lightness_class,
     classify_body_jersey,
+    pinned_target_lab,
 )
 from algo.thresholds import RUN_SETTINGS_KEY as EXTENDED_OFFSET_KEY, ExtendedThreshold
 from algo.album import Album, AlbumImage, PersonRecord
@@ -182,8 +183,16 @@ def _poll_jersey(candidates: list[PersonRecord], config, pinned_label: str | Non
         our_label = pinned_label
         log.info("[regrade] team colour pinned to %s (%d matching body/bodies)",
                  our_label, label_counts.get(our_label, 0))
-    else:
-        our_label = max(label_counts, key=label_counts.__getitem__)
+        team_target_lab = pinned_target_lab(our_label, labs_by_label)
+        # A pinned colour anchors the Light/Dark bucket too. With no anchor
+        # (it names no known colour) there is no bucket either: the polled
+        # majority would judge against the wrong team.
+        team_bucket = _lightness_class(
+            team_target_lab, config.jersey_light_l_min, config.jersey_light_chroma_max
+        ) if team_target_lab is not None else None
+        return our_label, team_target_lab, team_bucket
+
+    our_label = max(label_counts, key=label_counts.__getitem__)
 
     samples = labs_by_label.get(our_label) or []
     if samples:
@@ -195,14 +204,7 @@ def _poll_jersey(candidates: list[PersonRecord], config, pinned_label: str | Non
     else:
         team_target_lab = _REF_LAB_BY_LABEL.get(our_label)
 
-    # A pinned colour must anchor the Light/Dark bucket too, otherwise the
-    # fallback strategy would still be judging against the polled majority.
-    if pinned_label and team_target_lab is not None:
-        team_bucket = _lightness_class(
-            team_target_lab, config.jersey_light_l_min, config.jersey_light_chroma_max
-        )
-    else:
-        team_bucket = max(bucket_counts, key=bucket_counts.__getitem__) if bucket_counts else None
+    team_bucket = max(bucket_counts, key=bucket_counts.__getitem__) if bucket_counts else None
     return our_label, team_target_lab, team_bucket
 
 
@@ -441,7 +443,7 @@ def regrade_sensitivity(
             # the old verdict). Reset to the baseline unless the user rated
             # it by hand -- see culling_app.py's "stars_manual" marker.
             if image.apply_auto_rating(
-                baseline_stars(image.sharpness_score, new_status, new_threshold)
+                baseline_stars(image.sharpness_score, new_status, extended)
             ):
                 summary.stars_rebaselined += 1
 
