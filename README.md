@@ -67,8 +67,9 @@ Five steps, left to right along the top of the page (the optional **Players** st
    **Import Images** and watch the progress.
 3. **Culling.** Photos come pre-sorted into *Sharp*, *Blurry* and *Skipped*. Disagree with a call? One click
    overrules it; unlike real refs, this one doesn't argue back. **AI Edit** fixes brightness and contrast,
-   AI-sharpens selected players and crops for Instagram, phone or print. Your original is never touched;
-   edits are saved as copies.
+   AI-sharpens selected players and crops for Instagram, phone or
+   print, or lets the AI suggest the crop (**Auto crop**, needs an OpenAI key). Your original is
+   never touched; edits are saved as copies.
 4. **Faces.** Name each group of faces once. The app remembers them for future albums. It never forgets a
    face, which is more than we can say for the coach.
 5. **Album Tools.** **Export** the keepers, each with its star rating (Lightroom and Windows Explorer can
@@ -120,7 +121,8 @@ No jokes in this section. Privacy is no laughing matter.
 - **OpenAI (optional).** If you add an OpenAI API key to a team, or have the `OPENAI_API_KEY` environment
   variable set, every photo graded *sharp* in an import is sent to OpenAI, downscaled to about 1000 px,
   so its model can rank burst shots and suggest star ratings. You pay OpenAI for this usage, and the cost
-  estimate is shown in the import log. Without a key, nothing is sent.
+  estimate is shown in the import log. AI Edit's **Auto crop** also sends OpenAI a small copy (about 768 px)
+  of the one photo you are editing, only when you click it. Without a key, nothing is sent.
 - **Your API key is stored in plain text** in `team.json` inside the app folder. Don't share that file.
 - **Your original photos are never modified, moved or deleted.** The app only reads them. Its own working
   files live in a separate album folder (see [below](#where-files-are-stored)). Deleting an album in the

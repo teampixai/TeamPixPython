@@ -36,6 +36,9 @@ const Viewport = (function () {
     let zoom = min;
     let tx = 0;
     let ty = 0;
+    // Share of the viewport's width the picture covers at fit zoom (below 1
+    // when it is letterboxed in a fixed viewport), so "actual size" is right.
+    let contentFraction = 1;
 
     function baseRectOf(imgEl) {
       return imgEl.parentElement.getBoundingClientRect();
@@ -91,7 +94,7 @@ const Viewport = (function () {
     function zoomToActual($imgs, imgEl, clientX, clientY) {
       if (!imgEl || !imgEl.naturalWidth) return;
       const rect = baseRectOf(imgEl);
-      const nativeZoom = imgEl.naturalWidth / rect.width;
+      const nativeZoom = imgEl.naturalWidth / (rect.width * contentFraction);
       zoomTo($imgs, imgEl, nativeZoom, clientX, clientY);
     }
 
@@ -151,6 +154,7 @@ const Viewport = (function () {
       get min() { return min; },
       get max() { return max; },
       get step() { return step; },
+      set contentFraction(v) { contentFraction = v; },
       // Current zoom level and pan offset (screen px), so callers that need
       // to translate between on-screen position and an image's own local
       // coordinate space (e.g. the compare-window slider handle, which
@@ -432,7 +436,11 @@ const Viewport = (function () {
   //                    image) instead of panning, and swallows the click.
   //   onViewChange(zoom)  — called whenever zoom/pan/size changes, so
   //                    overlay content can keep a constant on-screen size.
-  // Returns { close, setAfterUrl, setBeforeUrl, setSplit, pxToImage, zoom }.
+  //   viewportSize     — {w, h}: keep the viewport box the shape of this size
+  //                    whatever the pictures' own size, letterboxing them
+  //                    (see setViewportSize below).
+  // Returns { close, setAfterUrl, setBeforeUrl, setSplit, pxToImage,
+  // setViewportSize, zoom }.
   function showCompareWindow(opts) {
     opts = opts || {};
     const HINT_SPLIT = "Drag the handle to compare \u2014 scroll to zoom, drag image to pan";
@@ -482,13 +490,14 @@ const Viewport = (function () {
       return $viewport.find("img").add($overlay);
     }
 
-    // Client point -> normalised (0-1) image coordinates, undoing zoom/pan.
+    // Client point -> normalised (0-1) image coordinates, undoing zoom/pan
+    // (and the letterbox of a fixed viewport, see `content` below).
     function toImageCoords(clientX, clientY) {
       const rect = $viewport[0].getBoundingClientRect();
       if (!rect.width || !rect.height) return null;
       const x = (clientX - rect.left - zoomCtl.tx) / zoomCtl.zoom / rect.width;
       const y = (clientY - rect.top - zoomCtl.ty) / zoomCtl.zoom / rect.height;
-      return { x, y };
+      return { x: (x - content.x) / content.w, y: (y - content.y) / content.h };
     }
 
     // Moves the handle to `pct` (0-100) of the box width and re-clips the
@@ -533,11 +542,42 @@ const Viewport = (function () {
       if (opts.onViewChange) opts.onViewChange(zoomCtl.zoom);
     }
 
+    // A fixed viewport (opts.viewportSize / setViewportSize): the box keeps
+    // the shape of that reference size however the picture's own size changes
+    // (the edit panel's Level turns the photo), and the picture is letterboxed
+    // inside it. `content` is the part of the box the picture covers at fit
+    // zoom, as fractions of it, so the overlay and pointer maths still line up.
+    let viewportSize = opts.viewportSize || null;
+    let content = { x: 0, y: 0, w: 1, h: 1 };
+
+    function updateContent() {
+      const img = $afterImg[0];
+      const vw = $viewport.width();
+      const vh = $viewport.height();
+      if (viewportSize && img.naturalWidth && vw && vh) {
+        const scale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight);
+        const w = (img.naturalWidth * scale) / vw;
+        const h = (img.naturalHeight * scale) / vh;
+        content = { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
+      } else {
+        content = { x: 0, y: 0, w: 1, h: 1 };
+      }
+      zoomCtl.contentFraction = content.w;
+      $overlay.css({
+        left: `${content.x * 100}%`, top: `${content.y * 100}%`,
+        width: `${content.w * 100}%`, height: `${content.h * 100}%`,
+      });
+    }
+
     // The viewport box is sized from whichever image reports a natural size
     // first, so before/after stay pixel-identical even if they differ
-    // slightly (the odd one out just letterboxes).
+    // slightly (the odd one out just letterboxes) — or from the fixed
+    // reference size, when there is one.
     function lock() {
-      const ref = [$beforeImg[0], $afterImg[0]].find((el) => el.naturalWidth);
+      const found = [$beforeImg[0], $afterImg[0]].find((el) => el.naturalWidth);
+      const ref = viewportSize
+        ? { naturalWidth: viewportSize.w, naturalHeight: viewportSize.h }
+        : found;
       if (!ref) return;
       let availW = window.innerWidth * 0.9;
       let availH = window.innerHeight * 0.74;
@@ -549,6 +589,7 @@ const Viewport = (function () {
       const box = computeContainFit(ref.naturalWidth, ref.naturalHeight, availW, availH);
       if (!box) return;
       $viewport.css({ width: box.width + "px", height: box.height + "px" });
+      updateContent();
       zoomCtl.apply(imgs());
       setSlider(sliderPct);
     }
@@ -708,13 +749,20 @@ const Viewport = (function () {
     // How much of the image (normalised 0-1, per axis) `px` screen pixels
     // span at the current zoom — for zoom-independent hit tolerances.
     function pxToImage(px) {
-      const w = $viewport.width() || 1;
-      const h = $viewport.height() || 1;
+      const w = ($viewport.width() || 1) * content.w;
+      const h = ($viewport.height() || 1) * content.h;
       return { x: px / (w * zoomCtl.zoom), y: px / (h * zoomCtl.zoom) };
     }
 
+    // Changes the fixed viewport's reference size (a different photo size
+    // after the edit panel's Reload); null goes back to following the picture.
+    function setViewportSize(size) {
+      viewportSize = size || null;
+      lock();
+    }
+
     return {
-      close, setAfterUrl, setBeforeUrl, setSplit, pxToImage,
+      close, setAfterUrl, setBeforeUrl, setSplit, pxToImage, setViewportSize,
       get zoom() { return zoomCtl.zoom; },
     };
   }

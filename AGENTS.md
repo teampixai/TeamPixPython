@@ -25,14 +25,14 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | `webui/index.html`, `webui/static/` | Older single-page UI. Not served by `culling_app.py`. |
 | `1_prep_review.py` | Import/scoring worker. Turns a folder of photos into an album. |
 | `apply_export.py` | Export worker. Copies kept photos flat to a destination, writes `players.csv`, adds EXIF star ratings (piexif). |
-| `autoedit.py` | AI Edit worker: tone (`apply_tone()`), Real-ESRGAN player sharpening, crop. |
+| `autoedit.py` | AI Edit worker: tone (`apply_tone()`), Real-ESRGAN player sharpening, `--rotate` (Level), crop. |
 | `esrsharpen.py` | Standalone Real-ESRGAN/GFPGAN sharpening. |
 | `RebuildFaceDB.py` | Recomputes face-DB embeddings and calibrates match thresholds. |
 | `MigrateFaceDB.py` | One-off migration from a flat face DB to the per-team layout. |
 | `RerunLLMCulling.py` | Re-runs LLM burst culling on an existing album. |
 | `algo/` | Core library (see below). |
 | `algo/stages/` | Pipeline stages: `image_analysis`, `grading`, `jersey_counting`, `face_reco`, `llm_culling`, `auto_adjust`, plus `annotation` (on-demand preview renderer, not a stage). |
-| `algo/llm/` | OpenAI provider (`culling_provider.py`, default model `gpt-6-luna`, pricing tables) and prompts. |
+| `algo/llm/` | OpenAI provider (`culling_provider.py`, default model `gpt-6-luna`, pricing tables), prompts, and `auto_crop.py` (the AI Edit panel's Auto crop: one vision call that suggests a level and what to crop out). |
 | `tests/` | pytest suite (`conftest.py` puts the repo root on `sys.path`). `test/` and `TestImages/` are local, git-ignored scratch areas. |
 | `InitPhotoProcessing.bat` | End-user Windows installer and updater (§8). |
 
@@ -105,7 +105,7 @@ All paths are relative to the app folder (`REPO_ROOT`, which is `<install root>\
 | `team.json` | Team page | Teams keyed by a **UUID** `id`. `name` is only for display. `legacyIds` keeps pre-UUID ids that old albums still reference. Holds `openaiApiKey` **in plaintext**. Git-ignored. |
 | `.culling_state.json` | app | Last import/export paths, current album, debug flags (e.g. `save_silhouette`). Git-ignored. |
 | `albums/<yyyymmdd-hhmmss>-<folder>/` | import | One album per import. Originals are **referenced in place, never copied or modified**. |
-| ↳ `album.json` | `algo/album.py` only | Per-photo detections, scores, verdicts, stars, `edited_crop`/`edited_crop_px`, cached capture time, `run_settings`. |
+| ↳ `album.json` | `algo/album.py` only | Per-photo detections, scores, verdicts, stars, `edited_crop`/`edited_crop_px`/`edited_rotated`, cached capture time, `run_settings`. |
 | ↳ `info.json` | `algo/album_info.py` | Category lists (`Anno_Blur` / `Anno_Sharp` / `Anno_Skipped`). |
 | ↳ `thumbnails/<key>.jpg` | import (or on demand) | Plain square thumbnails for the nav strip. |
 | ↳ `previews/<key>.jpg` | on demand | Annotated preview cache. Safe to delete. |
@@ -123,6 +123,27 @@ Export (`apply_export.py`) writes **flat** to the destination (kept photos plus 
 the album. `_apply_edits` is still a placeholder (a byte-for-byte `copy2` of the original), so accepted AI
 edits in `editedimages/` are **not** exported yet. Save Copy photos are exported because they are separate
 album entries.
+
+**AI Edit Level and Auto crop.** The Crop tab's Level turns the photo -180..180° (positive = counter-clockwise,
+`autoedit.py --rotate`) on a canvas enlarged to hold it, empty corners black. The crop rectangle is in pixels
+of that canvas (`autoedit.rotated_size()`, which `ai-edit.js` re-implements, so keep both rounding the same
+way); `autoedit.py` sharpens first (boxes are in the unturned frame), then rotates, then crops. A turned
+edit can't be mapped back onto the stored detections, so it records `edited_rotated` instead of
+`edited_crop`: no crop shading in the annotated preview, no player boxes for later edits, and Save Copy keeps
+the original-frame detections as they are. The edit window keeps the unturned photo's shape
+(`showCompareWindow`'s `viewportSize`) and letterboxes the turned one, so the layout doesn't jump.
+
+Auto crop is the Crop tab's checkbox; while it is on, the crop controls are locked. Its
+prompt makes the model measure the tilt first, then crop out only what doesn't belong. **The Level UI is
+temporarily hidden** (`LEVEL_ENABLED = false` in `ai-edit.js`): no Level widgets, and Auto crop ignores the
+level the model returns. The server side (`--rotate`, `level` in the API, `edited_rotated`) is intact; set the
+flag to true to bring it back. It runs **inside the web server** (no subprocess): a
+`BackgroundJobState` (`auto_crop_state`, `/api/edit/ai-edit/auto-crop` plus `/status`) whose thread sends a
+768 px copy through `OpenAIProvider.ask_json()` (the same request path, throttling and cost tracking as
+burst ranking) and logs each step for the log dialog. It needs the album's team to have `openaiApiKey` (or
+`OPENAI_API_KEY` in the environment). The first check fetches the suggestion and applies it; unchecking
+restores the level and crop from just before, and re-checking re-applies the same suggestion without a new
+request.
 
 ### Players page (team face-DB curation)
 

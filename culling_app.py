@@ -258,9 +258,21 @@ class AiEditApplyRequest(BaseModel):
     # Indexes into the photo's bodies, as returned by /api/edit/ai-edit/session.
     bodyIds: list[int] = Field(default_factory=list)
     # The Crop tab's rectangle, in pixels of the editable source (the
-    # session's width/height). None, or one covering the whole photo, means
-    # no crop.
+    # session's width/height) after it was turned by `level` — i.e. of the
+    # canvas autoedit.rotated_size() gives. None, or one covering the whole
+    # canvas, means no crop.
     crop: Optional[CropRect] = None
+    # The Crop tab's Level: degrees to turn the photo, -180..180, positive
+    # counter-clockwise (autoedit.py --rotate).
+    level: float = Field(default=0.0, ge=-180.0, le=180.0)
+
+
+class AutoCropRequest(BaseModel):
+    file: str
+    # Height and width of the ratio the Crop tab has selected (a preset), so
+    # the suggested crop is composed for it; both None for a free crop.
+    ratioH: Optional[float] = Field(default=None, gt=0)
+    ratioW: Optional[float] = Field(default=None, gt=0)
 
 # --------------------------------------------------------------------------- #
 # Processing (1_prep_review.py) — run in a background thread, buffer combined
@@ -361,6 +373,8 @@ class AiEditState:
         # The same crop in pixels of the original photo ({x, y, h, w}), which
         # is what gets written into the album entry as well.
         self.crop_px: Optional[dict] = None
+        # Whether the edit turned the photo (see AlbumImage.edited_rotated).
+        self.rotated = False
 
     def set_pending(
         self,
@@ -371,6 +385,7 @@ class AiEditState:
         final_path: Path,
         crop: Optional[tuple[float, float, float, float]] = None,
         crop_px: Optional[dict] = None,
+        rotated: bool = False,
     ) -> None:
         with self.lock:
             self.album_dir = album_dir
@@ -380,6 +395,7 @@ class AiEditState:
             self.final_path = final_path
             self.crop = crop
             self.crop_px = crop_px
+            self.rotated = rotated
 
     def snapshot(self) -> Optional[dict]:
         with self.lock:
@@ -393,6 +409,7 @@ class AiEditState:
                 "final_path": self.final_path,
                 "crop": self.crop,
                 "crop_px": self.crop_px,
+                "rotated": self.rotated,
             }
 
     def clear(self, delete_files: bool = False) -> None:
@@ -409,6 +426,7 @@ class AiEditState:
             self.final_path = None
             self.crop = None
             self.crop_px = None
+            self.rotated = False
         if not delete_files:
             return
         for path in stale:
@@ -603,6 +621,15 @@ class FaceDbRebuildState(BackgroundJobState):
 
 
 face_db_rebuild_state = FaceDbRebuildState()
+
+
+# --------------------------------------------------------------------------- #
+# Edit panel → Crop tab → Auto crop: one LLM call that suggests the Level and
+# crop for the open photo (algo/llm/auto_crop.py). A background job like the
+# others, so the panel shows its progress in the shared log dialog; the
+# suggestion comes back as the job's `result`.
+# --------------------------------------------------------------------------- #
+auto_crop_state = BackgroundJobState()
 
 
 # --------------------------------------------------------------------------- #
@@ -840,24 +867,29 @@ def _resolve_ai_edit_paths(album_dir: Path, key: str) -> tuple[Path, Path, Path]
 
 
 def _prepare_before_image(
-    source_path: Path, pending_dir: Path, crop_px: Optional[tuple[int, int, int, int]] = None
+    source_path: Path, pending_dir: Path, crop_px: Optional[tuple[int, int, int, int]] = None,
+    level: float = 0.0,
 ) -> Path:
     """Return a browser-displayable copy of *source_path* for the "before"
     pane of the compare view. JPEG/PNG/WebP sources are served straight from
     disk; anything else (RAW originals, TIFF) is rasterized to a JPEG cached
-    next to the pending edit. With *crop_px* (x, y, w, h) the before image is
-    cut to the same rectangle as the edit, so the two line up."""
-    if crop_px is None and source_path.suffix.lower() in _WEB_DISPLAYABLE_EXTENSIONS:
+    next to the pending edit. With *level* (degrees) the before image is
+    turned the same way as the edit, and with *crop_px* (x, y, w, h, in pixels
+    of the turned photo) cut to the same rectangle, so the two line up."""
+    if crop_px is None and not level and source_path.suffix.lower() in _WEB_DISPLAYABLE_EXTENSIONS:
         return source_path
 
     import cv2  # lazy: pulls in the heavy CV stack
 
-    if crop_px is not None:
+    if crop_px is not None or level:
         import autoedit  # decodes exactly like the edit itself, so the crop lines up
 
         image = autoedit.read_image(source_path)
         if image is not None:
-            image = autoedit.crop_image(image, crop_px)
+            source_size = (image.shape[1], image.shape[0])
+            image = autoedit.rotate_image(image, level)
+            if crop_px is not None:
+                image = autoedit.crop_image(image, crop_px, autoedit.rotated_size(*source_size, level))
     else:
         from algo.stages.image_analysis import _read_image  # lazy: pulls in the heavy CV stack
 
@@ -1018,6 +1050,13 @@ def _crop_to_px(
     return {"x": x1, "y": y1, "h": y2 - y1, "w": x2 - x1}
 
 
+def _clean_level(degrees: float) -> float:
+    """The edit panel's Level as the whole-photo turn to apply: limited to
+    -180..180 and to two decimals, which is all the panel offers (so the
+    canvas size it computed for the crop matches autoedit.rotated_size())."""
+    return round(min(180.0, max(-180.0, float(degrees))), 2) + 0.0
+
+
 def _clamp_crop_px(crop: Optional[CropRect], width: int, height: int) -> Optional[tuple[int, int, int, int]]:
     """The panel's crop rectangle clamped to a *width* x *height* source as
     (x, y, w, h), or None when there is nothing to crop (no rectangle, or
@@ -1048,7 +1087,8 @@ def _run_ai_edit(
     "tone" pipeline with the exact brightness/contrast values the user
     previewed, then — if Sharpen players is on and at least one player is
     selected — body-only "aisharpen" (with GFPGAN face enhance) on just
-    those players, and finally the Crop tab's rectangle (if any).
+    those players, then — if the Crop tab turned the photo (Level) — the turn,
+    and finally the Crop tab's rectangle (if any).
     *source_size* is the source's full-resolution (width, height) when the
     caller already knows it (the open edit session); otherwise it is read
     from the file when a crop needs it.
@@ -1066,8 +1106,9 @@ def _run_ai_edit(
         if stale.is_file():
             stale.unlink(missing_ok=True)
 
+    level = _clean_level(req.level)
     crop_px = None
-    if req.crop is not None:
+    if req.crop is not None or level:
         if source_size is None:
             import autoedit  # lazy: pulls in the CV stack
 
@@ -1075,36 +1116,46 @@ def _run_ai_edit(
             if decoded is not None:
                 source_size = (decoded.shape[1], decoded.shape[0])
             del decoded
+    if req.crop is not None:
         if source_size is not None:
-            crop_px = _clamp_crop_px(req.crop, *source_size)
+            import autoedit  # lazy: pulls in the CV stack
+
+            crop_px = _clamp_crop_px(req.crop, *autoedit.rotated_size(*source_size, level))
         else:
             log.warning("AI edit: could not read %s to size the crop; not cropping", source_path.name)
 
     try:
-        before_path = _prepare_before_image(source_path, pending_path.parent, crop_px)
+        before_path = _prepare_before_image(source_path, pending_path.parent, crop_px, level)
     except (RuntimeError, OSError, ImportError) as exc:
         log.warning("AI edit: could not prepare the 'before' image for %s: %s", key, exc)
         before_path = source_path
 
     image = album_for(album_dir).image(key)
     bodies = image.bodies if image is not None else []
+    # A turned edit (this run's, or one accepted earlier) can't be mapped back
+    # onto the stored detections, and neither can a crop of it — see
+    # AlbumImage.edited_rotated.
+    rotated = bool(level) or (image is not None and image.edited_rotated)
     # Stored detections are relative to the original; when the source is an
     # already cropped edit they are mapped onto it.
     prior_crop = image.edited_crop if image is not None else None
-    entries = _selected_body_entries(bodies, req.bodyIds, prior_crop) if req.sharpen else []
+    can_sharpen = not (image is not None and image.edited_rotated)
+    entries = _selected_body_entries(bodies, req.bodyIds, prior_crop) if req.sharpen and can_sharpen else []
 
     new_crop = None
-    if crop_px is not None and source_size is not None:
+    if crop_px is not None and source_size is not None and not level:
         x, y, w, h = crop_px
         width, height = source_size
         new_crop = (x / width, y / height, (x + w) / width, (y + h) / height)
-    composed_crop = _compose_crop(prior_crop, new_crop)
-    # An uncropped run on top of a cropped edit keeps that edit's recorded crop.
+    composed_crop = None
     composed_crop_px = None
-    if new_crop is not None:
-        composed_crop_px = _crop_to_px(composed_crop, source_size, prior_crop)
-    elif image is not None:
-        composed_crop_px = image.edited_crop_px
+    if not rotated:
+        composed_crop = _compose_crop(prior_crop, new_crop)
+        if new_crop is not None:
+            composed_crop_px = _crop_to_px(composed_crop, source_size, prior_crop)
+        elif image is not None:
+            # An uncropped run on top of a cropped edit keeps that edit's recorded crop.
+            composed_crop_px = image.edited_crop_px
 
     pipelines = ["tone"] + (["aisharpen"] if entries else [])
     cmd = [
@@ -1118,6 +1169,8 @@ def _run_ai_edit(
         "--shadows", f"{req.shadows:g}",
         "--contrast", f"{req.contrast:g}",
     ]
+    if level:
+        cmd += ["--rotate", f"{level:g}"]
     if crop_px is not None:
         cmd += ["--crop", ",".join(str(v) for v in crop_px)]
 
@@ -1149,6 +1202,7 @@ def _run_ai_edit(
             final_path=final_path,
             crop=composed_crop,
             crop_px=composed_crop_px,
+            rotated=rotated,
         )
     processing_state.mark_stopped()
     log.info("AI edit finished for %s (exit code %s)", key, returncode)
@@ -3492,6 +3546,7 @@ def api_ai_edit_session(req: AiEditRequest) -> dict:
 
     album_dir, (width, height), proposed = _open_edit_session(req.file)
     image = album_for(album_dir).image(req.file)
+    rotated = image is not None and image.edited_rotated
     return {
         "file": req.file,
         "width": width,
@@ -3504,30 +3559,47 @@ def api_ai_edit_session(req: AiEditRequest) -> dict:
             "contrast": proposed.contrast,
         },
         "limits": {"ev": autoedit.TONE_EV_LIMIT, "contrast": autoedit.TONE_CONTRAST_LIMIT},
-        "bodies": _edit_session_bodies(image.bodies, image.edited_crop) if image is not None else [],
+        # The players can't be located on an edit that was turned.
+        "bodiesUnavailable": rotated,
+        "bodies": _edit_session_bodies(image.bodies, image.edited_crop) if image is not None and not rotated else [],
     }
 
 
+def _session_base_at_level(session: dict, level: float):
+    """The session's preview-size photo turned by *level* degrees."""
+    import autoedit
+
+    return autoedit.rotate_image(session["base"], _clean_level(level))
+
+
 @app.get("/api/edit/ai-edit/session/before")
-def api_ai_edit_session_before(file: Optional[str] = None) -> Response:
-    """The open photo (*file*), unedited, at preview size."""
+def api_ai_edit_session_before(file: Optional[str] = None, level: float = 0.0) -> Response:
+    """The open photo (*file*), unedited, at preview size — turned by *level*
+    degrees when the Crop tab's Level is set, so it lines up with the preview."""
     session = _require_edit_session(file)
-    return Response(session["before_jpeg"], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    if not _clean_level(level):
+        return Response(session["before_jpeg"], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    return Response(
+        _encode_jpeg(_session_base_at_level(session, level)),
+        media_type="image/jpeg", headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/edit/ai-edit/session/preview")
 def api_ai_edit_session_preview(
     file: Optional[str] = None,
     highlights: float = 0.0, midtones: float = 0.0, shadows: float = 0.0, contrast: float = 0.0,
+    level: float = 0.0,
 ) -> Response:
     """The open photo (*file*) at preview size with the given
     brightness/contrast, rendered by autoedit.apply_tone() — the same
-    function the final render runs. Sharpening is not previewed."""
+    function the final render runs — and turned by *level* degrees. Sharpening
+    is not previewed."""
     import autoedit
 
     session = _require_edit_session(file)
     params = autoedit.ToneParams(highlights=highlights, midtones=midtones, shadows=shadows, contrast=contrast)
-    out = autoedit.apply_tone(session["base"], params)
+    out = autoedit.apply_tone(_session_base_at_level(session, level), params)
     return Response(_encode_jpeg(out), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
@@ -3536,6 +3608,82 @@ def api_ai_edit_session_close() -> dict:
     """Close edit mode without applying anything (Cancel)."""
     edit_session_state.clear()
     return {"ok": True}
+
+
+def _run_auto_crop(key: str, api_key: str, ratio_h: Optional[float], ratio_w: Optional[float]) -> None:
+    """Auto crop's job, run in the web server itself: one request to the
+    OpenAI model through the shared OpenAIProvider, narrated into
+    auto_crop_state's log, which the edit panel's log dialog shows."""
+    from algo.llm import auto_crop
+
+    try:
+        import cv2  # lazy: pulls in the CV stack
+
+        auto_crop_state.log("Opening the photo…")
+        session = _require_edit_session(key)
+        small = session["base"]
+        height, width = small.shape[:2]
+        scale = auto_crop.AUTO_CROP_IMAGE_LONG_EDGE / max(height, width)
+        if scale < 1.0:
+            small = cv2.resize(small, (max(1, round(width * scale)), max(1, round(height * scale))),
+                               interpolation=cv2.INTER_AREA)
+        jpeg = _encode_jpeg(small, auto_crop.AUTO_CROP_JPEG_QUALITY)
+        provider = auto_crop.make_provider(api_key)
+        auto_crop_state.log(
+            f"Sending a {small.shape[1]}x{small.shape[0]} copy ({len(jpeg) // 1024} KB) of the photo "
+            f"to {provider.model}…"
+        )
+        suggestion = auto_crop.suggest_crop(provider, jpeg, ratio_h=ratio_h, ratio_w=ratio_w)
+        auto_crop_state.log(f"Answer received in {suggestion.elapsed:.1f}s (cost ${suggestion.cost_usd:.4f}).")
+        x1, y1, x2, y2 = suggestion.box
+        auto_crop_state.log(
+            f"Level {suggestion.level:+g}°" + (f" — {suggestion.level_check}" if suggestion.level_check else "")
+        )
+        auto_crop_state.log(
+            f"Crop: keep x {x1:.0%}–{x2:.0%}, y {y1:.0%}–{y2:.0%} of the photo"
+            + (f" — removes {suggestion.removed}" if suggestion.removed else "")
+        )
+        if suggestion.reason:
+            auto_crop_state.log(suggestion.reason)
+        with auto_crop_state.lock:
+            auto_crop_state.result = {
+                "level": suggestion.level,
+                "box": list(suggestion.box),
+                "reason": suggestion.reason,
+            }
+            auto_crop_state.done = True
+    except HTTPException as exc:
+        with auto_crop_state.lock:
+            auto_crop_state.error = str(exc.detail)
+    except Exception as exc:  # noqa: BLE001 — surface any failure (network, key, model) to the UI
+        log.exception("[AutoCrop] failed")
+        with auto_crop_state.lock:
+            auto_crop_state.error = str(exc)
+    finally:
+        auto_crop_state.mark_stopped()
+
+
+@app.post("/api/edit/ai-edit/auto-crop")
+def api_ai_edit_auto_crop(req: AutoCropRequest) -> dict:
+    """Start the Auto crop job for the photo open in edit mode (it needs the
+    album's team to have an OpenAI API key). Poll .../auto-crop/status."""
+    team = _resolve_team(_album_team_id(_current_album_path()))
+    api_key = team.openaiApiKey or os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Auto crop needs an OpenAI API key. Add one on the Team page.",
+        )
+    if not auto_crop_state.claim():
+        raise HTTPException(status_code=409, detail="An auto crop is already running.")
+    ratio = (req.ratioH, req.ratioW) if req.ratioH and req.ratioW else (None, None)
+    threading.Thread(target=_run_auto_crop, args=(req.file, api_key, *ratio), daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/api/edit/ai-edit/auto-crop/status")
+def api_ai_edit_auto_crop_status(since: int = 0) -> dict:
+    return auto_crop_state.status(since)
 
 
 @app.post("/api/edit/ai-edit/apply")
@@ -3614,6 +3762,7 @@ def api_ai_edit_accept() -> dict:
         if image is not None:
             image.set_edited_image(final_path)
             image.set_edited_crop(pending["crop"], pending["crop_px"])
+            image.set_edited_rotated(pending["rotated"])
             album.save()
             # The annotated preview shows the cropped-out area darkened, so
             # redraw it with the crop that was just recorded (or dropped).

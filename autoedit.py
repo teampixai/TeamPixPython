@@ -13,6 +13,7 @@ Usage:
     python autoedit.py keepers.lst -pipelines "all openai_ig" --openaikey sk-...
     python autoedit.py photo.cr3 -o ./edited -ext png
     python autoedit.py photo.jpg -pipelines tone --crop 100,50,1600,2000
+    python autoedit.py photo.jpg -pipelines tone --rotate 1.5
 
 Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     tone             Highlights/midtones/shadows exposure (EV) + contrast,
@@ -391,6 +392,52 @@ def parse_crop(text: str) -> tuple[int, int, int, int]:
     if w <= 0 or h <= 0:
         raise argparse.ArgumentTypeError("--crop width and height must be positive")
     return x, y, w, h
+
+
+ROTATE_LIMIT_DEGREES = 180.0
+
+
+def clamp_rotation(degrees: float) -> float:
+    """*degrees* limited to -180..180 (a non-number counts as 0)."""
+    if not math.isfinite(degrees):
+        return 0.0
+    return max(-ROTATE_LIMIT_DEGREES, min(ROTATE_LIMIT_DEGREES, degrees))
+
+
+def rotated_size(width: int, height: int, degrees: float) -> tuple[int, int]:
+    """(width, height) of the canvas that holds a *width* x *height* image
+    rotated by *degrees* in full — what rotate_image() returns. Rounds half
+    up, like JavaScript's Math.round, because the edit panel computes the same
+    size to place its crop box (webui/culling/static/js/ai-edit.js)."""
+    rad = math.radians(degrees)
+    c, s = abs(math.cos(rad)), abs(math.sin(rad))
+    return (
+        max(1, math.floor(width * c + height * s + 0.5)),
+        max(1, math.floor(width * s + height * c + 0.5)),
+    )
+
+
+def rotate_image(image: np.ndarray, degrees: float) -> np.ndarray:
+    """*image* turned by *degrees* about its centre — positive is counter-
+    clockwise, negative clockwise — on a canvas enlarged to hold all of it
+    (see rotated_size); the corners the turn leaves empty are black. Multiples
+    of 90 degrees are exact pixel moves."""
+    degrees = clamp_rotation(degrees)
+    if degrees == 0:
+        return image
+    quarter_turns = degrees / 90.0
+    if quarter_turns == round(quarter_turns):
+        return np.ascontiguousarray(np.rot90(image, int(round(quarter_turns)) % 4))
+
+    height, width = image.shape[:2]
+    new_w, new_h = rotated_size(width, height, degrees)
+    matrix = cv2.getRotationMatrix2D(((width - 1) / 2.0, (height - 1) / 2.0), degrees, 1.0)
+    matrix[0, 2] += (new_w - 1) / 2.0 - (width - 1) / 2.0
+    matrix[1, 2] += (new_h - 1) / 2.0 - (height - 1) / 2.0
+    return cv2.warpAffine(
+        image, matrix, (new_w, new_h), flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
 
 
 def crop_image(
@@ -1752,6 +1799,7 @@ def process_one(
     protected_bodies: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None,
     silhouette_dir: Path | None = None,
     crop: tuple[int, int, int, int] | None = None,
+    rotate: float = 0.0,
 ) -> Path | None:
     image = read_image(source)
     if image is None:
@@ -1773,9 +1821,16 @@ def process_one(
             log.error("[%s] pipeline '%s' failed: %s", source.name, pipeline.name, exc)
             return None
 
-    # Cropping runs last so every pipeline (notably body-only sharpening,
-    # whose --boxes-file boxes are relative to the full source frame) sees
-    # the whole photo.
+    # Rotating and cropping run last so every pipeline (notably body-only
+    # sharpening, whose --boxes-file boxes are relative to the full source
+    # frame) sees the whole, unrotated photo. The crop rectangle is in pixels
+    # of the rotated canvas (rotated_size of the source).
+    rotate = clamp_rotation(rotate)
+    if rotate:
+        image = rotate_image(image, rotate)
+        log.info("[%s] rotated %+.1f degrees (counter-clockwise is positive) to %dx%d",
+                 source.name, rotate, image.shape[1], image.shape[0])
+        source_size = rotated_size(*source_size, rotate)
     if crop is not None:
         image = crop_image(image, crop, source_size)
         log.info("[%s] cropped to %dx%d", source.name, image.shape[1], image.shape[0])
@@ -1939,6 +1994,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--rotate", type=float, default=0.0, metavar="DEGREES",
+        help=(
+            f"Level the photo: turn it by this many degrees about its centre (-{ROTATE_LIMIT_DEGREES:g}.."
+            f"{ROTATE_LIMIT_DEGREES:g}; positive = counter-clockwise, negative = clockwise) on a "
+            "canvas enlarged to hold it, empty corners black. Applied after every pipeline and "
+            "before --crop, whose rectangle is then in pixels of the rotated canvas."
+        ),
+    )
+    parser.add_argument(
         "--save-silhouette", type=Path, default=None, metavar="DIR",
         help=(
             "Debug: when the aisharpen pipeline sharpens bodies (see --boxes-file), save "
@@ -2023,6 +2087,7 @@ def main() -> None:
                     silhouette_dir=args.save_silhouette,
                     tone=tone,
                     crop=args.crop,
+                    rotate=args.rotate,
                 ),
                 sources,
             )

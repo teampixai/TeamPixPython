@@ -715,6 +715,21 @@ class OpenAIProvider(CullingProvider):
                  len(grades), len(frames), elapsed)
         return grades
 
+    def ask_json(self, instructions: str, image_b64: str) -> tuple[str | None, float]:
+        """Ask one free-form question about one image and return
+        ``(raw_json_text, elapsed_seconds)``: the same throttled, cost-tracked
+        request path ranking and grading use, for callers whose prompt and
+        parsing live elsewhere (see ``algo/llm/auto_crop.py``). Raises on a
+        failed request — unlike ranking there is no run to protect, and the
+        caller wants to tell the user why."""
+        frame = BurstFrameInput(file="image", image_b64=image_b64, face_bbox=None, sharpness_score=0.0)
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": instructions}, self._image_url_content(frame)],
+        }]
+        estimated_tokens = estimate_tokens_for_b64_image(image_b64, self.model) + _ESTIMATED_PROMPT_TEXT_TOKENS
+        return self._chat_completion(messages, estimated_tokens)
+
     def _chat_completion(self, messages: list[dict], estimated_tokens: int) -> tuple[str | None, float]:
         """POST one chat-completions request, throttled by the live
         token/request budgets, and return ``(raw_content, elapsed_seconds)``.

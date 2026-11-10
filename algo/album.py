@@ -815,6 +815,21 @@ class AlbumImage:
         else:
             self._d["edited_crop_px"] = {k: int(crop_px[k]) for k in ("x", "y", "h", "w")}
 
+    @property
+    def edited_rotated(self) -> bool:
+        """Whether the accepted edit was turned (the edit panel's Level). The
+        stored detections are in the original photo's frame, and a turned edit
+        has no simple crop box in that frame, so `edited_crop` is empty for it
+        and its detections can't be located on it. False when there is no
+        edit on disk."""
+        return bool(self._d.get("edited_rotated")) and self.edited_path is not None
+
+    def set_edited_rotated(self, rotated: bool) -> None:
+        if rotated:
+            self._d["edited_rotated"] = True
+        else:
+            self._d.pop("edited_rotated", None)
+
     def clear_edited(self) -> Optional[Path]:
         """Forget the accepted edit, so the photo is its original again --
         crop included. Returns where the edited file was recorded to live (it
@@ -823,6 +838,7 @@ class AlbumImage:
         edited = self._d.pop("edited_image", None)
         self._d.pop("edited_crop", None)
         self._d.pop("edited_crop_px", None)
+        self._d.pop("edited_rotated", None)
         return self.album.path / edited if edited else None
 
     def copy_entry(self, *, file: Path, key: str, crop: Optional[NormCrop] = None) -> dict:
@@ -844,7 +860,7 @@ class AlbumImage:
         This photo's own entry is not modified.
         """
         entry = copy.deepcopy(self._d)
-        for name in ("edited_image", "edited_crop", "edited_crop_px"):
+        for name in ("edited_image", "edited_crop", "edited_crop_px", "edited_rotated"):
             entry.pop(name, None)
         entry["file"] = str(file)
         entry["key"] = key

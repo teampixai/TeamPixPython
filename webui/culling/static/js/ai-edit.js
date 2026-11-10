@@ -16,9 +16,17 @@
 //          autoedit.apply_tone() — the same code the final render uses — so
 //          what you see is what Apply produces (minus sharpening, which is
 //          too slow to preview).
-//        - Crop: ratio presets (all H x W) and Custom. The preview becomes a
-//          single image with a crop box that can be moved and resized from
-//          its edges and corners (presets keep their ratio, Custom is free).
+//        - Crop: ratio presets (all H x W) and Custom, plus "Auto crop" (a
+//          checkbox: an OpenAI model suggests what to crop out; while checked
+//          the crop controls are locked, and unchecking restores the previous
+//          crop). The Level (turn the photo -180..180 degrees, positive
+//          counter-clockwise; Auto crop then also applies the model's level)
+//          is built but hidden while LEVEL_ENABLED is false. The preview
+//          becomes a single image with a crop box that can be moved and
+//          resized from its edges and corners (presets keep their ratio,
+//          Custom is free). The crop is in pixels of the turned photo's
+//          canvas; changing the level re-fits the box inside the photo, and
+//          the window keeps the unturned photo's shape so the layout stays put.
 //        - Other: Reload the photo from disk, Revert it to the original
 //          (deleting the edit), or open the edited copy in another app.
 //      The crop always applies: whatever it cuts off is darkened on every
@@ -51,25 +59,28 @@ const AiEdit = (function () {
   ];
 
   // Crop presets, all H x W (h/w are only used as a ratio). The iPhone Fold
-  // entries are its screens' pixel sizes (outer display for the lock
-  // screen, inner display for the home screen wallpaper). Each group is
-  // shown widest first.
+  // entries are its screens' pixel sizes (outer display: portrait, shown
+  // width x height; inner display: landscape, shown H x W like the rest). Each
+  // group is shown widest first, except one marked `ordered`, which keeps the
+  // order written here.
   const CROP_GROUPS = [
     { title: "Instagram", presets: [
       { id: "ig-5x4", label: "5x4", h: 5, w: 4 },
       { id: "ig-1x1", label: "1x1", h: 1, w: 1 },
     ] },
-    { title: "Phone", presets: [
+    { title: "Phone", ordered: true, presets: [
       { id: "phone", label: "iPhone / Android", detail: "19.5x9", h: 19.5, w: 9 },
-      { id: "fold-lock", label: "iPhone Fold lock screen", detail: "2034x1398", h: 2034, w: 1398 },
-      { id: "fold-home", label: "iPhone Fold home screen", detail: "2670x1878", h: 2670, w: 1878 },
+      { id: "fold-outer", label: "iPhone Fold outer", detail: "1398x2034", detailUnit: "W x H px", h: 2034, w: 1398 },
+      { id: "fold-inner", label: "iPhone Fold inner", detail: "1878x2670", h: 1878, w: 2670, unfolded: true },
     ] },
-    { title: "Print", presets: ["16x9", "3x2", "4x3", "1x1", "3x4", "2x3", "9x16"].map((label) => {
+    { title: "Print", presets: ["16x9", "3x2", "4x3", "5x4", "1x1", "4x5", "3x4", "2x3", "9x16"].map((label) => {
       const [h, w] = label.split("x").map(Number);
       return { id: `print-${label}`, label, h, w };
     }) },
   ];
-  CROP_GROUPS.forEach((g) => g.presets.sort((a, b) => b.w / b.h - a.w / a.h));
+  CROP_GROUPS.forEach((g) => {
+    if (!g.ordered) g.presets.sort((a, b) => b.w / b.h - a.w / a.h);
+  });
 
   // Grab distance (screen px) around the crop box's edges and corners.
   const CROP_GRAB_PX = 10;
@@ -95,8 +106,77 @@ const AiEdit = (function () {
     return job;
   }
 
+  let autoCropJob = null;
+
+  // The log dialog Auto crop shows its progress in, above the editor window.
+  function autoCropDialog() {
+    if (!autoCropJob) {
+      autoCropJob = LogDialog.create({
+        dialogId: "aiAutoCropDialog",
+        outputId: "aiAutoCropOutput",
+        statusUrl: (since) => `/api/edit/ai-edit/auto-crop/status?since=${since}`,
+        pollIntervalMs: 500,
+        dialogOptions: { width: 520, dialogClass: "edit-over" },
+        label: "auto crop",
+      });
+      // The editor window sits above jQuery UI's usual layer; see style.css.
+      autoCropJob.$dialog.on("dialogopen", () => $("body").addClass("edit-dialog-over"));
+      autoCropJob.$dialog.on("dialogclose", () => $("body").removeClass("edit-dialog-over"));
+    }
+    return autoCropJob;
+  }
+
   function clamp(v, lo, hi) {
     return Math.min(hi, Math.max(lo, v));
+  }
+
+  // The Level: degrees to turn the photo, positive counter-clockwise. Two
+  // decimals is all the server keeps (_clean_level in culling_app.py).
+  const LEVEL_LIMIT = 180;
+  // Temporarily off: the Level widgets are not shown and Auto crop ignores
+  // the level the model suggests. Everything underneath still works.
+  const LEVEL_ENABLED = false;
+
+  function cleanLevel(v) {
+    const n = parseFloat(v);
+    if (!Number.isFinite(n)) return 0;
+    return Math.round(clamp(n, -LEVEL_LIMIT, LEVEL_LIMIT) * 100) / 100 + 0;
+  }
+
+  // Size of the canvas that holds a w x h photo turned by `deg` degrees —
+  // must agree with autoedit.rotated_size() (the crop is in its pixels).
+  function rotatedSize(w, h, deg) {
+    const rad = (deg * Math.PI) / 180;
+    const c = Math.abs(Math.cos(rad));
+    const s = Math.abs(Math.sin(rad));
+    return { w: Math.max(1, Math.round(w * c + h * s)), h: Math.max(1, Math.round(w * s + h * c)) };
+  }
+
+  // The largest w/h = `ratio` rectangle centred on the turned canvas that
+  // lies wholly inside the photo (no empty corners).
+  function inscribedCrop(srcW, srcH, deg, ratio) {
+    const rad = (deg * Math.PI) / 180;
+    const c = Math.abs(Math.cos(rad));
+    const s = Math.abs(Math.sin(rad));
+    const h = Math.min(srcW / (ratio * c + s), srcH / (ratio * s + c));
+    const w = h * ratio;
+    const canvas = rotatedSize(srcW, srcH, deg);
+    return { x: (canvas.w - w) / 2, y: (canvas.h - h) / 2, w, h };
+  }
+
+  // Whether the photo turned by `deg` degrees covers the point (x, y) of its
+  // canvas (`cw` x `ch`), within half a pixel.
+  function coversPoint(srcW, srcH, cw, ch, deg, x, y) {
+    const rad = (deg * Math.PI) / 180;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    const rx = x - cw / 2;
+    const ry = y - ch / 2;
+    return Math.abs(rx * c - ry * s) <= srcW / 2 + 0.5 && Math.abs(rx * s + ry * c) <= srcH / 2 + 0.5;
+  }
+
+  function formatLevel(v) {
+    return (v > 0 ? "+" : v < 0 ? "\u2212" : "") + Math.abs(v).toFixed(1) + "\u00b0";
   }
 
   // FastAPI errors arrive as '{"detail": "..."}' — show just the detail.
@@ -164,12 +244,13 @@ const AiEdit = (function () {
     return { $label, $input };
   }
 
-  // A small rectangle in the preset's shape (the long side 22px).
-  function ratioIcon(h, w) {
+  // A small rectangle in the preset's shape (the long side 22px). `unfolded`
+  // adds the faint crease of an opened foldable.
+  function ratioIcon(h, w, unfolded) {
     const long = 22;
     const ratio = w / h;
     return $("<span>", { class: "crop-icon", "aria-hidden": "true" }).append(
-      $("<span>", { class: "crop-icon-shape" }).css({
+      $("<span>", { class: "crop-icon-shape" + (unfolded ? " crop-icon-unfolded" : "") }).css({
         width: `${Math.round(long * Math.min(1, ratio))}px`,
         height: `${Math.round(long * Math.min(1, 1 / ratio))}px`,
       })
@@ -228,10 +309,17 @@ const AiEdit = (function () {
     let activeTab = "tone";
     let busy = false;
 
-    // The crop rectangle, in full-resolution pixels of the photo being
-    // edited (session.width x session.height). Starts as the whole photo.
-    let imgW = session.width;
-    let imgH = session.height;
+    // The photo's own size (session.width x session.height) and the Level
+    // it is turned by. The crop rectangle is in full-resolution pixels of
+    // the canvas that holds the turned photo (imgW x imgH — the photo's
+    // own size while the level is 0). Starts as the whole photo.
+    let srcW = session.width;
+    let srcH = session.height;
+    let level = 0;
+    let imgW = srcW;
+    let imgH = srcH;
+    let beforeLevel = 0;  // the level the "Original" image on screen was made for
+    let bodiesUnavailable = !!session.bodiesUnavailable;
     let crop = { x: 0, y: 0, w: imgW, h: imgH };
     let cropPreset = null;  // null = Custom
     let cropDrag = null;
@@ -269,6 +357,41 @@ const AiEdit = (function () {
     );
 
     // ============================== Crop tab ============================= //
+    // --- Level ---
+    const levelSlider = sliderRow("Angle", -LEVEL_LIMIT, LEVEL_LIMIT, 0.1, formatLevel);
+    levelSlider.$row.addClass("edit-slider-level");
+    const $levelNumber = $("<input>", {
+      type: "number", class: "edit-level-input", min: -LEVEL_LIMIT, max: LEVEL_LIMIT, step: 0.1, value: 0,
+      "aria-label": "Level in degrees",
+    });
+    const $levelReset = $("<button>", { type: "button", class: "btn", title: "Back to 0\u00b0" }).text("Reset");
+    const $level = $("<section>", { class: "edit-section" }).append(
+      $("<div>", { class: "edit-section-head" }).append(
+        $("<h3>").text("Level"),
+        $("<span>", { class: "edit-level-entry" }).append($levelNumber, " \u00b0", $levelReset)
+      ),
+      levelSlider.$row,
+      $("<p>", { class: "edit-hint" }).text(
+        "Positive turns the photo counter-clockwise, negative clockwise. Changing the level re-fits the crop box " +
+        "inside the turned photo."
+      )
+    );
+
+    // --- Auto crop ---
+    const $autoCrop = $("<input>", { type: "checkbox" });
+    const $autoCropNote = $("<p>", { class: "edit-hint" });
+    const $autoCropSection = $("<section>", { class: "edit-section" }).append(
+      $("<div>", { class: "edit-section-head" }).append(
+        $("<label>", { class: "edit-check" }).append($autoCrop, $("<h3>").text("Auto crop"))
+      ),
+      $("<p>", { class: "edit-hint" }).text(
+        "Checking it asks an AI model (OpenAI) to crop out what doesn't belong, using a small copy of the photo. " +
+        "While it is checked the crop controls are locked. " +
+        "Unchecking it brings back the crop you had before; checking it again re-applies the suggestion."
+      ),
+      $autoCropNote
+    );
+
     const $cropX = $("<span>", { class: "crop-readout-value" });
     const $cropSize = $("<span>", { class: "crop-readout-value" });
     const $customTile = $("<button>", { type: "button", class: "crop-tile crop-tile-custom", "aria-pressed": "true" }).append(
@@ -282,15 +405,17 @@ const AiEdit = (function () {
       )
     );
     const presetTiles = [];
-    const $crop = $("<div>", { class: "crop-groups" });
+    const $crop = $("<div>", { class: "crop-groups" }).append(...(LEVEL_ENABLED ? [$level] : []), $autoCropSection);
     CROP_GROUPS.forEach((group) => {
       const $grid = $("<div>", { class: "crop-grid" });
       group.presets.forEach((preset) => {
         const $tile = $("<button>", {
           type: "button", class: "crop-tile", "aria-pressed": "false",
-          title: preset.detail ? `${preset.label} (${preset.detail}, H x W)` : `${preset.label} (H x W)`,
+          title: preset.detail
+            ? `${preset.label} (${preset.detail}, ${preset.detailUnit || "H x W"})`
+            : `${preset.label} (H x W)`,
         }).append(
-          ratioIcon(preset.h, preset.w),
+          ratioIcon(preset.h, preset.w, preset.unfolded),
           $("<span>", { class: "crop-tile-label" }).text(preset.label),
           preset.detail ? $("<span>", { class: "crop-tile-detail" }).text(preset.detail) : null
         );
@@ -406,6 +531,34 @@ const AiEdit = (function () {
       cropPreset = null;
     }
 
+    // The canvas that holds the photo turned by the current Level.
+    function refreshCanvas() {
+      const canvas = rotatedSize(srcW, srcH, level);
+      imgW = canvas.w;
+      imgH = canvas.h;
+    }
+
+    // The w/h the crop box takes when it is re-fitted after a level change:
+    // the preset's, else the photo's own (swapped once it is turned past 45
+    // degrees, when its long side lies the other way).
+    function refitRatio() {
+      if (cropPreset) return cropPreset.w / cropPreset.h;
+      const folded = ((level % 180) + 180) % 180;
+      const turned = Math.min(folded, 180 - folded) > 45;
+      return turned ? srcH / srcW : srcW / srcH;
+    }
+
+    // Level changed: the crop box becomes the largest one of its shape that
+    // fits inside the turned photo.
+    function refitCrop() {
+      crop = inscribedCrop(srcW, srcH, level, refitRatio());
+    }
+
+    function syncLevelControls() {
+      levelSlider.set(level);
+      $levelNumber.val(level);
+    }
+
     function renderCrop() {
       const pct = (v) => `${v * 100}%`;
       const l = crop.x / imgW;
@@ -431,21 +584,47 @@ const AiEdit = (function () {
       presetTiles.forEach(({ preset, $tile }) => $tile.attr("aria-pressed", String(cropPreset === preset)));
     }
 
+    // `c` reshaped to the width/height `ratio`, keeping its centre and area,
+    // then shrunk/shifted as needed to stay on the canvas.
+    function reshapeCrop(c, ratio) {
+      const cx = c.x + c.w / 2;
+      const cy = c.y + c.h / 2;
+      let h = Math.sqrt((c.w * c.h) / ratio);
+      let w = h * ratio;
+      if (w > imgW) { w = imgW; h = w / ratio; }
+      if (h > imgH) { h = imgH; w = h * ratio; }
+      return { x: clamp(cx - w / 2, 0, imgW - w), y: clamp(cy - h / 2, 0, imgH - h), w, h };
+    }
+
+    // `c` shrunk about its centre until it lies wholly inside the turned
+    // photo (no empty corners), keeping its shape.
+    function shrinkIntoPhoto(c) {
+      const inside = (k) => {
+        const w = c.w * k;
+        const h = c.h * k;
+        const x = c.x + (c.w - w) / 2;
+        const y = c.y + (c.h - h) / 2;
+        return [[x, y], [x + w, y], [x, y + h], [x + w, y + h]]
+          .every(([px, py]) => coversPoint(srcW, srcH, imgW, imgH, level, px, py));
+      };
+      if (inside(1)) return c;
+      let lo = 0;
+      let hi = 1;
+      for (let i = 0; i < 30; i++) {
+        const mid = (lo + hi) / 2;
+        if (inside(mid)) lo = mid; else hi = mid;
+      }
+      const w = c.w * lo;
+      const h = c.h * lo;
+      return { x: c.x + (c.w - w) / 2, y: c.y + (c.h - h) / 2, w, h };
+    }
+
     // Picking a preset keeps the box's center and area, reshaped to the
     // preset's ratio, then shrunk/shifted as needed to stay on the photo.
     // Custom keeps the box as it is and frees the ratio.
     function selectPreset(preset) {
       cropPreset = preset;
-      if (preset) {
-        const ratio = preset.w / preset.h;
-        const cx = crop.x + crop.w / 2;
-        const cy = crop.y + crop.h / 2;
-        let h = Math.sqrt((crop.w * crop.h) / ratio);
-        let w = h * ratio;
-        if (w > imgW) { w = imgW; h = w / ratio; }
-        if (h > imgH) { h = imgH; w = h * ratio; }
-        crop = { x: clamp(cx - w / 2, 0, imgW - w), y: clamp(cy - h / 2, 0, imgH - h), w, h };
-      }
+      if (preset) crop = shrinkIntoPhoto(reshapeCrop(crop, preset.w / preset.h));
       renderCrop();
     }
 
@@ -524,15 +703,23 @@ const AiEdit = (function () {
     // --------------------------- Player boxes --------------------------- //
     function renderBoxes() {
       const on = $sharpen.prop("checked");
-      $playerLayer.toggle(activeTab === "tone" && on && bodies.length > 0);
+      // Boxes are in the unturned photo's frame, so they're hidden (and not
+      // clickable) while the Level turns it.
+      const pickable = !level && !bodiesUnavailable;
+      $playerLayer.toggle(activeTab === "tone" && on && bodies.length > 0 && pickable);
       bodies.forEach((b) => {
         boxEls[b.id].toggleClass("selected", selected.has(b.id)).toggleClass("hover", hoverId === b.id);
       });
-      if (!bodies.length) {
+      if (bodiesUnavailable) {
+        $sharpenHint.text("This photo was turned by an earlier edit, so its players can't be located to sharpen.");
+        $sharpenCount.text("");
+      } else if (!bodies.length) {
         $sharpenHint.text("No players found in this photo.");
         $sharpenCount.text("");
       } else {
-        $sharpenHint.text(on ? "Click a box on the photo to include or exclude a player." : "");
+        $sharpenHint.text(!on ? "" : level
+          ? "Set the Level back to 0\u00b0 to pick players; the current selection is still sharpened."
+          : "Click a box on the photo to include or exclude a player.");
         $sharpenCount.text(on ? `${selected.size} of ${bodies.length} player${bodies.length === 1 ? "" : "s"} selected` : "");
       }
     }
@@ -542,6 +729,7 @@ const AiEdit = (function () {
     function boxAt(x, y) {
       let best = null;
       let bestArea = Infinity;
+      if (level || bodiesUnavailable) return null;
       bodies.forEach((b) => {
         const [x1, y1, x2, y2] = b.box;
         if (x < x1 || x > x2 || y < y1 || y > y2) return;
@@ -564,11 +752,13 @@ const AiEdit = (function () {
     function previewUrl() {
       const q = new URLSearchParams(Object.entries(currentTone()).map(([k, v]) => [k, String(v)]));
       q.set("file", key);
+      q.set("level", String(level));
       return `/api/edit/ai-edit/session/preview?${q.toString()}`;
     }
 
-    function beforeUrl(stamp) {
-      return `/api/edit/ai-edit/session/before?file=${encodeURIComponent(key)}&t=${stamp}`;
+    function beforeUrl(stamp, forLevel) {
+      return `/api/edit/ai-edit/session/before?file=${encodeURIComponent(key)}` +
+        `&level=${encodeURIComponent(String(forLevel === undefined ? level : forLevel))}&t=${stamp}`;
     }
 
     let previewTimer = null;
@@ -579,6 +769,7 @@ const AiEdit = (function () {
       previewTimer = setTimeout(() => {
         const seq = ++previewSeq;
         const url = previewUrl();
+        const forLevel = level;
         $previewStatus.text("Updating preview\u2026");
         // Preload so the image only swaps once the new render is ready,
         // and drop responses that a newer request has overtaken.
@@ -586,6 +777,11 @@ const AiEdit = (function () {
         img.onload = () => {
           if (seq !== previewSeq || !win) return;
           win.setAfterUrl(url);
+          // The original is turned with the photo so the two line up.
+          if (beforeLevel !== forLevel) {
+            beforeLevel = forLevel;
+            win.setBeforeUrl(beforeUrl(Date.now(), forLevel));
+          }
           $previewStatus.text("");
         };
         img.onerror = () => {
@@ -629,6 +825,156 @@ const AiEdit = (function () {
       schedulePreview();
     });
 
+    // ------------------------------- Level ------------------------------- //
+    function setLevel(value) {
+      const next = cleanLevel(value);
+      if (next !== level) {
+        level = next;
+        refreshCanvas();
+        refitCrop();
+        renderBoxes();
+        renderCrop();
+        schedulePreview();
+      }
+      syncLevelControls();
+    }
+
+    levelSlider.$input.on("input", () => setLevel(levelSlider.value));
+    $levelNumber.on("change", () => setLevel($levelNumber.val()));
+    $levelReset.on("click", () => setLevel(0));
+
+    // ------------------------------ Auto crop ---------------------------- //
+    // The model's box is in the photo as it is now, unturned; the crop box
+    // becomes the box's bounds on the turned photo, in the selected preset's
+    // shape if one is, kept inside the photo.
+    function applyAutoCrop(result) {
+      level = LEVEL_ENABLED ? cleanLevel(result.level) : 0;
+      refreshCanvas();
+      syncLevelControls();
+      const [x1, y1, x2, y2] = result.box;
+      const rad = (level * Math.PI) / 180;
+      const c = Math.cos(rad);
+      const s = Math.sin(rad);
+      const xs = [];
+      const ys = [];
+      [[x1, y1], [x2, y1], [x1, y2], [x2, y2]].forEach(([nx, ny]) => {
+        const rx = nx * srcW - srcW / 2;
+        const ry = ny * srcH - srcH / 2;
+        xs.push(rx * c + ry * s + imgW / 2);
+        ys.push(-rx * s + ry * c + imgH / 2);
+      });
+      const left = clamp(Math.min(...xs), 0, imgW);
+      const top = clamp(Math.min(...ys), 0, imgH);
+      let box = { x: left, y: top, w: clamp(Math.max(...xs), 0, imgW) - left, h: clamp(Math.max(...ys), 0, imgH) - top };
+      if (cropPreset) box = reshapeCrop(box, cropPreset.w / cropPreset.h);
+      crop = shrinkIntoPhoto(box);
+      renderBoxes();
+      renderCrop();
+      schedulePreview();
+    }
+
+    // The checkbox: its first check asks the server for a suggestion (kept
+    // for later re-checks); unchecking brings back what the level and crop
+    // were just before it was applied.
+    let autoSuggestion = null;
+    let beforeAuto = null;
+
+    function applyAutoSuggestion() {
+      beforeAuto = { level, crop: Object.assign({}, crop), preset: cropPreset };
+      applyAutoCrop(autoSuggestion);
+      $autoCropNote.text(autoSuggestion.reason || "");
+    }
+
+    function restoreBeforeAuto() {
+      if (beforeAuto) {
+        level = beforeAuto.level;
+        crop = beforeAuto.crop;
+        cropPreset = beforeAuto.preset;
+        beforeAuto = null;
+        refreshCanvas();
+        syncLevelControls();
+        renderBoxes();
+        renderCrop();
+        schedulePreview();
+      }
+      $autoCropNote.text("");
+    }
+
+    function forgetAutoCrop() {
+      autoSuggestion = null;
+      beforeAuto = null;
+      $autoCrop.prop("checked", false);
+      $autoCropNote.text("");
+      renderAutoLock();
+    }
+
+    // While the checkbox is on the suggestion owns the level and crop: those
+    // controls (and the crop box on the photo) are locked until it is unchecked.
+    function autoLocked() {
+      return $autoCrop.prop("checked");
+    }
+
+    function renderAutoLock() {
+      const locked = autoLocked();
+      levelSlider.setEnabled(!locked);
+      $levelNumber.prop("disabled", locked);
+      $levelReset.prop("disabled", locked);
+      $customTile.prop("disabled", locked);
+      presetTiles.forEach(({ $tile }) => $tile.prop("disabled", locked));
+      cropDrag = null;
+      $cropLayer.toggleClass("locked", locked);
+    }
+
+    async function requestAutoSuggestion() {
+      const j = autoCropDialog();
+      setBusy(true);
+      $previewStatus.removeClass("error").text("");
+      j.reset();
+      try {
+        await apiPost("/api/edit/ai-edit/auto-crop", {
+          file: key,
+          ratioH: cropPreset ? cropPreset.h : null,
+          ratioW: cropPreset ? cropPreset.w : null,
+        });
+      } catch (err) {
+        setBusy(false);
+        $previewStatus.addClass("error").text(`Auto crop: ${errorText(err)}`);
+        return null;
+      }
+      j.open("Auto crop");
+      return new Promise((resolve) => {
+        j.startPolling((data) => {
+          if (data.running) return;
+          setBusy(false);
+          if (data.error || !data.result) {
+            j.appendLines([`Auto crop failed: ${data.error || "no suggestion was returned."}`]);
+            j.setFinished("Auto crop failed");
+            resolve(null);
+            return;
+          }
+          j.close();
+          resolve(data.result);
+        });
+      });
+    }
+
+    $autoCrop.on("change", async () => {
+      renderAutoLock();
+      if (!$autoCrop.prop("checked")) {
+        restoreBeforeAuto();
+        return;
+      }
+      if (!autoSuggestion) {
+        autoSuggestion = await requestAutoSuggestion();
+        if (!autoSuggestion) {
+          $autoCrop.prop("checked", false);
+          renderAutoLock();
+          return;
+        }
+      }
+      applyAutoSuggestion();
+    });
+
     // -------------------------------- Tabs ------------------------------- //
     function setTab(id) {
       activeTab = id;
@@ -656,19 +1002,25 @@ const AiEdit = (function () {
       busy = on;
       $reload.prop("disabled", on);
       $external.prop("disabled", on);
+      $autoCrop.prop("disabled", on);
       $apply.prop("disabled", on);
       renderOther();
     }
 
     // Takes over a (re)opened session: new photo size, suggested tone and
-    // player boxes. The crop is kept unless the photo's size changed or
-    // `fresh` asks for a clean start (after Revert).
+    // player boxes. The crop and level are kept unless the photo's size
+    // changed or `fresh` asks for a clean start (after Revert).
     function loadSession(next, fresh) {
-      const sizeChanged = next.width !== imgW || next.height !== imgH;
+      const sizeChanged = next.width !== srcW || next.height !== srcH;
       session = next;
       proposed = next.proposed;
-      imgW = next.width;
-      imgH = next.height;
+      srcW = next.width;
+      srcH = next.height;
+      bodiesUnavailable = !!next.bodiesUnavailable;
+      if (fresh || sizeChanged) level = 0;
+      if (fresh || sizeChanged) forgetAutoCrop();
+      refreshCanvas();
+      syncLevelControls();
       if (fresh || sizeChanged) resetCrop();
       bodies = next.bodies || [];
       const ids = new Set(bodies.map((b) => b.id));
@@ -683,6 +1035,8 @@ const AiEdit = (function () {
       renderCrop();
       renderOther();
       const stamp = Date.now();
+      beforeLevel = level;
+      if (sizeChanged) win.setViewportSize({ w: srcW, h: srcH });
       win.setBeforeUrl(beforeUrl(stamp));
       win.setAfterUrl(`${previewUrl()}&t=${stamp}`);
     }
@@ -739,6 +1093,7 @@ const AiEdit = (function () {
     buildPlayerBoxes();
     applyBrightnessAuto();
     applyContrastAuto();
+    syncLevelControls();
 
     const stamp = Date.now();
     win = Viewport.showCompareWindow({
@@ -747,6 +1102,8 @@ const AiEdit = (function () {
       afterUrl: previewUrl() + `&t=${stamp}`,
       beforeLabel: "Original",
       afterLabel: "Preview",
+      // The window keeps the unturned photo's shape however the Level turns it.
+      viewportSize: { w: srcW, h: srcH },
       sidePanel: $panel,
       overlay: $overlay,
       onImageClick(x, y) {
@@ -760,7 +1117,7 @@ const AiEdit = (function () {
       },
       onImageHover(x, y) {
         if (x != null && activeTab === "crop") {
-          const mode = cropHitTest(x, y);
+          const mode = autoLocked() ? null : cropHitTest(x, y);
           return mode ? CROP_CURSORS[mode] : false;
         }
         const b = x == null || activeTab !== "tone" || !$sharpen.prop("checked") ? null : boxAt(x, y);
@@ -769,7 +1126,7 @@ const AiEdit = (function () {
         return !!b;
       },
       onPointerDown(x, y) {
-        if (activeTab !== "crop") return false;
+        if (activeTab !== "crop" || autoLocked()) return false;
         const mode = cropHitTest(x, y);
         if (!mode) return false;
         cropDrag = { mode, x0: x * imgW, y0: y * imgH, start: Object.assign({}, crop) };
@@ -806,7 +1163,7 @@ const AiEdit = (function () {
     $apply.on("click", () => {
       const sharpen = $sharpen.prop("checked");
       const request = Object.assign(
-        { file: key, sharpen, bodyIds: sharpen ? [...selected] : [], crop: isCropped() ? cropPixels() : null },
+        { file: key, sharpen, bodyIds: sharpen ? [...selected] : [], crop: isCropped() ? cropPixels() : null, level },
         currentTone()
       );
       const chosenPrefs = {
