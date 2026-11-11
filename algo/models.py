@@ -19,6 +19,15 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+# Positions are normalised fractions; persisted with 5 decimals (0.12345),
+# which is well under a pixel on any photo and keeps album.json small.
+POSITION_DIGITS = 5
+
+
+def round_position(value: float) -> float:
+    return round(float(value), POSITION_DIGITS)
+
+
 @dataclass
 class Point:
     """A 2-D coordinate stored as a normalised fraction of image width/height."""
@@ -97,7 +106,10 @@ class Box:
         )
 
     def to_wire(self) -> dict:
-        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2}
+        return {
+            "x1": round_position(self.x1), "y1": round_position(self.y1),
+            "x2": round_position(self.x2), "y2": round_position(self.y2),
+        }
 
     @staticmethod
     def from_wire(data: dict | None) -> "Box | None":
@@ -114,7 +126,10 @@ class PredictedKeyPoint:
     passed:     bool = True   # scorers set this to False to disqualify
 
     def to_wire(self) -> dict:
-        return {"x": self.point.x, "y": self.point.y, "conf": self.confidence, "passed": self.passed}
+        return {
+            "x": round_position(self.point.x), "y": round_position(self.point.y),
+            "conf": self.confidence, "passed": self.passed,
+        }
 
     @staticmethod
     def from_wire(data: dict) -> "PredictedKeyPoint":

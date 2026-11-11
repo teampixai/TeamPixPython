@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 from pathlib import Path
 
 from conftest import make_body_dict, make_entry, write_album
 
 from algo import album as album_module
+from algo import utils as utils_module
 from algo.album import Album
+from algo.utils import wait_for_backups
 from algo.imagefiles import IMAGE_EXTENSIONS, collect_images, images_to_import
 
 
@@ -167,11 +170,36 @@ def test_backups_are_written_by_default(album_dir: Path):
     album = Album(album_dir)
     album.image("IMG_0001.jpg").stars = 4
     album.save()
+    wait_for_backups()
 
     backups = list((album_dir / "backup").glob("album_*.gz"))
     assert len(backups) == 1
     with gzip.open(backups[0], "rt", encoding="utf-8") as fh:
         assert json.load(fh)["results"][0].get("stars") is None
+    assert not list(album_dir.glob("*.tmp"))
+
+
+def test_save_does_not_wait_for_the_backup(album_dir: Path, monkeypatch):
+    """The new album.json is live before the (slow) backup is compressed."""
+    album_json = write_album(album_dir, [make_entry()])
+    started, release = threading.Event(), threading.Event()
+    real = utils_module._write_backup
+
+    def slow_backup(parked, backup_path):
+        started.set()
+        release.wait(10)
+        real(parked, backup_path)
+
+    monkeypatch.setattr(utils_module, "_write_backup", slow_backup)
+    album = Album(album_dir)
+    album.image("IMG_0001.jpg").stars = 4
+    album.save()  # returns while the backup is still blocked
+
+    assert started.wait(5)
+    assert json.loads(album_json.read_text(encoding="utf-8"))["results"][0]["stars"] == 4
+    release.set()
+    wait_for_backups()
+    assert len(list((album_dir / "backup").glob("album_*.gz"))) == 1
 
 
 def test_backups_can_be_turned_off_without_losing_atomicity(album_dir: Path, monkeypatch):

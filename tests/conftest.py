@@ -75,7 +75,7 @@ def write_album(album_dir: Path, entries: list[dict], **payload_overrides) -> Pa
     payload.update(payload_overrides)
     album_dir.mkdir(parents=True, exist_ok=True)
     album_json = album_dir / "album.json"
-    album_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    album_json.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     return album_json
 
 

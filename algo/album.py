@@ -36,6 +36,7 @@ from algo.models import (
     Face,
     NumpyEncoder,
     PredictedKeyPoint,
+    round_position,
 )
 from algo.utils import (
     THUMBNAILS_SUBDIR,
@@ -113,7 +114,10 @@ def _box_wire_in_crop(wire: Optional[dict], crop: NormCrop) -> Optional[dict]:
     mapped = box_in_crop((wire["x1"], wire["y1"], wire["x2"], wire["y2"]), crop)
     if mapped is None:
         return None
-    return {"x1": mapped[0], "y1": mapped[1], "x2": mapped[2], "y2": mapped[3]}
+    return {
+        "x1": round_position(mapped[0]), "y1": round_position(mapped[1]),
+        "x2": round_position(mapped[2]), "y2": round_position(mapped[3]),
+    }
 
 
 def _point_wire_in_crop(wire: dict, crop: NormCrop) -> dict:
@@ -125,9 +129,9 @@ def _point_wire_in_crop(wire: dict, crop: NormCrop) -> dict:
     y = (wire["y"] - cy1) / (cy2 - cy1)
     out = dict(wire)
     if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-        out["x"], out["y"] = x, y
+        out["x"], out["y"] = round_position(x), round_position(y)
     else:
-        out["x"], out["y"] = min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
+        out["x"], out["y"] = round_position(min(1.0, max(0.0, x))), round_position(min(1.0, max(0.0, y)))
         out["conf"] = 0.0
         out["passed"] = False
     return out
@@ -378,8 +382,7 @@ class PersonRecord:
         """Serialize a freshly detected `Body` into a new record.
 
         The one definition of the ``evaluated[]`` wire shape — key order
-        included, since album.json is written with ``indent=2`` and diffed
-        by humans.
+        included, so album.json stays stable between versions.
         """
         return cls({
             "body_bbox":          body.bbox.to_wire(),
@@ -809,7 +812,7 @@ class AlbumImage:
             self._d.pop("edited_crop", None)
             self._d.pop("edited_crop_px", None)
             return
-        self._d["edited_crop"] = [round(float(v), 6) for v in crop]
+        self._d["edited_crop"] = [round_position(v) for v in crop]
         if crop_px is None:
             self._d.pop("edited_crop_px", None)
         else:
@@ -1151,13 +1154,16 @@ class Album:
 
         Backs up the previous contents (see algo/utils.py) so a crash
         mid-write can never corrupt the album.
+
+        Written compact (no indentation): at tens of MB, pretty-printing
+        costs seconds on every save. Any JSON viewer can reformat it.
         """
         with self._lock:
             if self._payload is None:
                 return
             try:
                 atomic_save_and_backup(
-                    json.dumps(self._payload, indent=2, cls=NumpyEncoder),
+                    json.dumps(self._payload, separators=(",", ":"), cls=NumpyEncoder),
                     self.album_json,
                     backup=album_json_backups_enabled,
                 )

@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -109,7 +110,9 @@ def atomic_save_and_backup(content: str, path: Union[str, Path], *, backup: bool
     4. If there was a previous file, gzip-compress the parked-aside original
        into ``<path.parent>/backup/<path.stem>_<yyyymmdd-hhmmss>.gz``, where
        the timestamp is the *old* file's creation time — then delete the
-       parked-aside temp copy.
+       parked-aside temp copy. This runs in a background thread, so the
+       function returns as soon as the new file is live; see
+       `wait_for_backups()`.
 
     Only step 4 is optional (`backup=False`, for a caller rewriting the same
     file repeatedly in one run). Steps 1-3 are what make the overwrite safe
@@ -117,7 +120,8 @@ def atomic_save_and_backup(content: str, path: Union[str, Path], *, backup: bool
     """
     path = Path(path)
     tmp_new_path = path.with_name(path.name + ".new.tmp")
-    tmp_old_path = path.with_name(path.name + ".old.tmp")
+    # Unique: an earlier save's backup may still be reading its own parked file.
+    tmp_old_path = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.old.tmp")
 
     with open(tmp_new_path, "w", encoding="utf-8") as fh:
         fh.write(content)
@@ -142,13 +146,49 @@ def atomic_save_and_backup(content: str, path: Union[str, Path], *, backup: bool
         if not backup:
             tmp_old_path.unlink()
             return
-        backup_dir = path.parent / "backup"
-        backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.fromtimestamp(old_ctime).strftime("%Y%m%d-%H%M%S")
-        backup_path = backup_dir / f"{path.stem}_{timestamp}.gz"
-        with open(tmp_old_path, "rb") as src, gzip.open(backup_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        tmp_old_path.unlink()
+        backup_path = path.parent / "backup" / f"{path.stem}_{timestamp}.gz"
+        _start_backup(tmp_old_path, backup_path)
+
+
+# Compressing a large album.json takes seconds, and the new file is already
+# live by then, so the backup runs off the caller's thread. Backups are
+# serialized (two saves within one second share a backup name), and the
+# threads are non-daemon so a script that exits right after saving still
+# finishes writing its backup.
+_backup_lock = threading.Lock()  # held while a backup file is written
+_backup_threads_lock = threading.Lock()  # guards _backup_threads only
+_backup_threads: list[threading.Thread] = []
+_BACKUP_COMPRESS_LEVEL = 6
+
+
+def _write_backup(parked: Path, backup_path: Path) -> None:
+    try:
+        with _backup_lock:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(parked, "rb") as src, gzip.open(
+                backup_path, "wb", compresslevel=_BACKUP_COMPRESS_LEVEL
+            ) as dst:
+                shutil.copyfileobj(src, dst)
+        parked.unlink()
+    except Exception:  # noqa: BLE001 -- the live file is already safe; keep the parked copy for recovery
+        log.exception("Could not back up %s to %s (kept as %s)", parked.name, backup_path, parked)
+
+
+def _start_backup(parked: Path, backup_path: Path) -> None:
+    thread = threading.Thread(target=_write_backup, args=(parked, backup_path), name="album-backup")
+    with _backup_threads_lock:
+        _backup_threads[:] = [t for t in _backup_threads if t.is_alive()]
+        _backup_threads.append(thread)
+    thread.start()
+
+
+def wait_for_backups() -> None:
+    """Block until every pending background backup has been written."""
+    with _backup_threads_lock:
+        pending = list(_backup_threads)
+    for thread in pending:
+        thread.join()
 
 # EXIF tag ids (main IFD "DateTime", and Exif sub-IFD "DateTimeOriginal" /
 # "DateTimeDigitized") — checked in that order. Mirrors culling_app.py's

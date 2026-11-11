@@ -15,7 +15,7 @@ from .face_crop_embed import annotate_face_crop, embed_face_crop, load_face_mode
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
 from algo.album import Album, PersonRecord
 from algo.album_info import AlbumInfo
-from algo.models import Box as ModelBox
+from algo.models import Box as ModelBox, round_position
 
 log = logging.getLogger("TeamPixPython")
 
@@ -483,7 +483,7 @@ def _bbox_key(box: dict | None) -> tuple[float, float, float, float] | None:
     float round-tripping noise JSON (de)serialization can introduce."""
     if not box:
         return None
-    return tuple(round(float(box.get(k, 0.0)), 6) for k in ("x1", "y1", "x2", "y2"))
+    return tuple(round_position(box.get(k, 0.0)) for k in ("x1", "y1", "x2", "y2"))
 
 
 def load_manual_overrides(out_root: Path) -> dict:

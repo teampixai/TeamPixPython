@@ -2,9 +2,8 @@
 
 `build_result_entries` now builds each body through `PersonRecord.from_body`
 instead of its own dict literal. The expected values below are transcribed
-from the pre-refactor implementation, key order included -- album.json is
-written with ``indent=2`` and read by humans, so a reordering is a real
-(if cosmetic) regression.
+from the pre-refactor implementation, key order included, so a reordering
+is a real (if cosmetic) regression.
 """
 
 from __future__ import annotations

@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from algo.models import round_position
+
 
 @dataclass(frozen=True)
 class Box:
@@ -36,7 +38,10 @@ class Box:
         )
 
     def to_wire(self) -> dict:
-        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2}
+        return {
+            "x1": round_position(self.x1), "y1": round_position(self.y1),
+            "x2": round_position(self.x2), "y2": round_position(self.y2),
+        }
 
 
 @dataclass

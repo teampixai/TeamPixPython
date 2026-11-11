@@ -1689,7 +1689,7 @@ PROFILE_CROP_KEY = "profileCrop"
 DELETED_CROPS_KEY = "deletedCrops"
 
 # Matching tolerance for body_bbox floats when writing back to the Album.
-BBOX_EPS = 1e-6
+BBOX_EPS = 1e-5  # above the rounding error (5e-6) of positions stored with 5 decimals
 
 
 def _album_dir_by_id(album_id: str) -> Path:
