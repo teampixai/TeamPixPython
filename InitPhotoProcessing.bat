@@ -556,7 +556,15 @@ echo [10/11] Writing launcher...
     echo set "CONDA_EXE="
     echo set "CONDA_PYTHON_EXE="
     echo set "CONDA_PREFIX=%ENV_DIR%"
-    echo set "PATH=%ENV_DIR%\Library\bin;%ENV_DIR%\Scripts;%ENV_DIR%;%%PATH%%"
+    echo set "PATH=%ENV_DIR%\Library\bin;%ENV_DIR%\Library\cmd;%ENV_DIR%\Scripts;%ENV_DIR%;%%PATH%%"
+    echo :: Update first: pull the latest code when the app folder is a git checkout.
+    echo if exist "%APP_DIR%\.git" ^(
+    echo     echo Updating from git...
+    echo     git -C "%APP_DIR%" pull --ff-only ^|^| echo WARNING: could not update from git - starting the current version.
+    echo     call "%APP_DIR%\UpdateDeps.bat" "%ENV_PY%"
+    echo ^) else ^(
+    echo     echo NOTE: this install is not a git checkout - re-run InitPhotoProcessing.bat to update it.
+    echo ^)
     echo "%ENV_PY%" "%APP_DIR%\culling_app.py" %%*
 ) > "%INSTALL_ROOT%\RunPhotoProcessing.bat"
 

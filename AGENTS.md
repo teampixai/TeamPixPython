@@ -297,7 +297,11 @@ The installer is self-contained and safe to re-run. It:
 4. downloads the GitHub ZIP of `main` into `<root>\app` (keeping `albums\` and other local data);
 5. installs dlib from conda-forge, torch 2.2.2, `requirements.txt`, and face_recognition_models from the
    GitHub ZIP;
-6. writes `RunPhotoProcessing.bat`, which runs `app\culling_app.py`;
+6. writes `RunPhotoProcessing.bat`, which first runs `git pull --ff-only` if `app\` is a git checkout (the ZIP-based
+   install isn't one, so it just prints a note), then `UpdateDeps.bat` (re-installs the pip packages from
+   `requirements.txt` when its committed version differs from the last one installed OK, tracked by a
+   `.requirements-blob` stamp next to the env's `python.exe`; PyTorch and dlib are left alone), then runs
+   `app\culling_app.py`;
 7. creates the Start Menu shortcut "TeamPixPython".
 
 Conda config, package cache and environment variables are isolated from any system Python. If a change
