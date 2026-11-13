@@ -103,6 +103,55 @@ _FACE_LANDMARKERS: dict[int, object] = {}
 _FACE_LANDMARKER_LOCK = threading.Lock()
 
 
+def create_pose_landmarker(num_poses: int = 8):
+    """Build a new, uncached Pose Landmarker for *num_poses*.
+
+    Each instance serialises its own C calls (MediaPipe's SerialDispatcher),
+    so one instance is safe from any thread but never runs two detections at
+    once; give each concurrent worker its own instance. Callers own it and
+    must ``close()`` it.
+    """
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+
+    model_path = ensure_pose_model()
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_poses=num_poses,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return mp_vision.PoseLandmarker.create_from_options(options)
+
+
+def create_face_landmarker(num_faces: int = 8):
+    """Build a new, uncached Face Landmarker for *num_faces* (see
+    :func:`create_pose_landmarker` for the threading contract).
+
+    Detection confidence comes from
+    ``app_config.face_detection_min_confidence`` (well below MediaPipe's 0.5
+    default — see that setting's rationale).
+    """
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+
+    model_path = ensure_face_model()
+    conf = app_config.face_detection_min_confidence
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_faces=num_faces,
+        min_face_detection_confidence=conf,
+        min_face_presence_confidence=conf,
+        min_tracking_confidence=conf,
+    )
+    return mp_vision.FaceLandmarker.create_from_options(options)
+
+
 def load_pose_landmarker(num_poses: int = 8):
     """Return the process-wide Pose Landmarker singleton (built for *num_poses*).
 
@@ -115,20 +164,7 @@ def load_pose_landmarker(num_poses: int = 8):
     with _POSE_LANDMARKER_LOCK:
         if _POSE_LANDMARKER is not None and _POSE_LANDMARKER_NUM_POSES == num_poses:
             return _POSE_LANDMARKER
-        import mediapipe as mp
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision as mp_vision
-
-        model_path = ensure_pose_model()
-        options = mp_vision.PoseLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp_vision.RunningMode.IMAGE,
-            num_poses=num_poses,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        _POSE_LANDMARKER = mp_vision.PoseLandmarker.create_from_options(options)
+        _POSE_LANDMARKER = create_pose_landmarker(num_poses)
         _POSE_LANDMARKER_NUM_POSES = num_poses
         log.info("MediaPipe Pose Landmarker loaded (num_poses=%d)", num_poses)
     return _POSE_LANDMARKER
@@ -140,34 +176,16 @@ def load_face_landmarker(num_faces: int = 8):
     Two distinct instances are typically kept alive: one with a high
     ``num_faces`` for full-image detection, and one with ``num_faces=1`` for
     the per-crop landmark-refinement pass used during embedding/alignment.
-
-    Detection confidence comes from
-    ``app_config.face_detection_min_confidence`` (well below MediaPipe's 0.5
-    default — see that setting's rationale).
     """
     if num_faces in _FACE_LANDMARKERS:
         return _FACE_LANDMARKERS[num_faces]
     with _FACE_LANDMARKER_LOCK:
         if num_faces in _FACE_LANDMARKERS:
             return _FACE_LANDMARKERS[num_faces]
-        import mediapipe as mp
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision as mp_vision
-
-        model_path = ensure_face_model()
-        conf = app_config.face_detection_min_confidence
-        options = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp_vision.RunningMode.IMAGE,
-            num_faces=num_faces,
-            min_face_detection_confidence=conf,
-            min_face_presence_confidence=conf,
-            min_tracking_confidence=conf,
-        )
-        landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+        landmarker = create_face_landmarker(num_faces)
         _FACE_LANDMARKERS[num_faces] = landmarker
         log.info("MediaPipe Face Landmarker loaded (num_faces=%d, min_confidence=%.2f)",
-                 num_faces, conf)
+                 num_faces, app_config.face_detection_min_confidence)
     return landmarker
 
 

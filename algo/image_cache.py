@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,8 @@ class ImageCache:
     def __init__(self, root: Path) -> None:
         self.root = Path(root) / CACHE_DIR_NAME
         self._seq = 0
+        # Parallel analysis workers store crops concurrently.
+        self._seq_lock = threading.Lock()
 
     def store(self, stem: str, arr: np.ndarray | None) -> str | None:
         """Persist *arr* and return its path, or None when there is nothing to
@@ -36,8 +39,10 @@ class ImageCache:
         if arr is None or arr.size == 0:
             return None
         self.root.mkdir(parents=True, exist_ok=True)
-        self._seq += 1
-        path = self.root / f"{stem}_{self._seq:06d}.npy"
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
+        path = self.root / f"{stem}_{seq:06d}.npy"
         try:
             # ascontiguousarray: crops are numpy views, and a view keeps its
             # whole parent frame alive until it is copied out.

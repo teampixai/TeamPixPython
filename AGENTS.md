@@ -96,6 +96,18 @@ assignment, a regrade, a face-reco re-run) must call `invalidate_previews`.
 Detection engine: `--engine mediapipe` (default, Apache-2.0) or `--engine yolo` (legacy, AGPL/GPL,
 opt-in only, never enable by default).
 
+`MediaPipeImageAnalysisStage` analyses photos on a pool of `AppConfig.analysis_workers` threads
+(default 4; 1 = serial). Each worker runs one whole photo (decode → detect → thumbnail → crop cache)
+and holds one decoded full-resolution image, about 80 MB for 24 MP. That makes the worker count the
+RAM bound. Results keep file order and are identical to a serial run. Thread-safety rules:
+- MediaPipe landmarkers run one detection at a time per instance (`SerialDispatcher`). Each worker
+  therefore gets its own instances from `create_*_landmarker`, while the cached `load_*_landmarker`
+  singletons go to the first worker.
+- The shared GPU person detector serialises its forward passes on a lock in `torchvision_provider.py`.
+- `ImageCache.store` is locked.
+- MediaPipe's GPU delegate is Ubuntu-only, so pose and face stay on the CPU.
+Measured on a 6-core i7-8700K: 4 workers give about 2.6× end to end for this stage.
+
 ## 4. Data and files
 
 All paths are relative to the app folder (`REPO_ROOT`, which is `<install root>\app\` for installed users).

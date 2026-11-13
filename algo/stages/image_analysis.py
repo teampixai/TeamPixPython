@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -600,43 +603,120 @@ class MediaPipeImageAnalysisStage(ProcessStage):
             files = [f for f in files if f.resolve() not in self.skip_paths]
             log.info("[MediaPipeImageAnalysisStage] skipping %d already-imported file(s)", before - len(files))
         entries = self.album.images_by_source() if self.album is not None else {}
-        result: list[Frame] = []
-        width = len(str(len(files)))
+        total = len(files)
+        width = len(str(total))
+        workers = max(1, min(int(config.analysis_workers), total or 1))
 
-        for idx, path in enumerate(files, 1):
-            log.debug("[MediaPipeImageAnalysisStage] [%*d/%d] %s", width, idx, len(files), path.name)
+        # Pre-allocated in file order: workers finish out of order, but each
+        # writes only its own slot, so the result keeps the input order.
+        # Unreadable files leave their slot None.
+        slots: list[Frame | None] = [None] * total
+
+        # MediaPipe landmarkers run one detection at a time per instance, so
+        # each worker thread gets its own pair: the first worker uses the
+        # instances passed in, the others build private ones (closed below).
+        # The GPU person detector is shared (calls serialise on a lock in
+        # algo/torchvision_provider.py).
+        local = threading.local()
+        state_lock = threading.Lock()
+        owned: list = []
+        claimed = False
+        done_count = 0
+        progress_step = max(1, total // 20)
+
+        def landmarkers():
+            nonlocal claimed
+            pair = getattr(local, "pair", None)
+            if pair is not None:
+                return pair
+            with state_lock:
+                first, claimed = not claimed, True
+            if first or self.pose_landmarker is None or self.face_landmarker is None:
+                pair = (self.pose_landmarker, self.face_landmarker)
+            else:
+                from algo.mediapipe_provider import create_face_landmarker, create_pose_landmarker
+                pair = (create_pose_landmarker(num_poses=1), create_face_landmarker(num_faces=1))
+                with state_lock:
+                    owned.extend(pair)
+            local.pair = pair
+            return pair
+
+        def analyze(idx: int, path: Path) -> None:
+            nonlocal done_count
+            log.debug("[MediaPipeImageAnalysisStage] [%*d/%d] %s (%s)", width, idx + 1, total,
+                      path.name, threading.current_thread().name)
             image = _read_image(path)
             if image is None:
                 log.error("[MediaPipeImageAnalysisStage] %s — cannot read image file", path.name)
-                continue
+            else:
+                normalized = cap_long_edge(image, config.normalized_img_max_long_edge)
+                log.debug("[MediaPipeImageAnalysisStage] %s — original %dx%d  normalized %dx%d",
+                          path.name, image.shape[1], image.shape[0],
+                          normalized.shape[1], normalized.shape[0])
 
-            normalized = cap_long_edge(image, config.normalized_img_max_long_edge)
-            log.debug("[MediaPipeImageAnalysisStage] %s — original %dx%d  normalized %dx%d",
-                      path.name, image.shape[1], image.shape[0],
-                      normalized.shape[1], normalized.shape[0])
+                pose_landmarker, face_landmarker = landmarkers()
+                bodies, had_persons = detect_qualified_persons_mp(
+                    normalized, self.person_detector, pose_landmarker, face_landmarker
+                )
+                if not had_persons:
+                    log.debug("[MediaPipeImageAnalysisStage] %s — no person detected", path.name)
+                else:
+                    # Detector detail lines from parallel workers interleave;
+                    # this one ties the outcome back to the file.
+                    log.debug("[MediaPipeImageAnalysisStage] %s — %d body(ies), %d with a face",
+                              path.name, len(bodies), sum(1 for b in bodies if b.faces))
 
-            bodies, had_persons = detect_qualified_persons_mp(
-                normalized, self.person_detector, self.pose_landmarker, self.face_landmarker
-            )
-            if not had_persons:
-                log.debug("[MediaPipeImageAnalysisStage] %s — no person detected", path.name)
+                entry = _album_entry(entries, path, "MediaPipeImageAnalysisStage")
+                frame = Frame(
+                    path=path,
+                    bodies=bodies,
+                    image=image,
+                    normalized_image=normalized,
+                    output_key=entry.key if entry is not None else "",
+                )
+                write_import_thumbnail(entry, normalized)
+                populate_frame_cache(frame, self.cache, config,
+                                     cache_face_originals=self.cache_face_originals)
+                # See ImageAnalysisStage.process.
+                frame.image = None
+                frame.normalized_image = None
+                slots[idx] = frame
 
-            entry = _album_entry(entries, path, "MediaPipeImageAnalysisStage")
-            frame = Frame(
-                path=path,
-                bodies=bodies,
-                image=image,
-                normalized_image=normalized,
-                output_key=entry.key if entry is not None else "",
-            )
-            write_import_thumbnail(entry, normalized)
-            populate_frame_cache(frame, self.cache, config,
-                                 cache_face_originals=self.cache_face_originals)
-            # See ImageAnalysisStage.process.
-            frame.image = None
-            frame.normalized_image = None
-            result.append(frame)
+            with state_lock:
+                done_count += 1
+                done = done_count
+            if done % progress_step == 0 or done == total:
+                log.info("[MediaPipeImageAnalysisStage] [%*d/%d] photo(s) analysed", width, done, total)
 
-        log.info("[MediaPipeImageAnalysisStage] %d frame(s) constructed from %d file(s)",
-                 len(result), len(files))
+        started = time.perf_counter()
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="analysis") as pool:
+                # At most `workers` photos in flight: each holds a decoded
+                # full-resolution image until it finishes, so this bounds RAM.
+                pending: set = set()
+                try:
+                    for idx, path in enumerate(files):
+                        if len(pending) >= workers:
+                            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+                            for future in finished:
+                                future.result()
+                        pending.add(pool.submit(analyze, idx, path))
+                    for future in as_completed(pending):
+                        future.result()
+                except BaseException:
+                    for future in pending:
+                        future.cancel()
+                    raise
+        finally:
+            for landmarker in owned:
+                try:
+                    landmarker.close()
+                except Exception:
+                    log.debug("Error closing a worker landmarker", exc_info=True)
+
+        result = [frame for frame in slots if frame is not None]
+        elapsed = time.perf_counter() - started
+        log.info("[MediaPipeImageAnalysisStage] %d frame(s) constructed from %d file(s) "
+                 "in %.1fs with %d worker(s) (%.0f ms/photo)",
+                 len(result), total, elapsed, workers, 1000 * elapsed / max(1, total))
         return result

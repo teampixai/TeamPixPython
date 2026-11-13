@@ -129,6 +129,13 @@ class AppConfig:
     # Never upscales.
     normalized_img_max_long_edge: int = 1800
 
+    # Photos analysed concurrently by the MediaPipe import stage. Each worker
+    # owns its own MediaPipe landmarkers (CPU) and shares the GPU person
+    # detector, and holds one decoded full-resolution photo (~80 MB for 24 MP)
+    # at a time. Measured on a 6-core i7-8700K: 2 -> 2.0x, 3 -> 2.7x,
+    # 4 -> 3.2x, little gain beyond 6. 1 = the original one-at-a-time loop.
+    analysis_workers: int = 4
+
     # Jersey team-colour matching mode.
     # When True, the polled team-colour check collapses every jersey into one of
     # two lightness buckets — "Light" (white / pale) vs "Dark" (non-white /

@@ -31,6 +31,10 @@ _COCO_PERSON_LABEL = 1
 _PERSON_DETECTOR = None
 _PERSON_DETECTOR_DEVICE: str | None = None
 _PERSON_DETECTOR_LOCK = threading.Lock()
+# Serialises forward passes: concurrent calls would only queue on the same
+# CUDA stream anyway, and this keeps parallel import workers from racing on
+# the model.
+_PERSON_DETECTOR_INFERENCE_LOCK = threading.Lock()
 
 
 def load_person_detector(force_cpu: bool = False):
@@ -77,12 +81,11 @@ def extract_person_boxes_tv(image: np.ndarray, model, max_bodies: int = 8) -> li
     device = next(model.parameters()).device
     tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float().to(device) / 255.0
 
-    with torch.no_grad():
+    with _PERSON_DETECTOR_INFERENCE_LOCK, torch.no_grad():
         result = model([tensor])[0]
-
-    boxes_px = result["boxes"].cpu().numpy()
-    labels = result["labels"].cpu().numpy()
-    scores = result["scores"].cpu().numpy()
+        boxes_px = result["boxes"].cpu().numpy()
+        labels = result["labels"].cpu().numpy()
+        scores = result["scores"].cpu().numpy()
 
     person_idx = [i for i, lbl in enumerate(labels) if lbl == _COCO_PERSON_LABEL]
     if not person_idx:
