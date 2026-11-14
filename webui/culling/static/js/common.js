@@ -19,6 +19,34 @@ async function apiPost(url, body) {
 }
 
 // ------------------------------------------------------------------ //
+// Settings dropdown in the topbar (Team / Players).
+// ------------------------------------------------------------------ //
+(function initSettingsMenu() {
+  const btn = document.getElementById("settingsBtn");
+  const panel = document.getElementById("settingsPanel");
+  if (!btn || !panel) return;
+
+  function setOpen(open) {
+    panel.hidden = !open;
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setOpen(panel.hidden);
+  });
+  document.addEventListener("click", (e) => {
+    if (!panel.hidden && !panel.contains(e.target)) setOpen(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !panel.hidden) {
+      setOpen(false);
+      btn.focus();
+    }
+  });
+})();
+
+// ------------------------------------------------------------------ //
 // Tiny cookie helpers — used for small pieces of client-only UI memory
 // (e.g. the Face Recognition checkbox's last state) that intentionally
 // live in the browser rather than in server-side state.json.

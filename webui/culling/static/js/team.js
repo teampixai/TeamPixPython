@@ -22,12 +22,12 @@ function updateEditorVisibility() {
   $("#teamWelcome").toggle(!showEditor);
 }
 
-// Select Album and Players are disabled in the (server-rendered) nav until a
-// team exists; enable them as soon as the first team is saved, without
-// needing a reload.
+// Select Album and Players are disabled in the (server-rendered) nav and
+// Settings menu until a team exists; enable them as soon as the first team is
+// saved, without needing a reload.
 function enableSelectAlbumStep() {
   ["select-album", "players"].forEach((step) => {
-    $(`#steps a.step[data-step='${step}']`)
+    $(`#topbar a[data-step='${step}']`)
       .removeClass("disabled")
       .attr("href", "/" + step)
       .removeAttr("aria-disabled tabindex title");

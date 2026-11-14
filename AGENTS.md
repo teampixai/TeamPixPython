@@ -20,7 +20,7 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | Path | Role |
 |---|---|
 | `culling_app.py` | **The app.** FastAPI server (default `127.0.0.1:8010`) plus all page routes and `/api/*` endpoints. Long-running work is started as subprocesses (see §3). |
-| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `album-tools`), all extending `base.html` (top bar and step navigation). |
+| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `album-tools`), all extending `base.html` (top bar: a numbered stepper for Select Album → Culling → Faces → Album Tools, plus a right-aligned **Settings** dropdown holding Team and Players). |
 | `webui/culling/static/js/*.js` | One jQuery script per page, plus shared `common.js` (API helpers, `LogDialog`, heartbeat), `viewport.js` (zoom/pan image window) and `ai-edit.js` (the AI Edit dialog, `AiEdit.run(key, { onResult })`). jQuery 3.7.1 and jQuery UI 1.13.2 load from code.jquery.com. |
 | `webui/index.html`, `webui/static/` | Older single-page UI. Not served by `culling_app.py`. |
 | `1_prep_review.py` | Import/scoring worker. Turns a folder of photos into an album. |

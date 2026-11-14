@@ -148,8 +148,56 @@ code {
   cursor: not-allowed;
 }
 
+/* Settings dropdown — right end of the topbar. */
+.settings-menu { position: relative; flex-shrink: 0; }
+.settings-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.settings-btn:hover,
+.settings-btn[aria-expanded="true"] { background: var(--surface-2); color: var(--text); }
+.settings-btn.active { color: var(--text); background: var(--accent-soft); border-color: var(--accent); }
+.settings-icon { font-size: 15px; line-height: 1; }
+.settings-caret { font-size: 10px; }
+.settings-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 160px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  z-index: 30;
+}
+.settings-panel[hidden] { display: none; }
+.menu-item {
+  display: block;
+  padding: 8px 12px;
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 13.5px;
+  text-decoration: none;
+}
+.menu-item:hover,
+.menu-item:focus-visible { background: var(--surface-2); outline: none; }
+.menu-item.active { background: var(--accent-soft); font-weight: 600; }
+.menu-item.disabled { color: var(--muted); opacity: 0.45; pointer-events: none; cursor: not-allowed; }
+
 @media (max-width: 720px) {
   .step-label { display: none; }
+  .settings-label { display: none; }
 }
 
 /* Narrower still: the step nav is already down to just numbered circles,

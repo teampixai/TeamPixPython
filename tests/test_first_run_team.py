@@ -51,6 +51,16 @@ def test_team_page_is_reachable_without_a_team(client):
     assert "Create a team first" in resp.text
 
 
+def test_team_and_players_live_in_settings_menu_not_stepper(client):
+    html = client.get("/team").text
+    stepper, rest = html.split("</nav>", 1)
+    assert 'data-step="team"' not in stepper
+    assert 'data-step="players"' not in stepper
+    menu = rest.split('id="settingsPanel"', 1)[1].split("</header>", 1)[0]
+    assert 'data-step="team"' in menu
+    assert 'data-step="players"' in menu
+
+
 def test_pages_render_once_a_team_exists(client):
     saved = client.post("/api/team", json={"name": "U10 Sharks"})
     assert saved.status_code == 200
