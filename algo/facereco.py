@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,7 +13,13 @@ import numpy as np
 import rawpy
 from sklearn.cluster import AgglomerativeClustering
 
-from .face_crop_embed import annotate_face_crop, embed_face_crop, load_face_model, make_alignment_debug_image
+from .face_crop_embed import (
+    annotate_face_crop,
+    finish_face_embedding,
+    load_face_model,
+    make_alignment_debug_image,
+    prepare_face_crop,
+)
 from .facereco_provider import BodyRecord, Box, FaceRecoProvider, Player
 from algo.album import Album, PersonRecord
 from algo.album_info import AlbumInfo
@@ -99,6 +107,11 @@ class FaceRecoConfig:
     # (e.g. "high") doesn't also start discarding faces that are perfectly
     # recognizable but merely a bit softer than that stricter overall bar.
     sensitivity_threshold: float = 0.4
+    # Threads that prepare face crops (load, landmarks, alignment) and write
+    # the output PNGs in parallel. Embedding itself stays on the calling
+    # thread, batched on the GPU. 1 = serial; the legacy YOLO engine is
+    # always prepared serially.
+    workers: int = 4
 @dataclass
 class FaceSample:
     body: BodyRecord
@@ -578,6 +591,31 @@ class _QualifiedBody:
     body: BodyRecord
 
 
+class _PngWriter:
+    """Writes PNGs on a small thread pool (cv2 encodes without holding the
+    GIL). ``close()`` waits for every write and re-raises the first error."""
+
+    def __init__(self, workers: int) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="facereco-png")
+        self._futures: list = []
+
+    def write(self, path: Path, image: np.ndarray) -> None:
+        self._futures.append(self._pool.submit(self._write, path, image))
+
+    @staticmethod
+    def _write(path: Path, image: np.ndarray) -> None:
+        if not cv2.imwrite(str(path), image, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+            log.warning("FaceReco [write]: could not write %s", path)
+
+    def close(self) -> None:
+        try:
+            for future in self._futures:
+                future.result()
+        finally:
+            self._futures.clear()
+            self._pool.shutdown(wait=True, cancel_futures=True)
+
+
 class FaceRecoPipeline:
     def __init__(self, provider: FaceRecoProvider, config: FaceRecoConfig, cpu_only: bool) -> None:
         self.provider = provider
@@ -786,8 +824,12 @@ class FaceRecoPipeline:
 
         clusters, cluster_name_map = self._apply_manual_overrides(clusters, cluster_name_map, assigned_overrides)
 
-        self._write_all_faces(out_root, clusters)
-        self._write_cluster_outputs(out_root, clusters, src_dir, cluster_name_map)
+        writer = _PngWriter(self.config.workers)
+        try:
+            self._write_all_faces(out_root, clusters, writer)
+            self._write_cluster_outputs(out_root, clusters, src_dir, cluster_name_map, writer)
+        finally:
+            writer.close()
         log.info("FaceReco completed: %d qualified bodies → %d clusters  output=%s",
                  len(samples), len(clusters), out_root)
         return out_root
@@ -871,11 +913,22 @@ class FaceRecoPipeline:
 
     # RAW extensions that require rawpy instead of OpenCV.
     _RAW_EXTENSIONS: frozenset[str] = frozenset({".cr3", ".cr2"})
+    # Full-resolution decodes are serialised across the prepare workers: with
+    # several running at once, a standalone FaceReco re-run (which re-decodes
+    # every source photo) crashed with a native access violation inside
+    # cv2.imdecode, reproducibly near the end of a 3,445-face album; with
+    # this lock the same run completes. An import never decodes here (crops
+    # come from the analysis cache), so the import path is unaffected.
+    _DECODE_LOCK = threading.Lock()
 
     def _load_image(self, path: Path) -> np.ndarray | None:
         """Load the original source image as a full-resolution BGR array.
         RAW files (.cr3/.cr2) are decoded with rawpy at full resolution.
         """
+        with self._DECODE_LOCK:
+            return self._decode_image(path)
+
+    def _decode_image(self, path: Path) -> np.ndarray | None:
         if path.suffix.lower() in self._RAW_EXTENSIONS:
             try:
                 with rawpy.imread(str(path)) as raw:
@@ -891,124 +944,215 @@ class FaceRecoPipeline:
             log.debug("FaceReco [load]: %s  loaded %dx%d", path.name, img.shape[1], img.shape[0])
         return img
 
+    # Faces per prepare-then-embed round: large enough to fill FaceNet batches,
+    # small enough that a round's prepared crops stay a few MB.
+    _EMBED_CHUNK = 256
+
     def _predict_samples(
         self,
         qualified: list[_QualifiedBody],
         debug_dir: Path | None = None,
         face_crop_lookup: dict | None = None,
     ) -> list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]]:
+        """Embed every qualified face, in ``qualified`` order.
+
+        Works in rounds of ~``_EMBED_CHUNK`` faces: ``config.workers`` threads
+        prepare a round's crops in parallel (load, crop, landmark, align -- all
+        CPU), then the provider embeds the whole round at once so FaceNet runs
+        GPU batches instead of one launch-bound pass per face. Each worker owns
+        its own MediaPipe Face Landmarker; only this thread calls the provider.
+        """
         predicted: list[tuple[_QualifiedBody, Player, np.ndarray, np.ndarray]] = []
         total = len(qualified)
-        skipped_load = skipped_embedding = skipped_crop = skipped_oom = 0
+        skipped = {"load": 0, "embedding": 0, "crop": 0, "oom": 0}
         log.debug("FaceReco [embed]: processing %d qualified body/bodies", total)
-        # ``qualified`` groups all bodies of the same image together, so cache
-        # the last-decoded full-res image and reuse it for consecutive bodies
-        # instead of re-decoding (often 20+ times for a busy team photo) —
-        # this is both faster and much lighter on peak/fragmented memory.
-        last_path: Path | None = None
-        last_image: np.ndarray | None = None
-        for index, item in enumerate(qualified, start=1):
-            tag = f"{item.image_path.name} body#{item.body.body_index}"
-            # Same run as the import: analysis already cropped this face at
-            # native resolution with the same buffer ratio, so skip re-decoding
-            # the whole photo. A standalone re-run passes no lookup.
-            crop = None
-            cached_face = (
-                face_crop_lookup.get((item.body.orig_filename, item.body.body_index))
-                if face_crop_lookup is not None else None
-            )
-            if cached_face is not None:
-                crop = cached_face.get_original_crop()
-                cached_face.set_original_crop(None)
 
-            if crop is None:
-                if item.image_path == last_path:
-                    image = last_image
+        # ``qualified`` groups all bodies of the same image together; a worker
+        # takes a whole group so a standalone re-run decodes each photo once
+        # (often 20+ bodies for a busy team photo) and holds at most one
+        # full-resolution photo per worker.
+        groups: list[list[tuple[int, _QualifiedBody]]] = []
+        for index, item in enumerate(qualified, start=1):
+            if groups and groups[-1][-1][1].image_path == item.image_path:
+                groups[-1].append((index, item))
+            else:
+                groups.append([(index, item)])
+
+        # The legacy YOLO face model's thread-safety is unknown: keep it serial.
+        workers = 1 if self.config.engine != "mediapipe" else max(1, int(self.config.workers))
+        local = threading.local()
+        claim_lock = threading.Lock()
+        owned: list = []
+        claimed = False
+
+        def face_model():
+            nonlocal claimed
+            model = getattr(local, "face_model", None)
+            if model is None:
+                with claim_lock:
+                    first, claimed = not claimed, True
+                if first:
+                    model = load_face_model(force_cpu=self.cpu_only, engine=self.config.engine)
                 else:
-                    try:
-                        image = self._load_image(item.image_path)
-                    except (MemoryError, cv2.error) as exc:
-                        skipped_oom += 1
-                        log.warning(
-                            "FaceReco [embed]: %s — out of memory decoding image, skipped: %s",
-                            tag, exc,
-                        )
-                        last_path, last_image = item.image_path, None
+                    from algo.mediapipe_provider import create_face_landmarker
+                    model = create_face_landmarker(num_faces=1)
+                    with claim_lock:
+                        owned.append(model)
+                local.face_model = model
+            return model
+
+        def prepare_group(group: list[tuple[int, _QualifiedBody]]) -> list[tuple]:
+            """Per body: ``("ok", index, item, crop, prepared)`` or ``("skip", kind)``."""
+            out: list[tuple] = []
+            image: np.ndarray | None = None
+            image_loaded = False
+            for index, item in group:
+                tag = f"{item.image_path.name} body#{item.body.body_index}"
+                # Same run as the import: analysis already cropped this face at
+                # native resolution with the same buffer ratio, so skip re-decoding
+                # the whole photo. A standalone re-run passes no lookup.
+                crop = None
+                cached_face = (
+                    face_crop_lookup.get((item.body.orig_filename, item.body.body_index))
+                    if face_crop_lookup is not None else None
+                )
+                if cached_face is not None:
+                    crop = cached_face.get_original_crop()
+                    cached_face.set_original_crop(None)
+
+                if crop is None:
+                    if not image_loaded:
+                        image_loaded = True
+                        try:
+                            image = self._load_image(item.image_path)
+                        except (MemoryError, cv2.error) as exc:
+                            image = None
+                            log.warning(
+                                "FaceReco [embed]: %s — out of memory decoding image, skipped: %s",
+                                tag, exc,
+                            )
+                            out.append(("skip", "oom"))
+                            continue
+                        if image is None:
+                            log.warning("FaceReco [embed]: %s — cannot read image, skipped", tag)
+                    if image is None:
+                        out.append(("skip", "load"))
                         continue
-                    last_path, last_image = item.image_path, image
-                if image is None:
-                    skipped_load += 1
-                    log.warning("FaceReco [embed]: %s — cannot read image, skipped", tag)
+                    # Crop the face area first (same "face preview" rules used for the
+                    # saved crop), then re-detect landmarks on the crop and embed from
+                    # it.  Embedding from the exact crop we save guarantees that a
+                    # later RebuildFaceDB run reproduces this embedding, so prediction
+                    # and face-DB embeddings live in the same space.
+                    try:
+                        crop = self._crop_face_with_buffer(image, item.body)
+                    except (MemoryError, cv2.error) as exc:
+                        log.warning("FaceReco [embed]: %s — out of memory cropping face, skipped: %s", tag, exc)
+                        out.append(("skip", "oom"))
+                        continue
+                if crop is None:
+                    log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)
+                    out.append(("skip", "crop"))
                     continue
-                # Crop the face area first (same "face preview" rules used for the
-                # saved crop), then re-detect landmarks on the crop and embed from
-                # it.  Embedding from the exact crop we save guarantees that a
-                # later RebuildFaceDB run reproduces this embedding, so prediction
-                # and face-DB embeddings live in the same space.
+                # Quality gate: a crop too small to trust is excluded entirely --
+                # never matched against the DB and never folded into residual
+                # clustering -- rather than letting a noisy embedding produce a
+                # confident-looking wrong answer either way.
+                short_edge = min(crop.shape[0], crop.shape[1])
+                if short_edge < self.config.min_face_crop_px:
+                    log.debug(
+                        "FaceReco [embed]: %s — crop too small (%dpx < %dpx min), skipped",
+                        tag, short_edge, self.config.min_face_crop_px,
+                    )
+                    out.append(("skip", "crop"))
+                    continue
                 try:
-                    crop = self._crop_face_with_buffer(image, item.body)
+                    prepared = prepare_face_crop(face_model(), crop, align=self.config.align_faces)
                 except (MemoryError, cv2.error) as exc:
-                    skipped_oom += 1
-                    log.warning("FaceReco [embed]: %s — out of memory cropping face, skipped: %s", tag, exc)
+                    log.warning("FaceReco [embed]: %s — out of memory embedding face, skipped: %s", tag, exc)
+                    out.append(("skip", "oom"))
                     continue
-            if crop is None:
-                skipped_crop += 1
-                log.debug("FaceReco [embed]: %s — face crop returned None, skipped", tag)
-                continue
-            # Quality gate: a crop too small to trust is excluded entirely --
-            # never matched against the DB and never folded into residual
-            # clustering -- rather than letting a noisy embedding produce a
-            # confident-looking wrong answer either way.
-            short_edge = min(crop.shape[0], crop.shape[1])
-            if short_edge < self.config.min_face_crop_px:
-                skipped_crop += 1
-                log.debug(
-                    "FaceReco [embed]: %s — crop too small (%dpx < %dpx min), skipped",
-                    tag, short_edge, self.config.min_face_crop_px,
-                )
-                continue
+                out.append(("ok", index, item, crop, prepared))
+            return out
+
+        def embed(ready: list[tuple]) -> list[Player | None]:
+            images = [entry[4].image for entry in ready]
+            bodies = [entry[4].body for entry in ready]
             try:
-                result = embed_face_crop(
-                    self.provider,
-                    load_face_model(force_cpu=self.cpu_only, engine=self.config.engine),
-                    crop,
-                    fallback_confidence=item.body.confidence,
-                    align=self.config.align_faces,
-                    collect_debug=True,
-                )
+                return self.provider.predict_players(images, bodies)
             except (MemoryError, cv2.error) as exc:
-                skipped_oom += 1
-                log.warning("FaceReco [embed]: %s — out of memory embedding face, skipped: %s", tag, exc)
-                continue
-            player, debug = result
-            if debug_dir is not None:
-                self._write_align_debug(debug_dir, item, crop, debug)
-            embedding = player.internal.get("embedding")
-            if embedding is None:
-                skipped_embedding += 1
-                log.debug("FaceReco [embed]: %s — no embedding returned by provider, skipped", tag)
-                continue
-            annotated = annotate_face_crop(
-                crop,
-                debug.get("face_bbox"),
-                debug.get("narrow_face_bbox"),
-                debug.get("landmarks_px", []),
-                player.confidence,
-            )
-            emb_arr = np.asarray(embedding, dtype=np.float32)
-            log.debug(
-                "FaceReco [embed]: %s — embedding dim=%d  norm=%.4f  provider_conf=%s",
-                tag, emb_arr.shape[0], float(np.linalg.norm(emb_arr)),
-                f"{player.confidence:.3f}" if player.confidence is not None else "n/a",
-            )
-            log.debug("FaceReco [embed]: %s — crop %dx%d  ✓", tag, crop.shape[1], crop.shape[0])
-            predicted.append((item, player, crop, annotated))
-            if index == 1 or index % 50 == 0 or index == total:
-                log.info("FaceReco [embed]: %d/%d processed  embedded=%d", index, total, len(predicted))
+                log.warning("FaceReco [embed]: batch of %d failed (%s) — retrying one face at a time",
+                            len(ready), exc)
+            players: list[Player | None] = []
+            for entry, image, body in zip(ready, images, bodies):
+                try:
+                    players.append(self.provider.predict_player(image, body))
+                except (MemoryError, cv2.error) as exc:
+                    item = entry[2]
+                    log.warning("FaceReco [embed]: %s body#%d — out of memory embedding face, skipped: %s",
+                                item.image_path.name, item.body.body_index, exc)
+                    players.append(None)
+            return players
+
+        chunks: list[list[list[tuple[int, _QualifiedBody]]]] = []
+        for group in groups:
+            if not chunks or sum(len(g) for g in chunks[-1]) >= self._EMBED_CHUNK:
+                chunks.append([])
+            chunks[-1].append(group)
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="facereco") as pool:
+                for chunk in chunks:
+                    outcomes = [o for group_out in pool.map(prepare_group, chunk) for o in group_out]
+                    ready = [o for o in outcomes if o[0] == "ok"]
+                    for o in outcomes:
+                        if o[0] == "skip":
+                            skipped[o[1]] += 1
+                    players = embed(ready) if ready else []
+
+                    for (_ok, index, item, crop, prepared), player in zip(ready, players):
+                        tag = f"{item.image_path.name} body#{item.body.body_index}"
+                        if player is None:
+                            skipped["oom"] += 1
+                            continue
+                        player, debug = finish_face_embedding(
+                            prepared, player, fallback_confidence=item.body.confidence, collect_debug=True,
+                        )
+                        if debug_dir is not None:
+                            self._write_align_debug(debug_dir, item, crop, debug)
+                        embedding = player.internal.get("embedding")
+                        if embedding is None:
+                            skipped["embedding"] += 1
+                            log.debug("FaceReco [embed]: %s — no embedding returned by provider, skipped", tag)
+                            continue
+                        annotated = annotate_face_crop(
+                            crop,
+                            debug.get("face_bbox"),
+                            debug.get("narrow_face_bbox"),
+                            debug.get("landmarks_px", []),
+                            player.confidence,
+                        )
+                        emb_arr = np.asarray(embedding, dtype=np.float32)
+                        log.debug(
+                            "FaceReco [embed]: %s — embedding dim=%d  norm=%.4f  provider_conf=%s",
+                            tag, emb_arr.shape[0], float(np.linalg.norm(emb_arr)),
+                            f"{player.confidence:.3f}" if player.confidence is not None else "n/a",
+                        )
+                        log.debug("FaceReco [embed]: %s — crop %dx%d  ✓", tag, crop.shape[1], crop.shape[0])
+                        predicted.append((item, player, crop, annotated))
+
+                    processed = chunk[-1][-1][0]
+                    log.info("FaceReco [embed]: %d/%d processed  embedded=%d", processed, total, len(predicted))
+        finally:
+            for model in owned:
+                try:
+                    model.close()
+                except Exception:
+                    log.debug("Error closing a FaceReco worker landmarker", exc_info=True)
+
         log.info(
             "FaceReco [embed]: done  embedded=%d  skipped_load=%d  "
-            "skipped_embedding=%d  skipped_crop=%d  skipped_oom=%d",
-            len(predicted), skipped_load, skipped_embedding, skipped_crop, skipped_oom,
+            "skipped_embedding=%d  skipped_crop=%d  skipped_oom=%d  (workers=%d)",
+            len(predicted), skipped["load"], skipped["embedding"], skipped["crop"], skipped["oom"], workers,
         )
         return predicted
 
@@ -1326,7 +1470,7 @@ class FaceRecoPipeline:
         clusters_out = [c for c in remaining.values() if c.samples]
         return clusters_out, cluster_name_map
 
-    def _write_all_faces(self, out_root: Path, clusters: list[Cluster]) -> None:
+    def _write_all_faces(self, out_root: Path, clusters: list[Cluster], writer: "_PngWriter") -> None:
         """Write every processed face crop and a combined face.json to
         ``<out_root>/.AllFaces/``.
 
@@ -1359,10 +1503,7 @@ class FaceRecoPipeline:
                 # so a full recluster overwrites the same file in place instead
                 # of leaving the previous run's crop behind as an orphan.
                 crop_name = f"{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
-                cv2.imwrite(
-                    str(all_faces_dir / crop_name), crop,
-                    [cv2.IMWRITE_PNG_COMPRESSION, 3],
-                )
+                writer.write(all_faces_dir / crop_name, crop)
                 written += 1
 
                 emb = sample.embedding.astype(np.float32)
@@ -1400,6 +1541,23 @@ class FaceRecoPipeline:
         clusters: list[Cluster],
         src_dir: Path,
         cluster_name_map: dict[int, FaceDbEntry] | None = None,
+        writer: "_PngWriter | None" = None,
+    ) -> None:
+        own_writer = writer is None
+        if own_writer:
+            writer = _PngWriter(self.config.workers)
+        try:
+            self._write_cluster_dirs(out_root, clusters, cluster_name_map, writer)
+        finally:
+            if own_writer:
+                writer.close()
+
+    def _write_cluster_dirs(
+        self,
+        out_root: Path,
+        clusters: list[Cluster],
+        cluster_name_map: dict[int, FaceDbEntry] | None,
+        writer: "_PngWriter",
     ) -> None:
         log.info("FaceReco [write]: writing %d cluster(s) to %s", len(clusters), out_root)
         for cluster_index, cluster in enumerate(clusters, start=1):
@@ -1430,14 +1588,10 @@ class FaceRecoPipeline:
                 # reruns) so a full recluster overwrites the same file in
                 # place instead of leaving the previous run's crop behind.
                 crop_name = f"{Path(sample.body.orig_filename).stem}-b{sample.body.body_index}.png"
-                cv2.imwrite(str(face_dir / crop_name), crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+                writer.write(face_dir / crop_name, crop)
                 if annotated is not None:
                     face_annotated_dir.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(
-                        str(face_annotated_dir / crop_name),
-                        annotated,
-                        [cv2.IMWRITE_PNG_COMPRESSION, 3],
-                    )
+                    writer.write(face_annotated_dir / crop_name, annotated)
                 sample.crop_file_name = crop_name
                 sample.crop_image = None
                 sample.annotated_image = None

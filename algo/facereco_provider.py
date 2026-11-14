@@ -80,3 +80,9 @@ class FaceRecoProvider(ABC):
     @abstractmethod
     def predict_player(self, image_bgr: np.ndarray, body: BodyRecord) -> Player:
         """Infer player identity for one body and return a Player object."""
+
+    def predict_players(self, images_bgr: list[np.ndarray], bodies: list[BodyRecord]) -> list[Player]:
+        """Batch form of :meth:`predict_player`, one Player per (image, body)
+        pair in order. Providers whose model benefits from batching (FaceNet
+        on a GPU) override this; the default just loops."""
+        return [self.predict_player(image, body) for image, body in zip(images_bgr, bodies)]

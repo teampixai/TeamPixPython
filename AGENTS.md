@@ -108,6 +108,23 @@ RAM bound. Results keep file order and are identical to a serial run. Thread-saf
 - MediaPipe's GPU delegate is Ubuntu-only, so pose and face stay on the CPU.
 Measured on a 6-core i7-8700K: 4 workers give about 2.6× end to end for this stage.
 
+FaceReco (`FaceRecoPipeline._predict_samples`) works in rounds of about 256 faces. Each round,
+`FaceRecoConfig.workers` threads (default 4) prepare the faces: crop, MediaPipe landmarks and
+alignment, each worker with its own landmarker. Then the calling thread embeds the whole round
+through `provider.predict_players`. FaceNet runs that as GPU batches of 64, because one face at a
+time is launch-bound: about 25 ms per face, against about 0.7 ms per face in a batch. Batching
+changes embeddings only by float rounding (≤1e-6); cluster assignments match a serial run. Rules:
+- Only the calling thread touches the provider.
+- New many-face callers should batch through `prepare_face_crop` / `predict_players` /
+  `finish_face_embedding`. `embed_face_crop` is the single-face wrapper, still used by RebuildFaceDB.
+- Full-resolution photo decodes (standalone re-run only; an import uses cached crops) are serialised
+  by `FaceRecoPipeline._DECODE_LOCK`. Parallel decodes there crashed the process with a native access
+  violation in `cv2.imdecode`.
+- The legacy YOLO engine prepares serially.
+- Output PNGs are written on a small pool (`_PngWriter`). The JSON files and cluster logs stay in
+  order.
+Measured on the same machine (cached-crop import, 230 faces): FaceReco went from 24 s to 6 s.
+
 ## 4. Data and files
 
 All paths are relative to the app folder (`REPO_ROOT`, which is `<install root>\app\` for installed users).

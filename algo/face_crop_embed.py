@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import threading
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -269,6 +270,58 @@ def make_crop_body(fr_face: FRBox, fr_narrow: FRBox | None) -> BodyRecord:
     )
 
 
+@dataclass
+class PreparedFaceCrop:
+    """A face crop ready for the provider: the image to embed, the body record
+    describing where the face is in it, and the landmark/alignment details."""
+    image: np.ndarray
+    body: BodyRecord
+    landmarks_px: list[tuple[float, float]]
+    aligned: np.ndarray | None
+    face_bbox: FRBox
+    narrow_face_bbox: FRBox | None
+
+
+def prepare_face_crop(face_model, crop: np.ndarray, align: bool = True) -> PreparedFaceCrop:
+    """CPU half of :func:`embed_face_crop`: re-detect landmarks on *crop* and,
+    when *align* is True, similarity-align it (falling back to the unaligned
+    crop if landmark detection fails). Pair with :func:`finish_face_embedding`
+    once the provider has embedded ``image``."""
+    fr_face, fr_narrow, landmarks_px = detect_face_in_crop(crop, face_model)
+
+    aligned = align_face(crop, landmarks_px) if align else None
+    if aligned is not None:
+        # The aligned image is the canonically-framed face itself, so the
+        # provider should embed the whole image (full-image bbox).
+        return PreparedFaceCrop(aligned, make_crop_body(FRBox(0.0, 0.0, 1.0, 1.0), None),
+                                landmarks_px, aligned, fr_face, fr_narrow)
+    if align:
+        log.debug("[align] alignment unavailable (need 5 landmarks) — using unaligned crop")
+    return PreparedFaceCrop(crop, make_crop_body(fr_face, fr_narrow),
+                            landmarks_px, None, fr_face, fr_narrow)
+
+
+def finish_face_embedding(
+    prepared: PreparedFaceCrop,
+    player,
+    fallback_confidence: float | None = None,
+    collect_debug: bool = False,
+):
+    """Apply the confidence fallback to the provider's *player* and build the
+    :func:`embed_face_crop` return value."""
+    if player.confidence is None:
+        player.confidence = fallback_confidence
+
+    if collect_debug:
+        return player, {
+            "landmarks_px": prepared.landmarks_px,
+            "aligned": prepared.aligned,
+            "face_bbox": prepared.face_bbox,
+            "narrow_face_bbox": prepared.narrow_face_bbox,
+        }
+    return player
+
+
 def embed_face_crop(
     provider: FaceRecoProvider,
     face_model,
@@ -290,32 +343,14 @@ def embed_face_crop(
     When *collect_debug* is True the return value is ``(player, debug)`` where
     ``debug`` is ``{"landmarks_px": [...], "aligned": <ndarray|None>}`` for
     visual QA; otherwise just ``player`` is returned.
+
+    Many-face callers should use :func:`prepare_face_crop` /
+    ``provider.predict_players`` / :func:`finish_face_embedding` instead, so the
+    provider can batch (see ``FaceRecoPipeline._predict_samples``).
     """
-    fr_face, fr_narrow, landmarks_px = detect_face_in_crop(crop, face_model)
-
-    aligned = align_face(crop, landmarks_px) if align else None
-    if aligned is not None:
-        # The aligned image is the canonically-framed face itself, so the
-        # provider should embed the whole image (full-image bbox).
-        body = make_crop_body(FRBox(0.0, 0.0, 1.0, 1.0), None)
-        player = provider.predict_player(aligned, body)
-    else:
-        if align:
-            log.debug("[align] alignment unavailable (need 5 landmarks) — using unaligned crop")
-        body = make_crop_body(fr_face, fr_narrow)
-        player = provider.predict_player(crop, body)
-
-    if player.confidence is None:
-        player.confidence = fallback_confidence
-
-    if collect_debug:
-        return player, {
-            "landmarks_px": landmarks_px,
-            "aligned": aligned,
-            "face_bbox": fr_face,
-            "narrow_face_bbox": fr_narrow,
-        }
-    return player
+    prepared = prepare_face_crop(face_model, crop, align=align)
+    player = provider.predict_player(prepared.image, prepared.body)
+    return finish_face_embedding(prepared, player, fallback_confidence, collect_debug)
 
 
 # Distinct BGR colours for landmarks 0..4 (eye, eye, nose, mouth, mouth).
