@@ -1,14 +1,25 @@
 # TeamPixPython – Python dependencies
 #
-# Install order matters: install PyTorch with CUDA first (see README below),
-# then install the packages listed here. facenet-pytorch (below) requires
-# torch<2.3 / torchvision<0.18, and CUDA 12 builds of torch 2.2.2 are only
-# published on the cu121 index, so install exactly these versions first --
-# otherwise installing this file replaces a newer CUDA torch with a CPU one.
+# Install order matters: install PyTorch first, from the download.pytorch.org
+# index that matches the GPU (InitPhotoProcessing.bat picks it automatically),
+# then this file, then facenet-pytorch without its dependencies:
 #
-# Quick-start (CUDA 12.x):
-#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
+#   NVIDIA Turing or newer (incl. RTX 50xx), driver >= 580:
+#     pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu130
+#   Other NVIDIA GPUs up to Hopper (e.g. Volta/TITAN V, or any pre-Blackwell
+#   card on a driver < 580), driver >= 528:
+#     pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126
+#   No NVIDIA GPU:
+#     pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
 #   pip install -r requirements.txt
+#   pip install --no-deps facenet-pytorch==2.6.0
+#
+# facenet-pytorch (the FaceNet face-recognition provider) is NOT listed here:
+# it's unmaintained and declares torch<2.3 / torchvision<0.18 / Pillow<10.3,
+# so installing it normally downgrades PyTorch to a CPU-only 2.2.x, which
+# also has no GPU code for RTX 50xx cards. Its model code runs fine on
+# current PyTorch, hence --no-deps. Its own runtime needs (requests, tqdm)
+# are listed below.
 
 rawpy>=0.18.0
 opencv-python>=4.10.0
@@ -16,10 +27,10 @@ opencv-python>=4.10.0
 # Already an indirect dependency of torchvision/facenet-pytorch, listed here
 # explicitly since we now import it directly.
 Pillow>=10.0.0
-# Pinned <2: torch 2.2.2's compiled extensions (and facenet-pytorch) use the
-# NumPy 1.x ABI; NumPy 2.x breaks torch's Tensor.numpy() bridge with
-# "RuntimeError: Numpy is not available". mediapipe's declared opencv-contrib
-# dependency wants numpy>=2 but works fine at runtime with 1.26.x.
+# Kept on NumPy 1.x: the tested combination. torch >= 2.3 also supports
+# NumPy 2, so this can be lifted once mediapipe/basicsr/dlib are verified on
+# it. mediapipe's declared opencv-contrib dependency wants numpy>=2 but works
+# fine at runtime with 1.26.x.
 numpy>=1.26.0,<2
 scikit-learn>=1.3.0
 
@@ -37,8 +48,10 @@ ultralytics>=8.3.0
 face-recognition>=1.3.0
 dlib>=19.24.0
 
-# Optional but required when using the facenet face-recognition provider
-facenet-pytorch>=2.6.0
+# facenet-pytorch is installed separately with --no-deps (see the top of this
+# file); these are its runtime dependencies (weight download + progress bar).
+requests>=2.0.0
+tqdm>=4.0.0
 
 # Web UI for the end-to-end photo culling UI (culling_app.py), including its
 # face-reco cluster tagging page. Permissive licenses (FastAPI MIT,
@@ -60,9 +73,8 @@ openai>=1.30.0
 piexif>=1.1.3
 
 # Standalone image sharpening (esrsharpen.py). BSD-3-Clause (Real-ESRGAN) /
-# Apache-2.0 (GFPGAN). basicsr's own release pins numpy<2 too, but its
-# torchvision.transforms.functional_tensor import was removed in
-# torchvision>=0.17 (this repo's pinned version) — esrsharpen.py shims it
+# Apache-2.0 (GFPGAN). basicsr imports torchvision.transforms.functional_tensor,
+# which was removed in torchvision>=0.17 — esrsharpen.py/autoedit.py shim it
 # at runtime, no action needed here.
 basicsr>=1.4.2
 realesrgan>=0.3.0

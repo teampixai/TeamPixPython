@@ -72,8 +72,8 @@ def _patch_basicsr_torchvision_compat() -> None:
     """basicsr (a realesrgan/gfpgan dependency) imports
     ``torchvision.transforms.functional_tensor``, which was removed in
     torchvision >= 0.17 (its contents moved into
-    ``torchvision.transforms.functional``). This repo pins torchvision
-    0.17.2, so importing basicsr fails outright without this shim. Must run
+    ``torchvision.transforms.functional``). This repo uses torchvision
+    0.29, so importing basicsr fails outright without this shim. Must run
     before ANY basicsr/realesrgan/gfpgan import. No-op on torchvision
     versions that still have the module."""
     try:

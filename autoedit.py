@@ -815,7 +815,7 @@ def propose_tone(image: np.ndarray) -> ToneParams:
 
 def _patch_basicsr_torchvision_compat() -> None:
     """basicsr imports ``torchvision.transforms.functional_tensor``, removed in
-    torchvision >= 0.17 (this repo pins 0.17.2). Must run before ANY
+    torchvision >= 0.17 (this repo uses 0.29). Must run before ANY
     basicsr/realesrgan import."""
     try:
         import torchvision.transforms.functional_tensor  # noqa: F401

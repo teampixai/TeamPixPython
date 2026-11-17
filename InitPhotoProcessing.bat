@@ -40,18 +40,22 @@ setlocal EnableDelayedExpansion
 ::   3. Pins setuptools<81 right away so pkg_resources stays available for
 ::      face_recognition_models - done before the much slower steps below so
 ::      a broken pip environment is caught fast.
-::   4. Detects an NVIDIA GPU/driver (nvidia-smi, driver >= 528 for CUDA 12) to
-::      pick CUDA vs CPU builds.
+::   4. Detects an NVIDIA GPU (nvidia-smi: driver version and compute
+::      capability) to pick the PyTorch build: CUDA 13 for Turing and newer
+::      (incl. RTX 50xx), CUDA 12.6 for older GPUs, otherwise CPU-only.
 ::   5. Downloads the latest TeamPixPython source as a GitHub ZIP archive
 ::      (no git required) and updates the local app folder in place (existing
 ::      albums\ and other local-only data are never deleted).
 ::   6. Installs dlib via conda-forge (prebuilt binary - no C++ compiler /
 ::      CMake needed) - GPU build + cudnn when an NVIDIA GPU was detected,
 ::      otherwise the CPU build.
-::   7. Installs PyTorch 2.2.2 (CUDA 12.1 build or CPU-only; pinned because
-::      facenet-pytorch requires torch<2.3), then checks afterwards that
-::      PyTorch and dlib can really use the GPU (warns if not).
-::   8. Installs the rest of requirements.txt via pip.
+::   7. Installs PyTorch 2.14.1 / torchvision 0.29.1 in the build picked in
+::      step 4, replacing any other version or build already in the env (so
+::      re-running this script repairs an env with an old or wrong PyTorch).
+::      Checks afterwards that PyTorch can really run on the GPU, switching to
+::      the CPU build if it can't, and warns if dlib can't use it.
+::   8. Installs the rest of requirements.txt via pip, plus facenet-pytorch
+::      without its outdated torch<2.3 pin.
 ::   9. Installs face_recognition_models straight from source (PyPI releases
 ::      of it are unreliable) via a GitHub ZIP archive URL (no git required).
 ::  10. Writes a RunPhotoProcessing.bat launcher that runs the app with the
@@ -93,14 +97,29 @@ set "REPO_NAME=TeamPixPython"
 set "REPO_BRANCH=main"
 set "ENV_NAME=teampixpython"
 set "PYTHON_VERSION=3.12"
-:: PyTorch versions are pinned because requirements.txt's facenet-pytorch
-:: requires torch<2.3 / torchvision<0.18; installing a newer (e.g. CUDA)
-:: torch first would just get replaced by a CPU-only 2.2.x when
-:: requirements.txt is installed. The newest CUDA 12 index that publishes
-:: torch 2.2.2 wheels is cu121, which needs an NVIDIA driver >= 528 on Windows.
-set "TORCH_SPEC=torch==2.2.2 torchvision==0.17.2"
-set "TORCH_CUDA_TAG=cu121"
-set "MIN_CUDA_DRIVER=528"
+:: One PyTorch version for every machine; only the build (CUDA or CPU) differs
+:: and is picked in step 4 from the GPU's compute capability and driver:
+::   cu130 - Turing (7.5) and newer, incl. Blackwell RTX 50xx; driver >= 580.
+::   cu126 - Maxwell (5.0) .. Hopper (9.0), incl. Volta (TITAN V, which CUDA 13
+::           dropped); no Blackwell. Driver >= 528 (CUDA 12 minor-version
+::           compatibility).
+::   cpu   - everything else.
+:: torch 2.14.x is the last release with cu126 wheels for Windows, so it's
+:: the newest version that still covers Volta/Pascal GPUs.
+set "TORCH_VER=2.14.1"
+set "TORCHVISION_VER=0.29.1"
+set "CU_NEW_TAG=cu130"
+set "CU_NEW_MIN_DRIVER=580"
+set "CU_NEW_MIN_CC=75"
+set "CU_OLD_TAG=cu126"
+set "CU_OLD_MIN_DRIVER=528"
+set "CU_OLD_MIN_CC=50"
+set "CU_OLD_MAX_CC=90"
+:: facenet-pytorch (unmaintained) declares torch<2.3 / torchvision<0.18 /
+:: Pillow<10.3, which would make pip downgrade the PyTorch above to a CPU-only
+:: 2.2.x. Its model code works on current PyTorch, so it is installed with
+:: --no-deps in step 8 and kept out of requirements.txt.
+set "FACENET_SPEC=facenet-pytorch==2.6.0"
 
 set "INSTALL_ROOT=%CD%"
 set "ACCEPT_LICENSE=0"
@@ -350,31 +369,54 @@ if errorlevel 1 goto :fail
 :: ----------------------------------------------------------------------------
 echo [4/11] Detecting NVIDIA GPU / CUDA driver...
 set "HAS_NVIDIA_GPU=0"
-set "TORCH_INDEX="
+set "TORCH_TAG=cpu"
 set "NV_DRIVER="
+set "NV_CC="
 where nvidia-smi >nul 2>nul
 if not errorlevel 1 (
     for /f "usebackq delims=" %%D in (`nvidia-smi "--query-gpu=driver_version" "--format=csv,noheader" 2^>nul`) do if not defined NV_DRIVER set "NV_DRIVER=%%D"
+    for /f "usebackq delims=" %%C in (`nvidia-smi "--query-gpu=compute_cap" "--format=csv,noheader" 2^>nul`) do if not defined NV_CC set "NV_CC=%%C"
 )
 :: A broken driver makes nvidia-smi print an error sentence instead of a version.
 if defined NV_DRIVER (
     echo !NV_DRIVER!| findstr /r /c:"^[0-9][0-9]*\.[0-9]" >nul
     if errorlevel 1 set "NV_DRIVER="
 )
-if defined NV_DRIVER (
-    set "NV_MAJOR=0"
-    for /f "tokens=1 delims=." %%M in ("!NV_DRIVER!") do set /a "NV_MAJOR=%%M" 2>nul
-    if !NV_MAJOR! GEQ %MIN_CUDA_DRIVER% (
-        echo       NVIDIA driver !NV_DRIVER! found - will install CUDA-enabled PyTorch ^(%TORCH_CUDA_TAG%^) and GPU-accelerated dlib.
-        set "TORCH_INDEX=--index-url https://download.pytorch.org/whl/%TORCH_CUDA_TAG%"
-        set "HAS_NVIDIA_GPU=1"
-    ) else (
-        echo       NVIDIA driver !NV_DRIVER! found but it is older than %MIN_CUDA_DRIVER% ^(needed for CUDA 12^) - installing CPU-only
-        echo       PyTorch and dlib. Update the NVIDIA driver and re-run this script to enable the GPU.
-    )
-) else (
-    echo       No working NVIDIA driver detected - will install CPU-only PyTorch and dlib.
+if defined NV_CC (
+    echo !NV_CC!| findstr /r /c:"^[0-9][0-9]*\.[0-9]" >nul
+    if errorlevel 1 set "NV_CC="
 )
+if not defined NV_DRIVER (
+    echo       No working NVIDIA driver detected - will install CPU-only PyTorch and dlib.
+    goto :gpu_picked
+)
+set "NV_MAJOR=0"
+for /f "tokens=1 delims=." %%M in ("%NV_DRIVER%") do set /a "NV_MAJOR=%%M" 2>nul
+:: Compute capability as an integer: 7.0 -> 70, 12.0 -> 120. 0 = unknown.
+set "NV_CC_NUM=0"
+if defined NV_CC for /f "tokens=1,2 delims=." %%A in ("%NV_CC%") do set /a "NV_CC_NUM=%%A*10+%%B" 2>nul
+if not defined NV_CC set "NV_CC=unknown"
+echo       NVIDIA driver %NV_DRIVER%, GPU compute capability %NV_CC%.
+if %NV_MAJOR% GEQ %CU_NEW_MIN_DRIVER% if %NV_CC_NUM% GEQ %CU_NEW_MIN_CC% set "TORCH_TAG=%CU_NEW_TAG%"
+if "%TORCH_TAG%"=="cpu" if %NV_MAJOR% GEQ %CU_OLD_MIN_DRIVER% if %NV_CC_NUM% EQU 0 set "TORCH_TAG=%CU_OLD_TAG%"
+if "%TORCH_TAG%"=="cpu" if %NV_MAJOR% GEQ %CU_OLD_MIN_DRIVER% if %NV_CC_NUM% GEQ %CU_OLD_MIN_CC% if %NV_CC_NUM% LEQ %CU_OLD_MAX_CC% set "TORCH_TAG=%CU_OLD_TAG%"
+if not "%TORCH_TAG%"=="cpu" (
+    echo       Will install CUDA-enabled PyTorch ^(%TORCH_TAG%^) and GPU-accelerated dlib.
+    set "HAS_NVIDIA_GPU=1"
+    goto :gpu_picked
+)
+if %NV_CC_NUM% GTR %CU_OLD_MAX_CC% goto :gpu_needs_new_driver
+if %NV_CC_NUM% GTR 0 if %NV_CC_NUM% LSS %CU_OLD_MIN_CC% goto :gpu_too_old
+echo       The NVIDIA driver is older than %CU_OLD_MIN_DRIVER% ^(needed for CUDA 12^) - installing CPU-only PyTorch and dlib.
+echo       Update the NVIDIA driver and re-run this script to enable the GPU.
+goto :gpu_picked
+:gpu_needs_new_driver
+echo       This GPU needs NVIDIA driver %CU_NEW_MIN_DRIVER% or newer ^(CUDA 13^) - installing CPU-only PyTorch and dlib.
+echo       Update the NVIDIA driver and re-run this script to enable the GPU.
+goto :gpu_picked
+:gpu_too_old
+echo       This GPU is too old for current PyTorch CUDA builds - installing CPU-only PyTorch and dlib.
+:gpu_picked
 
 :: ----------------------------------------------------------------------------
 :: [5/11] Download latest app code (no git required)
@@ -433,8 +475,8 @@ if errorlevel 8 (
 :: - "--override-channels -c conda-forge" avoids also pulling in the slower
 ::   "defaults" channel, which otherwise makes the solve far slower.
 :: - Installing dlib-gpu can pull in a newer numpy (e.g. 2.x) as a conda
-::   dependency, silently corrupting the pip-installed numpy<2 (torch 2.2.2
-::   needs numpy<2 - see requirements.txt comment). Step 8 below re-asserts
+::   dependency, silently corrupting the pip-installed numpy<2 (see the
+::   requirements.txt comment for why it is pinned). Step 8 below re-asserts
 ::   the numpy<2 pin via pip --force-reinstall to fix this deterministically
 ::   regardless of which branch ran here.
 "%CONDA_DIR%\Scripts\conda.exe" remove -y -p "%ENV_DIR%" dlib dlib-cpu dlib-gpu --force >nul 2>nul
@@ -455,22 +497,38 @@ if "%HAS_NVIDIA_GPU%"=="1" (
 :: ----------------------------------------------------------------------------
 :: [7/11] PyTorch
 :: ----------------------------------------------------------------------------
-echo [7/11] Installing PyTorch ^(%TORCH_SPEC%^)...
+:: The exact version string includes the build ("2.14.1+cu130"), so an env
+:: holding another version, or the right version in the wrong build (e.g. a
+:: CPU-only one, or the old 2.2.2+cu121 that has no code for RTX 50xx GPUs),
+:: is replaced. pip alone would keep a different build of the same version.
+echo [7/11] Installing PyTorch %TORCH_VER% / torchvision %TORCHVISION_VER% ^(%TORCH_TAG% build^)...
 "%ENV_PY%" -m pip install --upgrade pip
 if errorlevel 1 goto :fail
-"%ENV_PY%" -m pip install %TORCH_SPEC% !TORCH_INDEX!
-if errorlevel 1 goto :fail
+"%ENV_PY%" -c "import sys, torch, torchvision; sys.exit(0 if (torch.__version__, torchvision.__version__) == ('%TORCH_VER%+%TORCH_TAG%', '%TORCHVISION_VER%+%TORCH_TAG%') else 1)" >nul 2>nul
+if not errorlevel 1 (
+    echo       Already installed.
+) else (
+    call :install_torch %TORCH_TAG%
+    if errorlevel 1 goto :fail
+)
 
 :: ----------------------------------------------------------------------------
 :: [8/11] Remaining Python dependencies (dlib already handled by conda above)
 :: ----------------------------------------------------------------------------
+:: facenet-pytorch is filtered out too (an older requirements.txt still lists
+:: it) and installed with --no-deps below - see FACENET_SPEC at the top.
 echo [8/11] Installing remaining dependencies from requirements.txt...
 set "REQ_FILTERED=%WORK_DIR%\requirements.filtered.txt"
-findstr /V /R "^dlib" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
+findstr /V /R /C:"^dlib" /C:"^facenet-pytorch" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
 "%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
 if errorlevel 1 goto :fail
 
-echo       Re-asserting numpy^<2 pin ^(dlib-gpu's conda-forge numpy dependency can bump it to 2.x, which breaks torch's Tensor.numpy^(^) bridge^)...
+echo       Installing %FACENET_SPEC% without its outdated torch^<2.3 pin
+echo       ^(pip may warn that it "requires torch^<2.3.0" - that is expected and harmless^)...
+"%ENV_PY%" -m pip install --no-deps %FACENET_SPEC%
+if errorlevel 1 goto :fail
+
+echo       Re-asserting numpy^<2 pin ^(dlib-gpu's conda-forge numpy dependency can bump it to 2.x^)...
 "%ENV_PY%" -m pip install --force-reinstall "numpy>=1.26.0,<2"
 if errorlevel 1 goto :fail
 
@@ -506,16 +564,29 @@ if errorlevel 1 (
     goto :fail
 )
 
-:: Make sure the GPU path really ended up with a CUDA-enabled PyTorch (a later
-:: pip install can silently swap it for a CPU build) and a CUDA-enabled dlib.
-:: Warnings only - e.g. a driver that needs a reboot shouldn't fail the setup.
+:: Make sure the GPU path really ended up with a PyTorch that can run on this
+:: GPU. torch.cuda.is_available() alone isn't enough: a build without code for
+:: the GPU (e.g. a CUDA 12.1 build on an RTX 50xx) still reports True and only
+:: fails at the first operation with "no kernel image is available", which
+:: would crash every import - so run a real convolution, and switch to the
+:: CPU build if that fails. GPU not visible at all only warns (e.g. a driver
+:: that needs a reboot shouldn't fail the setup; the app then uses the CPU).
 if "%HAS_NVIDIA_GPU%"=="1" (
     echo       Verifying GPU support...
     "%ENV_PY%" -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
     if errorlevel 1 (
-        echo       WARNING: PyTorch cannot use the NVIDIA GPU ^(CPU-only build or driver problem^) - the app will run on the CPU.
+        echo       WARNING: PyTorch cannot see the NVIDIA GPU ^(driver problem, or a reboot is needed^) - the app will run on the CPU.
     ) else (
-        echo       PyTorch CUDA: OK
+        "%ENV_PY%" -c "import torch; x = torch.ones(1, 3, 16, 16, device='cuda'); w = torch.ones(4, 3, 3, 3, device='cuda'); print(torch.nn.functional.conv2d(x, w).sum().item())" >nul 2>nul
+        if errorlevel 1 (
+            echo       WARNING: this PyTorch build cannot run on this GPU - switching to the CPU-only build.
+            call :install_torch cpu
+            if errorlevel 1 goto :fail
+            "%ENV_PY%" -m pip install "numpy>=1.26.0,<2" "setuptools<81"
+            if errorlevel 1 goto :fail
+        ) else (
+            echo       PyTorch CUDA: OK
+        )
     )
     "%ENV_PY%" -c "import sys, dlib; sys.exit(0 if dlib.DLIB_USE_CUDA else 1)" >nul 2>nul
     if errorlevel 1 (
@@ -604,6 +675,17 @@ echo  Re-run this script any time to update everything to the latest.
 echo ============================================================
 pause
 goto :eof
+
+:: ----------------------------------------------------------------------------
+:: :install_torch <build>  -- replace PyTorch/torchvision with TORCH_VER /
+:: TORCHVISION_VER from the given download.pytorch.org index (cu130, cu126 or
+:: cpu). Uninstalls first because pip keeps an installed build of the same
+:: version number.
+:: ----------------------------------------------------------------------------
+:install_torch
+"%ENV_PY%" -m pip uninstall -y torch torchvision torchaudio >nul 2>nul
+"%ENV_PY%" -m pip install torch==%TORCH_VER% torchvision==%TORCHVISION_VER% --index-url https://download.pytorch.org/whl/%~1
+exit /b %errorlevel%
 
 :: ----------------------------------------------------------------------------
 :: :download <url> <output_path>  -- curl if available, else PowerShell.

@@ -28,9 +28,13 @@ if "%NEW_BLOB%"=="%DONE_BLOB%" exit /b 0
 
 echo requirements.txt changed - updating dependencies...
 set "REQ_FILTERED=%TEMP%\bpd-requirements.filtered.txt"
-:: dlib comes from conda (see InitPhotoProcessing.bat), not pip.
-findstr /V /R "^dlib" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
+:: dlib comes from conda (see InitPhotoProcessing.bat), not pip. facenet-pytorch
+:: must be installed with --no-deps or pip would downgrade PyTorch to the
+:: CPU-only 2.2.x it declares (an older requirements.txt still lists it).
+findstr /V /R /C:"^dlib" /C:"^facenet-pytorch" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
 "%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
+if errorlevel 1 goto :warn
+"%ENV_PY%" -m pip install --no-deps "facenet-pytorch==2.6.0"
 if errorlevel 1 goto :warn
 :: Same pins InitPhotoProcessing.bat re-asserts after installing requirements.
 "%ENV_PY%" -m pip install "numpy>=1.26.0,<2" "setuptools<81"

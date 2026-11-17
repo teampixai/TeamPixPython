@@ -210,9 +210,14 @@ request.
 - **Sensitivity presets are duplicated:** `SENSITIVITY_PRESETS` in `culling_app.py` and
   `SENSITIVITY_THRESHOLDS` in `1_prep_review.py` (low 0.40 / medium 0.50 / high 0.62; score ≤ threshold
   means blurry). Change both together, and recalibrate when the evaluator changes.
-- **Dependency pins:** `torch==2.2.2` / `torchvision==0.17.2` (required by facenet-pytorch), `numpy<2`
-  (torch 2.2 ABI), `setuptools<81` (keeps `pkg_resources` for face_recognition_models). Install torch
-  **before** `pip install -r requirements.txt`, or pip will replace the CUDA build with a CPU one.
+- **Dependency pins:** `torch==2.14.1` / `torchvision==0.29.1`, one version for every machine, with the
+  build picked by GPU: `cu130` (Turing+ incl. RTX 50xx Blackwell, driver ≥ 580), `cu126` (up to Hopper incl.
+  Volta, driver ≥ 528; 2.14.x is the last release with Windows cu126 wheels), else `cpu`.
+  `facenet-pytorch==2.6.0` is **not** in `requirements.txt`: it declares `torch<2.3` (which would pull in a
+  CPU-only 2.2.x with no Blackwell code), so it's installed with `pip install --no-deps`, and both
+  `InitPhotoProcessing.bat` and `UpdateDeps.bat` filter it out of `pip install -r`. `numpy<2` (tested set;
+  torch itself no longer needs it), `setuptools<81` (keeps `pkg_resources` for face_recognition_models).
+  Install torch **before** `pip install -r requirements.txt`, or pip may pull a CPU build from PyPI.
   `esrsharpen.py`/`autoedit.py` patch basicsr's removed `torchvision.transforms.functional_tensor` import
   at runtime.
 - **Team identity is the UUID**, not the name. Face-DB folders and `album.team_id` use it. Match `legacyIds` too.
@@ -228,13 +233,14 @@ request.
 ## 6. Developing and testing
 
 ```powershell
-# Dev environment (conda, Python 3.12, CUDA 12 example)
+# Dev environment (conda, Python 3.12; cu130 = Turing+ incl. RTX 50xx, cu126 = older GPUs, or cpu)
 conda create -n teampixpython python=3.12 pip git
 conda activate teampixpython
 conda install -c conda-forge dlib           # prebuilt, no compiler needed
 pip install "setuptools<81"
-pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121   # or the CPU index
+pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
+pip install --no-deps facenet-pytorch==2.6.0
 pip install https://github.com/ageitgey/face_recognition_models/archive/master.zip
 
 # Run the app
@@ -331,10 +337,13 @@ The installer is self-contained and safe to re-run. It:
 1. installs a private Miniconda into `<root>\miniconda3` (not on PATH and not registered, after the user
    accepts the ToS or passes `/y`);
 2. creates the env `<root>\envs\teampixpython` (Python 3.12, with pip and git);
-3. detects an NVIDIA driver ≥ 528 to choose CUDA (cu121) or CPU builds;
+3. reads the NVIDIA driver version and GPU compute capability to choose the PyTorch build (cu130 / cu126 /
+   cpu, see §5);
 4. downloads the GitHub ZIP of `main` into `<root>\app` (keeping `albums\` and other local data);
-5. installs dlib from conda-forge, torch 2.2.2, `requirements.txt`, and face_recognition_models from the
-   GitHub ZIP;
+5. installs dlib from conda-forge, torch 2.14.1 (replacing any other version or build, so a re-run repairs an
+   old env), `requirements.txt`, facenet-pytorch with `--no-deps`, and face_recognition_models from the
+   GitHub ZIP. It then runs a real convolution on the GPU (`torch.cuda.is_available()` is also True for a
+   build that has no code for the GPU) and falls back to the CPU build if that fails;
 6. writes `RunPhotoProcessing.bat`, which first runs `git pull --ff-only` if `app\` is a git checkout (the ZIP-based
    install isn't one, so it just prints a note), then `UpdateDeps.bat` (re-installs the pip packages from
    `requirements.txt` when its committed version differs from the last one installed OK, tracked by a

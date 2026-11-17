@@ -44,7 +44,7 @@ Python won't even know we were here.
 |---|---|
 | **OS** | Windows 10 or 11, 64-bit. Windows on ARM works through x64 emulation, but slowly. |
 | **Disk** | About **10 GB** free for the app, plus room for each album's thumbnails and previews. |
-| **GPU** | Optional but **strongly recommended**: an NVIDIA graphics card with driver 528 or newer. The installer detects it and installs the GPU version automatically. Without one, everything still works on the CPU, just more slowly. Think "coach's halftime speech" slowly. |
+| **GPU** | Optional but **strongly recommended**: an NVIDIA graphics card with driver 528 or newer (RTX 50-series cards need driver 580 or newer). The installer detects it and installs the GPU version automatically. Without one, everything still works on the CPU, just more slowly. Think "coach's halftime speech" slowly. |
 | **Internet** | Needed for installing and updating, and for downloading AI models the first time. Afterwards it's only needed if you use the optional OpenAI features. |
 | **Photos** | JPEG, PNG, TIFF, WEBP, BMP and Canon RAW (`.CR2` / `.CR3`). |
 
