@@ -66,13 +66,18 @@ Key `algo/` modules:
   - expose a `…/status?since=N` endpoint that returns `state.status(since)`;
   - show progress on the page with `LogDialog.create({...})` from `common.js`.
 
+  The shared Task Log window retains at most 1,024 logical lines, trimming the oldest lines in a batch
+  down to 512 when the limit is exceeded. This only limits the displayed text; the server's job log
+  buffer and polling cursor are unchanged.
+
   Never block the request, and don't build a one-off spinner or progress UI.
   `_stream_subprocess(cmd, log_fn=...)` forwards a script's output into any job log.
 - **Heartbeat:** every page pings `/api/heartbeat` every 10 s. After `--heartbeat-timeout` seconds
   (default 60; 0 disables) without a ping, the server **prints a relaunch link instead of exiting**, so a
   running job survives a closed tab.
-- **Native dialogs:** the folder picker (`/api/browse-folder`) uses tkinter, called directly from the
-  FastAPI worker thread. "Open folder" uses `os.startfile`, and "Edit with custom app" uses the Windows
+- **Native dialogs:** the folder picker (`/api/browse-folder`) runs tkinter in a short-lived child process
+  (`_FOLDER_PICKER_SCRIPT`), so Tk is on that process's main thread. Never create Tk inside the server
+  process: a Tcl interpreter freed on another thread aborts the whole server (`Tcl_AsyncDelete`). "Open folder" uses `os.startfile`, and "Edit with custom app" uses the Windows
   "Open with" chooser (§9).
 - **CLI:** `python culling_app.py [--host H] [--port P] [--no-browser] [--heartbeat-timeout S]`.
 
@@ -214,6 +219,8 @@ request.
 - **Licensing:** keep the default path permissive (§10). Ultralytics/YOLO stays opt-in.
 - **Face recognition is consent-gated in the UI** (a COPPA/GDPR notice in `add-new-album.html`). Keep it.
 - `.gitignore` excludes `/.[0-9]*.md`, which is the naming convention for local scratch plan docs.
+- **No tkinter in the server process.** `culling_app.py` must not import tkinter or create `Tk()`. Use a
+  child process (as `_FOLDER_PICKER_SCRIPT` does) for any native dialog.
 - **jQuery element props:** in `$("<div>", { ... })`, any key that is also a jQuery method is *called*
   rather than set as an attribute. With jQuery UI loaded, `draggable: true` therefore turns the element into
   a jQuery UI draggable, not an HTML5 drag source. Use `.attr("draggable", "true")`.
@@ -235,6 +242,8 @@ python culling_app.py --no-browser --port 8010
 
 # Tests (≈220 tests, ~40 s; no GPU or network needed)
 python -m pytest tests -q
+# Task Log JavaScript tests (requires Node.js)
+node --test tests\test_task_log.js
 ```
 
 `tests/e2e_check.py` is a manual end-to-end script, not part of the pytest suite.
@@ -340,8 +349,6 @@ adds a dependency, update **both** `requirements.txt` and, where it needs specia
 
 The app is Windows-only today. Before claiming macOS or Linux support, fix these:
 
-- `/api/browse-folder` creates a tkinter `Tk()` inside a FastAPI worker thread. macOS requires Tk on the
-  main thread, so this will crash or hang there.
 - `/api/edit/open-external` returns HTTP 501 on anything except Windows (it uses `os.startfile(..., "openas")`).
 - There's no installer for other platforms. dlib and torch would need a separate setup, and CUDA isn't
   available on macOS (no MPS code paths exist; everything falls back to CPU).

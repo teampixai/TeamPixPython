@@ -175,6 +175,9 @@ $(function () {
 // callers (like ai-edit.js) don't need to hand-author any dialog markup.
 // ------------------------------------------------------------------ //
 const LogDialog = (function () {
+  const MAX_LOG_LINES = 1024;
+  const TRIMMED_LOG_LINES = 512;
+
   function ensureDialog(dialogId, outputId, dialogOptions) {
     let $dialog = $("#" + dialogId);
     if ($dialog.length === 0) {
@@ -206,8 +209,23 @@ const LogDialog = (function () {
       const box = document.getElementById(outputId);
       if (!box) return;
       const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
-      box.value += (box.value ? "\n" : "") + lines.join("\n");
-      if (atBottom) box.scrollTop = box.scrollHeight;
+      const previousScrollTop = box.scrollTop;
+      const previousHeight = box.scrollHeight;
+      const previousLines = box.value ? box.value.split("\n") : [];
+      const combined = box.value + (box.value ? "\n" : "") + lines.join("\n");
+      const combinedLines = combined.split("\n");
+      let removedHeight = 0;
+      if (combinedLines.length > MAX_LOG_LINES) {
+        const removedLines = combinedLines.length - TRIMMED_LOG_LINES;
+        if (!atBottom && previousLines.length) {
+          box.value = previousLines.slice(removedLines).join("\n");
+          removedHeight = previousHeight - box.scrollHeight;
+        }
+        box.value = combinedLines.slice(-TRIMMED_LOG_LINES).join("\n");
+      } else {
+        box.value = combined;
+      }
+      box.scrollTop = atBottom ? box.scrollHeight : Math.max(0, previousScrollTop - removedHeight);
     }
 
     function open(title) {
