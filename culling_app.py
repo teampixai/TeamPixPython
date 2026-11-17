@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import gc
 import json
 import logging
 import os
@@ -3366,6 +3367,51 @@ def api_set_import_path(req: ImportPathRequest) -> dict:
     return {"ok": True, "path": str(path.resolve())}
 
 
+_TK_DIALOG_LOCK = threading.Lock()
+
+
+def _pick_folder_dialog(title: str, initial_dir: str) -> Optional[str]:
+    """Show the native folder picker and return the chosen path (None on cancel or failure).
+
+    A Tcl interpreter must be freed on the thread that created it, otherwise Tcl aborts the whole
+    server ("Tcl_AsyncDelete: async handler deleted by the wrong thread"). Tk objects often sit in
+    reference cycles (tracebacks, callbacks), so the cyclic GC would free them later on whichever
+    thread happens to trigger it. To keep that on this thread: the cyclic GC is paused while Tk
+    objects exist, and a collection is forced here once they are garbage.
+    """
+    import tkinter as tk
+    from tkinter import filedialog
+
+    def run() -> Optional[str]:
+        root = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            chosen = filedialog.askdirectory(initialdir=initial_dir, title=title, parent=root)
+            return chosen or None
+        except Exception as e:
+            # Log text, not the exception: a record that keeps `e` would keep its traceback, and with
+            # it the Tk root, alive past this thread.
+            log.warning("Folder picker failed: %s", f"{type(e).__name__}: {e}")
+            return None
+        finally:
+            if root is not None:
+                with contextlib.suppress(tk.TclError):
+                    root.destroy()
+
+    with _TK_DIALOG_LOCK:
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            return run()
+        finally:
+            # run()'s frame (and any traceback it held) is gone, so every Tk object is now garbage.
+            gc.collect()
+            if gc_was_enabled:
+                gc.enable()
+
+
 @app.post("/api/browse-folder")
 def api_browse_folder(req: BrowseFolderRequest = BrowseFolderRequest()) -> dict:
     """Open a native OS folder-picker dialog on the server machine.
@@ -3384,23 +3430,7 @@ def api_browse_folder(req: BrowseFolderRequest = BrowseFolderRequest()) -> dict:
     if not initial_dir or not Path(initial_dir).is_dir():
         initial_dir = str(Path.home())
 
-    result: dict[str, Optional[str]] = {"path": None}
-
-    def _run_dialog() -> None:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        chosen = filedialog.askdirectory(initialdir=initial_dir, title=req.title)
-        root.destroy()
-        result["path"] = chosen or None
-
-    # tkinter must run on the main thread on some platforms; FastAPI's sync
-    # endpoints already execute in a worker thread, so calling it directly
-    # here is safe (no separate thread needed) and keeps the dialog modal.
-    _run_dialog()
+    result: dict[str, Optional[str]] = {"path": _pick_folder_dialog(req.title, initial_dir)}
 
     if result["path"]:
         log.info("Folder picked via dialog: %s", result["path"])

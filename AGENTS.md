@@ -75,10 +75,9 @@ Key `algo/` modules:
 - **Heartbeat:** every page pings `/api/heartbeat` every 10 s. After `--heartbeat-timeout` seconds
   (default 60; 0 disables) without a ping, the server **prints a relaunch link instead of exiting**, so a
   running job survives a closed tab.
-- **Native dialogs:** the folder picker (`/api/browse-folder`) runs tkinter in a short-lived child process
-  (`_FOLDER_PICKER_SCRIPT`), so Tk is on that process's main thread. Never create Tk inside the server
-  process: a Tcl interpreter freed on another thread aborts the whole server (`Tcl_AsyncDelete`). "Open folder" uses `os.startfile`, and "Edit with custom app" uses the Windows
-  "Open with" chooser (§9).
+- **Native dialogs:** the folder picker (`/api/browse-folder`) calls tkinter from the FastAPI worker thread,
+  but only through `_pick_folder_dialog`, which keeps Tk garbage on that thread (see §5). "Open folder"
+  uses `os.startfile`, and "Edit with custom app" uses the Windows "Open with" chooser (§9).
 - **CLI:** `python culling_app.py [--host H] [--port P] [--no-browser] [--heartbeat-timeout S]`.
 
 ### Processing pipeline (import)
@@ -224,8 +223,11 @@ request.
 - **Licensing:** keep the default path permissive (§10). Ultralytics/YOLO stays opt-in.
 - **Face recognition is consent-gated in the UI** (a COPPA/GDPR notice in `add-new-album.html`). Keep it.
 - `.gitignore` excludes `/.[0-9]*.md`, which is the naming convention for local scratch plan docs.
-- **No tkinter in the server process.** `culling_app.py` must not import tkinter or create `Tk()`. Use a
-  child process (as `_FOLDER_PICKER_SCRIPT` does) for any native dialog.
+- **Tk objects must be freed on the thread that created them.** Otherwise Tcl aborts the whole server
+  (`Tcl_AsyncDelete: async handler deleted by the wrong thread`, no traceback). Create Tk only through
+  `_pick_folder_dialog` in `culling_app.py`: it pauses the cyclic GC while Tk objects exist and forces
+  `gc.collect()` on the same thread once they are garbage. Don't log or store an exception raised inside
+  it (its traceback keeps the Tk root alive); log a string. `tests/test_browse_folder.py` covers this.
 - **jQuery element props:** in `$("<div>", { ... })`, any key that is also a jQuery method is *called*
   rather than set as an attribute. With jQuery UI loaded, `draggable: true` therefore turns the element into
   a jQuery UI draggable, not an HTML5 drag source. Use `.attr("draggable", "true")`.
