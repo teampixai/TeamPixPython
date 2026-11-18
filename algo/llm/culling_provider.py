@@ -730,6 +730,20 @@ class OpenAIProvider(CullingProvider):
         estimated_tokens = estimate_tokens_for_b64_image(image_b64, self.model) + _ESTIMATED_PROMPT_TEXT_TOKENS
         return self._chat_completion(messages, estimated_tokens)
 
+    def ask_json_images(self, instructions: str, images: list[tuple[str, str]]) -> tuple[str | None, float]:
+        """:meth:`ask_json` for several images in one request: *images* is a
+        list of ``(label, image_b64)``, each label sent as text just before
+        its image. Same throttled, cost-tracked request path; raises on a
+        failed request."""
+        content: list[dict] = [{"type": "text", "text": instructions}]
+        estimated_tokens = _ESTIMATED_PROMPT_TEXT_TOKENS
+        for label, image_b64 in images:
+            frame = BurstFrameInput(file=label, image_b64=image_b64, face_bbox=None, sharpness_score=0.0)
+            content.append({"type": "text", "text": label})
+            content.append(self._image_url_content(frame))
+            estimated_tokens += estimate_tokens_for_b64_image(image_b64, self.model)
+        return self._chat_completion([{"role": "user", "content": content}], estimated_tokens)
+
     def _chat_completion(self, messages: list[dict], estimated_tokens: int) -> tuple[str | None, float]:
         """POST one chat-completions request, throttled by the live
         token/request budgets, and return ``(raw_content, elapsed_seconds)``.
@@ -762,12 +776,16 @@ class OpenAIProvider(CullingProvider):
         """
         import openai
         kwargs = dict(model=self.model, messages=messages, response_format={"type": "json_object"})
-        if self._temperature_supported is not False:
+        sent_temperature = self._temperature_supported is not False
+        if sent_temperature:
             kwargs["temperature"] = 0
         try:
             return self._client.chat.completions.with_raw_response.create(**kwargs)
         except openai.BadRequestError as exc:
-            if self._temperature_supported is False or exc.param != "temperature" or exc.code != "unsupported_value":
+            # Judged by what THIS request sent, not by the shared flag: with
+            # concurrent requests another thread may already have flipped it
+            # while this one was in flight, and this one must still retry.
+            if not sent_temperature or exc.param != "temperature" or exc.code != "unsupported_value":
                 raise
             with self._limits_lock:
                 if self._temperature_supported is None:

@@ -184,6 +184,19 @@ class PlayerVideoRenderRequest(BaseModel):
     fps: float = DEFAULT_FPS
 
 
+class BatchAutoEditRequest(BaseModel):
+    destination: str
+    # None = keep each photo's framing; otherwise the Auto crop to apply:
+    # "instagram" (4:5) or "original" (the photo's own ratio).
+    resize: Optional[str] = None
+    sharpen: bool = False
+    # None = every player; otherwise only photos this tagged player is in,
+    # sharpening only them and building the crop around them.
+    player: Optional[str] = None
+    # Photos at or above this star rating are processed.
+    minStars: int = 5
+
+
 class RegradeSensitivityRequest(BaseModel):
     sensitivityMode: str = "medium"       # "low" | "medium" | "high" | "custom"
     sensitivityCustomValue: float = 0.50  # used only when mode == "custom", 0-0.99
@@ -605,6 +618,19 @@ class PlayerVideoState(BackgroundJobState):
 
 player_video_state = PlayerVideoState()
 
+
+# --------------------------------------------------------------------------- #
+# Batch Auto Edit (experimental, page 5 — Album Tools): the AI Edit panel's
+# Auto crop and Sharpen players over every photo at or above a star rating,
+# written to a user-chosen destination folder. Same background-job pattern.
+# --------------------------------------------------------------------------- #
+class BatchAutoEditState(BackgroundJobState):
+    def reset(self) -> None:
+        super().reset()
+        self.output_dir: Optional[str] = None
+
+
+batch_auto_edit_state = BatchAutoEditState()
 
 # --------------------------------------------------------------------------- #
 # Face-DB rebuild (Players page) — flush deleted crops, then re-run
@@ -3075,6 +3101,310 @@ def _run_player_video(album_path: Path, dest_dir: Path, fps: float) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Batch Auto Edit worker. Two phases: PLAN (ask the LLM for every photo's
+# crop, batched, and work out which bodies to sharpen from the stored
+# detections: no local model runs) then PROCESS (one autoedit.py --jobs-file
+# run, so the sharpen models load once for the whole batch).
+# --------------------------------------------------------------------------- #
+BATCH_AUTO_EDIT_SUFFIX = "_ai_edited"
+_BATCH_DECODE_WORKERS = 4
+
+
+def _batch_log(msg: str) -> None:
+    batch_auto_edit_state.log(msg)
+    log.info("[BatchAutoEdit] %s", msg)
+
+
+def _batch_player_names(album_path: Path) -> list[str]:
+    """Every player name the album's face recognition has put in a named
+    cluster (automatic database matches and hand-assigned names alike), for
+    Batch Auto Edit's player picker."""
+    names = {name for faces in _face_name_index(album_path).values() for _box, name in faces}
+    return sorted(names, key=lambda name: (name.lower(), name))
+
+
+def _batch_player_body_ids(album_path: Path, image: AlbumImage, player: str) -> list[int]:
+    """Indices (into ``image.bodies``) of the people in *image* the face
+    recognition names *player*; empty when the player isn't in the photo."""
+    boxes = [box for box, name in _face_name_index(album_path).get(image.key, []) if name == player]
+    if not boxes:
+        return []
+    ids = []
+    for index, body in enumerate(image.bodies):
+        bbox = body.body_bbox
+        if bbox is not None and any(_boxes_match(box, bbox.to_wire()) for box in boxes):
+            ids.append(index)
+    return ids
+
+
+def _batch_candidates(album_path: Path, min_stars: int, player: Optional[str] = None) -> list[dict]:
+    """The photos a batch processes: every reviewable photo at or above
+    *min_stars* (the effective rating the Culling page and export use), by
+    file name; with *player*, only those the player appears in."""
+    images = [im for im in _all_culling_images(album_path, with_timestamp=False) if im["stars"] >= min_stars]
+    if player:
+        album = album_for(album_path)
+        images = [
+            im for im in images
+            if (record := album.image(im["file"])) is not None and _batch_player_body_ids(album_path, record, player)
+        ]
+    images.sort(key=lambda im: im["file"].lower())
+    return images
+
+
+def _batch_output_names(keys: list[str]) -> dict[str, str]:
+    """Output file name of each photo key: ``<stem>_ai_edited.jpg``. Photos
+    sharing a stem (a RAW + JPEG pair of one shot) also carry their
+    extension, ``<stem>_<EXT>_ai_edited.jpg``, so none overwrites another;
+    names are compared case-insensitively, as Windows does."""
+    stem_counts: dict[str, int] = {}
+    for key in keys:
+        stem_counts[Path(key).stem.lower()] = stem_counts.get(Path(key).stem.lower(), 0) + 1
+    used: set[str] = set()
+    names: dict[str, str] = {}
+    for key in keys:
+        path = Path(key)
+        stem = path.stem
+        if stem_counts[stem.lower()] > 1:
+            stem = f"{stem}_{path.suffix.lstrip('.').upper()}"
+        name = f"{stem}{BATCH_AUTO_EDIT_SUFFIX}.jpg"
+        n = 2
+        while name.lower() in used:
+            name = f"{stem}{BATCH_AUTO_EDIT_SUFFIX}_{n}.jpg"
+            n += 1
+        used.add(name.lower())
+        names[key] = name
+    return names
+
+
+def _batch_sharpen_entries(bodies, selected: Optional[list[int]] = None) -> list[dict]:
+    """--jobs-file "boxes" for a photo: the bodies to sharpen and every other
+    body as "protect", so only the sharpened ones are ever touched. By default
+    the sharpened bodies are the teammates the album tagged (the ones the AI
+    Edit panel preselects, by jersey colour); *selected* (indices into
+    *bodies*) is the chosen player instead. Empty when none of them has a
+    box."""
+    if selected is None:
+        selected = [index for index, body in enumerate(bodies) if body.is_teammate]
+    entries = _selected_body_entries(bodies, selected)
+    if not entries:
+        return []
+    return entries + _protected_body_entries(bodies, selected)
+
+
+def _batch_focus_box(bodies, selected: list[int]) -> Optional[tuple[float, float, float, float]]:
+    """The box around the chosen player's body (several if the face
+    recognition named more than one in a photo), normalised, or None."""
+    boxes = [box for index in selected if 0 <= index < len(bodies) and (box := _body_box(bodies[index], None))]
+    if not boxes:
+        return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def _batch_crop_input(path: Path):
+    """Decodes the original at *path* and shrinks it for the model; returns
+    ``((width, height) of the original, base64 JPEG, (width, height) shown)``
+    or None when it can't be read."""
+    import base64
+
+    import cv2  # lazy: pulls in the CV stack
+    import autoedit
+    from algo.llm import auto_crop
+
+    full = autoedit.read_image(path)
+    if full is None:
+        return None
+    height, width = full.shape[:2]
+    small = full
+    scale = auto_crop.AUTO_CROP_IMAGE_LONG_EDGE / max(height, width)
+    if scale < 1.0:
+        small = cv2.resize(full, (max(1, round(width * scale)), max(1, round(height * scale))),
+                           interpolation=cv2.INTER_AREA)
+    del full
+    jpeg = _encode_jpeg(small, auto_crop.AUTO_CROP_JPEG_QUALITY)
+    return (width, height), base64.b64encode(jpeg).decode("ascii"), (small.shape[1], small.shape[0])
+
+
+def _batch_plan_crops(
+    plans: dict[str, dict], choice: str, api_key: str, jersey_color: str,
+) -> None:
+    """Fills ``plans[key]["crop"]`` (x, y, w, h in pixels of the original) with
+    the LLM's *choice* crop for every photo it answered, and
+    ``plans[key]["asked"]`` with whether it did. Photos go to the model in
+    batches (auto_crop.AUTO_CROP_BATCH_SIZE per request, run concurrently);
+    those a batch left out get one request each."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from algo.llm import auto_crop
+
+    keys = list(plans)
+    _batch_log(f"Preparing {len(keys)} photo(s) for the model…")
+    sizes: dict[str, tuple[int, int]] = {}
+    photos: list = []
+    step = max(1, len(keys) // 10)
+
+    def prepare(key: str):
+        try:
+            return _batch_crop_input(plans[key]["source"])
+        except Exception as exc:  # noqa: BLE001 — one unreadable photo must not sink the batch
+            log.warning("[BatchAutoEdit] could not prepare %s: %s", key, exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=_BATCH_DECODE_WORKERS) as pool:
+        results = pool.map(prepare, keys)
+        for number, (key, prepared) in enumerate(zip(keys, results), start=1):
+            if prepared is None:
+                _batch_log(f"  Could not read {Path(key).name}; it will not be cropped.")
+            else:
+                sizes[key] = prepared[0]
+                shown_w, shown_h = prepared[2]
+                photos.append(auto_crop.CropPhoto(
+                    file=key, image_b64=prepared[1], width=shown_w, height=shown_h, focus=plans[key].get("focus"),
+                ))
+            if number % step == 0 or number == len(keys):
+                _batch_log(f"  {number}/{len(keys)} prepared")
+
+    provider = auto_crop.make_provider(api_key)
+    batches = auto_crop.split_batches(photos)
+    colour = auto_crop.describe_jersey_color(jersey_color)
+    _batch_log(
+        f"Asking {provider.model} for the {_AUTO_CROP_LABELS.get(choice, choice)} crop of {len(photos)} photo(s) in "
+        f"{len(batches)} request(s) of up to {auto_crop.AUTO_CROP_BATCH_SIZE}"
+        + (", centred on the chosen player" if any(p.focus for p in photos)
+           else f", looking for players in {colour}" if colour else "") + "…"
+    )
+
+    def progress(done: int, total: int, error) -> None:
+        _batch_log(f"  {done}/{total} request(s) done" + (f" (one failed: {error})" if error else ""))
+
+    merged: dict = {}
+    for answer in auto_crop.suggest_crops_batches(provider, batches, jersey_color=jersey_color, on_batch_done=progress):
+        merged.update(answer)
+    missing = [p for p in photos if choice not in merged.get(p.file, {})]
+    if missing:
+        _batch_log(f"The model skipped {len(missing)} photo(s); asking again for each one…")
+        for answer in auto_crop.suggest_crops_batches(
+            provider, [[p] for p in missing], jersey_color=jersey_color, on_batch_done=progress,
+        ):
+            merged.update(answer)
+    _batch_log(f"Crops received (cost so far ${provider.get_cost_summary().total_cost_usd:.4f}).")
+
+    for key, (width, height) in sizes.items():
+        suggestion = merged.get(key, {}).get(choice)
+        if suggestion is None:
+            continue
+        plans[key]["asked"] = True
+        x1, y1, x2, y2 = auto_crop.fit_box_to_ratio(
+            suggestion.box, auto_crop.crop_ratio(choice, width, height), width, height
+        )
+        plans[key]["crop"] = _clamp_crop_px(
+            CropRect(x=round(x1 * width), y=round(y1 * height),
+                     w=round((x2 - x1) * width), h=round((y2 - y1) * height)),
+            width, height,
+        )
+
+
+def _run_batch_auto_edit(
+    album_dir: Path, dest_dir: Path, resize: Optional[str], sharpen: bool, min_stars: int,
+    api_key: str, jersey_color: str, player: Optional[str] = None,
+) -> None:
+    try:
+        import tempfile
+
+        started = time.time() - 1.0
+        images = _batch_candidates(album_dir, min_stars, player)
+        album = album_for(album_dir)
+        names = _batch_output_names([im["file"] for im in images])
+        _batch_log(
+            f"{len(images)} photo(s) at {min_stars}+ stars" + (f" with {player}" if player else "") + "."
+        )
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with batch_auto_edit_state.lock:
+            batch_auto_edit_state.output_dir = str(dest_dir)
+
+        plans: dict[str, dict] = {}
+        for im in images:
+            key, source = im["file"], Path(im["path"])
+            if not source.is_file():
+                _batch_log(f"  {key}: the original is missing; skipped.")
+                continue
+            record = album.image(key)
+            bodies = record.bodies if record is not None else []
+            chosen = _batch_player_body_ids(album_dir, record, player) if player and record is not None else None
+            entries = []
+            if sharpen:
+                entries = _batch_sharpen_entries(bodies, chosen)
+            plans[key] = {
+                "source": source, "out_file": dest_dir / names[key],
+                "boxes": entries, "crop": None, "asked": False,
+                "focus": _batch_focus_box(bodies, chosen) if chosen else None,
+            }
+        if sharpen:
+            with_targets = sum(1 for p in plans.values() if p["boxes"])
+            _batch_log(
+                f"{with_targets} of {len(plans)} photo(s) have "
+                + (f"{player} to sharpen (inside the player's box)" if player else "teammates to sharpen")
+                + "; the rest, and any whose player can't be segmented, are sharpened whole (no face enhancement)."
+            )
+            if plans and not with_targets and not player:
+                _batch_log(
+                    "  No teammates were found. An album imported before teammates were tagged needs "
+                    "Team Jersey Colour → Apply to tag them."
+                )
+        if resize and plans:
+            _batch_plan_crops(plans, resize, api_key, jersey_color)
+
+        jobs, skipped = [], 0
+        for key, plan in plans.items():
+            # Nothing to do for this photo: not sharpening, and no crop was obtained.
+            if not sharpen and plan["crop"] is None and not (resize and plan["asked"]):
+                skipped += 1
+                _batch_log(f"  {Path(key).name}: nothing to apply; skipped.")
+                continue
+            jobs.append({
+                "source": str(plan["source"]), "out_file": str(plan["out_file"]),
+                "crop": list(plan["crop"]) if plan["crop"] else None, "boxes": plan["boxes"],
+                "strict_box": bool(player), "sharpen": bool(sharpen),
+            })
+        if not jobs:
+            raise RuntimeError("There was nothing to process.")
+
+        _batch_log(f"Processing {len(jobs)} photo(s) into {dest_dir}…")
+        with tempfile.TemporaryDirectory(prefix="batch_auto_edit_") as tmp:
+            jobs_file = Path(tmp) / "jobs.json"
+            jobs_file.write_text(json.dumps(jobs), encoding="utf-8")
+            cmd = [sys.executable, str(REPO_ROOT / "autoedit.py"), "--jobs-file", str(jobs_file)]
+            if any(job["boxes"] for job in jobs):
+                cmd.append("--face-enhance")
+            _stream_subprocess(cmd, log_fn=_batch_log)
+
+        written = [job for job in jobs if Path(job["out_file"]).is_file() and Path(job["out_file"]).stat().st_mtime >= started]
+        result = {
+            "processed": len(written),
+            "failed": len(jobs) - len(written),
+            "skipped": skipped,
+            "cropped": sum(1 for job in written if job["crop"]),
+            "sharpened": sum(1 for job in written if job["sharpen"]),
+            "outputDir": str(dest_dir),
+        }
+        _batch_log(
+            f"Done: {result['processed']} written, {result['failed']} failed, {skipped} skipped "
+            f"({result['cropped']} cropped, {result['sharpened']} sharpened)."
+        )
+        with batch_auto_edit_state.lock:
+            batch_auto_edit_state.result = result
+            if result["failed"]:
+                batch_auto_edit_state.error = f"{result['failed']} photo(s) could not be processed."
+            batch_auto_edit_state.done = True
+    except Exception as exc:  # noqa: BLE001 — surface any failure (network, key, model) to the UI
+        log.exception("[BatchAutoEdit] failed")
+        with batch_auto_edit_state.lock:
+            batch_auto_edit_state.error = str(exc)
+    finally:
+        batch_auto_edit_state.mark_stopped()
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI app
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="Photo Culling UI")
@@ -4382,6 +4712,84 @@ def api_player_video_open_folder() -> dict:
         output_dir = player_video_state.output_dir
     if not output_dir or not Path(output_dir).is_dir():
         raise HTTPException(status_code=400, detail="No output folder yet — render at least once first.")
+    _open_in_file_explorer(Path(output_dir))
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/batch-auto-edit/players")
+def api_batch_auto_edit_players() -> dict:
+    """The tagged players Batch Auto Edit can be limited to."""
+    return {"players": _batch_player_names(_current_album_path())}
+
+
+@app.get("/api/album-tools/batch-auto-edit/summary")
+def api_batch_auto_edit_summary(minStars: int = 5, player: str = "") -> dict:
+    """How many photos a batch at *minStars* or more (of *player*, when
+    given) would process."""
+    count = len(_batch_candidates(_current_album_path(), max(1, min(5, minStars)), player.strip() or None))
+    return {"count": count}
+
+
+@app.post("/api/album-tools/batch-auto-edit/start")
+def api_batch_auto_edit_start(req: BatchAutoEditRequest) -> dict:
+    """Start Batch Auto Edit: Auto crop (when *resize* is set) and Sharpen
+    players over every photo at or above *minStars* (only those of *player*,
+    when given), written to the destination as <name>_ai_edited.jpg. Poll
+    .../status."""
+    album_path = _current_album_path()
+    destination = req.destination.strip()
+    if not destination:
+        raise HTTPException(status_code=400, detail="Destination folder is required.")
+    dest_path = Path(destination)
+    if dest_path.is_file():
+        raise HTTPException(status_code=400, detail="Destination is a file, not a folder.")
+    if req.resize not in (None, "instagram", "original"):
+        raise HTTPException(status_code=400, detail="Resize must be 'instagram' or 'original'.")
+    if not req.resize and not req.sharpen:
+        raise HTTPException(status_code=400, detail="Turn on Resize and/or Sharpen players.")
+    player = (req.player or "").strip() or None
+    if player and player not in _batch_player_names(album_path):
+        raise HTTPException(status_code=400, detail=f"{player} is not a tagged player in this album.")
+    min_stars = max(1, min(5, req.minStars))
+    if not _batch_candidates(album_path, min_stars, player):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No photos of {player} have {min_stars}+ stars." if player else f"No photos have {min_stars}+ stars.",
+        )
+    api_key = ""
+    if req.resize:
+        team = _resolve_team(_album_team_id(album_path))
+        api_key = team.openaiApiKey or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Resize needs an OpenAI API key. Add one on the Team page.",
+            )
+    if processing_state.running or export_state.running:
+        raise HTTPException(status_code=409, detail="An import, edit or export is running — try again when it finishes.")
+    if not batch_auto_edit_state.claim():
+        raise HTTPException(status_code=409, detail="A batch auto edit is already running.")
+
+    threading.Thread(
+        target=_run_batch_auto_edit,
+        args=(album_path, dest_path, req.resize, req.sharpen, min_stars, api_key, _album_jersey_color(album_path),
+              player),
+        daemon=True,
+    ).start()
+    return {"ok": True}
+
+
+@app.get("/api/album-tools/batch-auto-edit/status")
+def api_batch_auto_edit_status(since: int = 0) -> dict:
+    return batch_auto_edit_state.status(since)
+
+
+@app.post("/api/album-tools/batch-auto-edit/open-folder")
+def api_batch_auto_edit_open_folder() -> dict:
+    with batch_auto_edit_state.lock:
+        output_dir = batch_auto_edit_state.output_dir
+    if not output_dir or not Path(output_dir).is_dir():
+        raise HTTPException(status_code=400, detail="No output folder yet — run a batch first.")
     _open_in_file_explorer(Path(output_dir))
     return {"ok": True}
 

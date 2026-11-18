@@ -14,6 +14,7 @@ Usage:
     python autoedit.py photo.cr3 -o ./edited -ext png
     python autoedit.py photo.jpg -pipelines tone --crop 100,50,1600,2000
     python autoedit.py photo.jpg -pipelines tone --rotate 1.5
+    python autoedit.py --jobs-file jobs.json --face-enhance
 
 Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     tone             Highlights/midtones/shadows exposure (EV) + contrast,
@@ -24,10 +25,13 @@ Available pipelines (see PIPELINE_ORDER for the canonical execution order):
     brightness       Auto exposure correction (highlight-safe gamma).
     aisharpen        Real-ESRGAN (realesr-general-x4v3, compact) detail
                      restoration at input resolution. Optional GFPGAN
-                     face-enhance pass via --face-enhance (off by default).
+                     face-enhance pass via --face-enhance (off by default),
+                     applied only to segmented players.
                      With --boxes-file, sharpens+blends only the detected
                      players instead of the whole frame — see
-                     AI_SHARPEN_SCOPE/sharpen_bodies() below.
+                     AI_SHARPEN_SCOPE/sharpen_bodies() below. When no player
+                     could be segmented (or none was given) the whole frame
+                     is sharpened instead, without face enhancement.
     openai_autoedit  Generative retouch via the OpenAI image model.
     openai_ig        Generative heroic 4:5 Instagram reframe.
 
@@ -886,8 +890,9 @@ class SharpenProcessor(ABC):
     """
 
     @abstractmethod
-    def process(self, image: np.ndarray) -> np.ndarray:
-        """Return *image* sharpened, at the same resolution."""
+    def process(self, image: np.ndarray, face_enhance: bool = True) -> np.ndarray:
+        """Return *image* sharpened, at the same resolution. *face_enhance*
+        False skips the face-restoration pass even when the processor has one."""
 
     @property
     @abstractmethod
@@ -964,7 +969,7 @@ class LocalSharpenProcessor(SharpenProcessor):
         )
         return upsampler, face_enhancer
 
-    def process(self, image: np.ndarray) -> np.ndarray:
+    def process(self, image: np.ndarray, face_enhance: bool = True) -> np.ndarray:
         if self._upsampler is None:
             with LocalSharpenProcessor._build_lock:
                 if self._upsampler is None:
@@ -978,7 +983,7 @@ class LocalSharpenProcessor(SharpenProcessor):
         # wrong attribute here would silently no-op and always process the
         # whole image untiled, regardless of size.
         self._upsampler.tile_size = _pick_tile_size(image, self._device, self._spec)
-        if self._face_enhancer is not None:
+        if self._face_enhancer is not None and face_enhance:
             _, _, output = self._face_enhancer.enhance(
                 image, has_aligned=False, only_center_face=False, paste_back=True
             )
@@ -996,6 +1001,7 @@ class LocalSharpenProcessor(SharpenProcessor):
 @dataclass
 class _SharpenJob:
     image: np.ndarray
+    face_enhance: bool = True
     done: threading.Event = field(default_factory=threading.Event)
     result: np.ndarray | None = None
     error: BaseException | None = None
@@ -1015,10 +1021,16 @@ class SharpenDispatcher:
     _CPU_POLL_SECONDS = 0.05
 
     def __init__(
-        self, model_spec: SharpenModelSpec | None = None, face_enhance: bool = False,
+        self,
+        model_spec: SharpenModelSpec | None = None,
+        face_enhance: bool = False,
+        cpu_spillover: bool = True,
     ) -> None:
         self._model_spec = model_spec or SHARPEN_MODELS[DEFAULT_SHARPEN_MODEL]
         self._face_enhance = face_enhance
+        # Without it the CPU processor (a whole second copy of the models in
+        # RAM) is only created when there is no GPU to run on.
+        self._cpu_spillover = cpu_spillover
         self._queue: queue.Queue[_SharpenJob | None] = queue.Queue()
         self._lock = threading.Lock()
         self._gpu_busy = 0
@@ -1044,6 +1056,9 @@ class SharpenDispatcher:
                 f"sharpen-{device}",
             )
 
+        if self._gpu_count and not self._cpu_spillover:
+            log.info("Sharpen processor: cpu (not loaded, the GPU does all the work)")
+            return
         log.info(
             "Sharpen processor: cpu (%s)",
             "sole worker" if self._gpu_count == 0 else "spillover only",
@@ -1059,8 +1074,11 @@ class SharpenDispatcher:
         thread.start()
         self._threads.append(thread)
 
-    def submit(self, image: np.ndarray) -> np.ndarray:
-        job = _SharpenJob(image=image)
+    def submit(self, image: np.ndarray, face_enhance: bool = True) -> np.ndarray:
+        """Sharpen *image*, blocking until done. *face_enhance* False skips
+        the face-restoration pass for this one image (whole-frame sharpening
+        never face-enhances; see AiSharpenPipeline)."""
+        job = _SharpenJob(image=image, face_enhance=face_enhance)
         self._queue.put(job)
         job.done.wait()
         if job.error is not None:
@@ -1078,7 +1096,7 @@ class SharpenDispatcher:
     @staticmethod
     def _run(processor: SharpenProcessor, job: _SharpenJob) -> None:
         try:
-            job.result = processor.process(job.image)
+            job.result = processor.process(job.image, job.face_enhance)
         except BaseException as exc:  # surfaced to the waiting file worker
             job.error = exc
         finally:
@@ -1120,14 +1138,16 @@ class SharpenDispatcher:
 def _box_clip_mask(
     shape_hw: tuple[int, int],
     box_px: tuple[float, float, float, float],
+    margin_pct: float = BODY_SHARPEN_CLIP_MARGIN_PCT,
 ) -> np.ndarray:
     """Float32 [0, 1] mask of *shape_hw* that is 1 inside *box_px*
     (x1, y1, x2, y2 in the mask's own pixel coordinates), grown by
-    BODY_SHARPEN_CLIP_MARGIN_PCT and feathered by BODY_SHARPEN_CLIP_FEATHER_PX."""
+    *margin_pct* of the box's size (BODY_SHARPEN_CLIP_MARGIN_PCT by default)
+    and feathered by BODY_SHARPEN_CLIP_FEATHER_PX."""
     height, width = shape_hw
     x1, y1, x2, y2 = box_px
-    margin_x = (x2 - x1) * BODY_SHARPEN_CLIP_MARGIN_PCT
-    margin_y = (y2 - y1) * BODY_SHARPEN_CLIP_MARGIN_PCT
+    margin_x = (x2 - x1) * margin_pct
+    margin_y = (y2 - y1) * margin_pct
     cx1 = max(0, int(round(x1 - margin_x)))
     cy1 = max(0, int(round(y1 - margin_y)))
     cx2 = min(width, int(round(x2 + margin_x)))
@@ -1320,6 +1340,8 @@ def sharpen_bodies(
     keypoints_norm: list[list[tuple[float, float, float]]] | None = None,
     protected_norm: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None,
     debug_layers: dict[str, np.ndarray] | None = None,
+    clip_margin_pct: float = BODY_SHARPEN_CLIP_MARGIN_PCT,
+    report: dict | None = None,
 ) -> np.ndarray:
     """Sharpen only the given players, leaving the rest of *image*
     pixel-identical to the source.
@@ -1366,6 +1388,15 @@ def sharpen_bodies(
     Logs every box it was given and, per box, whether segmentation worked
     (and how much of the crop it marked as person) or why the box was skipped.
     *label* (usually the photo's file name) prefixes those lines.
+
+    *clip_margin_pct* is how far past each player's own box the sharpening
+    may reach, as a fraction of the box's size (BODY_SHARPEN_CLIP_MARGIN_PCT
+    by default, so an arm or leg poking out of the detector's box isn't cut
+    off); 0 keeps it strictly inside the box.
+
+    *report*, if given, is filled with ``{"sharpened": n, "total": m}``: how
+    many of the boxes were actually sharpened. AiSharpenPipeline uses it to
+    fall back to whole-frame sharpening when none was.
     """
     from algo.segmentation import DEFAULT_SEGMENTER_BACKEND, get_segmenter
 
@@ -1463,6 +1494,7 @@ def sharpen_bodies(
         mask = mask * _box_clip_mask(
             crop.shape[:2],
             (x1 * img_w - px1, y1 * img_h - py1, x2 * img_w - px1, y2 * img_h - py1),
+            margin_pct=clip_margin_pct,
         )
 
         alpha = np.clip(mask, 0.0, 1.0)[..., None]
@@ -1480,6 +1512,8 @@ def sharpen_bodies(
 
     log.info("%sBody sharpen: %d/%d box(es) sharpened, %d skipped",
              prefix, sharpened, total, total - sharpened)
+    if report is not None:
+        report.update(sharpened=sharpened, total=total)
     return result
 
 
@@ -1595,6 +1629,9 @@ class EditContext:
     # keypoints) pairs — --boxes-file entries marked "protect" (see
     # sharpen_bodies()'s protected_norm).
     protected_bodies: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] | None = None
+    # Keep sharpening strictly inside each body's own box (no margin past it);
+    # --jobs-file "strict_box".
+    strict_box: bool = False
     # Debug (--save-silhouette): folder to write the body-sharpen debug images
     # into (see _save_sharpen_debug()); None = don't. `original` is the photo
     # as read from disk (set only when silhouette_dir is), and
@@ -1653,22 +1690,30 @@ class AiSharpenPipeline(EditPipeline):
         assert ctx.dispatcher is not None
         if AI_SHARPEN_SCOPE == "bodies" and ctx.body_boxes:
             debug_layers: dict[str, np.ndarray] | None = {} if ctx.silhouette_dir is not None else None
+            report: dict = {}
             result = sharpen_bodies(
                 image, ctx.body_boxes, ctx.dispatcher, label=ctx.source.name,
                 keypoints_norm=ctx.body_keypoints, protected_norm=ctx.protected_bodies,
                 debug_layers=debug_layers,
+                clip_margin_pct=0.0 if ctx.strict_box else BODY_SHARPEN_CLIP_MARGIN_PCT,
+                report=report,
             )
-            if debug_layers:
-                _save_sharpen_debug(debug_layers, ctx)
-            elif debug_layers is not None:
+            if report.get("sharpened"):
+                if debug_layers:
+                    _save_sharpen_debug(debug_layers, ctx)
+                return result
+            if debug_layers is not None:
                 log.warning("[%s] save_silhouette: no body was sharpened, nothing to save", ctx.source.name)
-            return result
-        reason = (
-            f"AI_SHARPEN_SCOPE={AI_SHARPEN_SCOPE!r}" if AI_SHARPEN_SCOPE != "bodies"
-            else "no body boxes were passed in for this photo"
-        )
-        log.info("[%s] Sharpening the whole frame (%s)", ctx.source.name, reason)
-        return ctx.dispatcher.submit(image)
+            reason = "no player could be segmented"
+        else:
+            reason = (
+                f"AI_SHARPEN_SCOPE={AI_SHARPEN_SCOPE!r}" if AI_SHARPEN_SCOPE != "bodies"
+                else "no body boxes were passed in for this photo"
+            )
+        # No segmented player to sharpen: sharpen the whole frame, without the
+        # face-restoration pass, which only ever runs on segmented players.
+        log.info("[%s] Sharpening the whole frame, without face enhancement (%s)", ctx.source.name, reason)
+        return ctx.dispatcher.submit(image, face_enhance=False)
 
 
 # JPEG quality of the debug images (--save-silhouette): effectively lossless.
@@ -1800,6 +1845,7 @@ def process_one(
     silhouette_dir: Path | None = None,
     crop: tuple[int, int, int, int] | None = None,
     rotate: float = 0.0,
+    strict_box: bool = False,
 ) -> Path | None:
     image = read_image(source)
     if image is None:
@@ -1810,7 +1856,7 @@ def process_one(
     ctx = EditContext(
         source=source, dispatcher=dispatcher, openai_client=openai_client,
         body_boxes=body_boxes, body_keypoints=body_keypoints, tone=tone,
-        protected_bodies=protected_bodies, silhouette_dir=silhouette_dir,
+        protected_bodies=protected_bodies, silhouette_dir=silhouette_dir, strict_box=strict_box,
         # No pipeline mutates its input, so the untouched original is kept by reference.
         original=image if silhouette_dir is not None else None,
     )
@@ -1885,6 +1931,114 @@ def _parse_boxes_file(raw: dict) -> tuple[
     return boxes_by_name, keypoints_by_name, protected_by_name
 
 
+@dataclass
+class EditJob:
+    """One photo of a --jobs-file run: where it is read from and written to,
+    the crop to apply (source pixels) and the bodies to sharpen/protect. A job
+    sharpens iff it has at least one body to sharpen; it never falls back to
+    whole-frame sharpening."""
+
+    source: Path
+    out_file: Path
+    crop: tuple[int, int, int, int] | None = None
+    boxes: list[tuple[float, float, float, float]] = field(default_factory=list)
+    keypoints: list[list[tuple[float, float, float]]] = field(default_factory=list)
+    protected: list[tuple[tuple[float, float, float, float], list[tuple[float, float, float]]]] = field(
+        default_factory=list
+    )
+    # Keep each body's sharpening strictly inside its own box (see sharpen_bodies()'s clip_margin_pct).
+    strict_box: bool = False
+    # Run the aisharpen pipeline on this photo: the bodies in `boxes` when
+    # any is segmented, else the whole frame (see AiSharpenPipeline). Defaults
+    # to "has a body to sharpen" so a job without it behaves as before.
+    sharpen: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.sharpen is None:
+            self.sharpen = bool(self.boxes)
+
+    @property
+    def sharpens(self) -> bool:
+        return bool(self.sharpen)
+
+
+def load_jobs_file(path: Path) -> list[EditJob]:
+    """Reads --jobs-file: a JSON list of {"source", "out_file", "crop":
+    [x, y, w, h] | null, "boxes": [...], "strict_box": bool, "sharpen": bool}
+    objects, "boxes" being --boxes-file entries (see its --help), "strict_box"
+    keeping each body's sharpening strictly inside its own box and "sharpen"
+    (default: there are boxes) running the sharpen step, whole-frame when no
+    body is segmented. Malformed jobs are logged and skipped; raises
+    OSError/ValueError when the file itself can't be read."""
+    raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, list):
+        raise ValueError("a jobs file must contain a JSON list")
+    jobs: list[EditJob] = []
+    for index, item in enumerate(raw, start=1):
+        try:
+            source, out_file = Path(item["source"]), Path(item["out_file"])
+            crop = item.get("crop")
+            crop = tuple(int(round(float(v))) for v in crop) if crop else None
+            if crop is not None and (len(crop) != 4 or crop[2] <= 0 or crop[3] <= 0):
+                raise ValueError("crop must be [x, y, w, h] with a positive size")
+            boxes, keypoints, protected = _parse_boxes_file({source.name: item.get("boxes") or []})
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            log.warning("Jobs file entry %d skipped: %s", index, exc)
+            continue
+        sharpen = item.get("sharpen")
+        jobs.append(EditJob(
+            source=source, out_file=out_file, crop=crop, strict_box=bool(item.get("strict_box")),
+            boxes=boxes[source.name], keypoints=keypoints[source.name], protected=protected[source.name],
+            sharpen=None if sharpen is None else bool(sharpen),
+        ))
+    return jobs
+
+
+def run_jobs(jobs: list[EditJob], args: argparse.Namespace) -> int:
+    """Runs every job in this one process, so the sharpen models (and the
+    body segmenter) load once for the whole batch, and only if some job
+    sharpens. Jobs with bodies to sharpen go first so the GPU is busy from the
+    start. A job's photo is sharpened by AiSharpenPipeline: its segmented
+    bodies with face enhancement, or, when none can be segmented (or it has no
+    bodies), the whole frame without it; so GFPGAN is only loaded when some
+    job has bodies. Returns the number of jobs that failed."""
+    pipelines = [AiSharpenPipeline()]
+    dispatcher = None
+    if any(job.sharpens for job in jobs):
+        face_enhance = bool(args.face_enhance) and any(job.boxes for job in jobs if job.sharpens)
+        dispatcher = SharpenDispatcher(
+            SHARPEN_MODELS[args.sharpen_model], face_enhance, cpu_spillover=False
+        )
+        dispatcher.start()
+    else:
+        log.info("No photo needs sharpening; the sharpen models are not loaded.")
+
+    log.info(
+        "Processing %d image(s): %d with bodies to sharpen, %d sharpened whole-frame if no body is found, %d crop-only",
+        len(jobs), sum(1 for job in jobs if job.sharpens and job.boxes),
+        sum(1 for job in jobs if job.sharpens and not job.boxes), sum(not job.sharpens for job in jobs),
+    )
+    ordered = sorted(jobs, key=lambda job: (not job.sharpens, not job.boxes))
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            results = pool.map(
+                lambda job: process_one(
+                    job.source, pipelines if job.sharpens else [], args.output, args.ext, args.compression,
+                    dispatcher, None, out_file=job.out_file,
+                    body_boxes=job.boxes or None, body_keypoints=job.keypoints or None,
+                    protected_bodies=job.protected or None, crop=job.crop, strict_box=job.strict_box,
+                ),
+                ordered,
+            )
+            succeeded = sum(1 for result in results if result is not None)
+    finally:
+        if dispatcher is not None:
+            dispatcher.shutdown()
+    failed = len(jobs) - succeeded
+    log.info("Done. %d succeeded, %d failed.", succeeded, failed)
+    return failed
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1896,8 +2050,25 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "inputPath", type=Path,
-        help="An image, a directory of images (non-recursive), or a newline-delimited list file.",
+        "inputPath", type=Path, nargs="?", default=None,
+        help=(
+            "An image, a directory of images (non-recursive), or a newline-delimited list file. "
+            "Not used with --jobs-file."
+        ),
+    )
+    parser.add_argument(
+        "--jobs-file", type=Path, default=None, metavar="PATH",
+        help=(
+            "Batch mode: a JSON list of {\"source\", \"out_file\", \"crop\": [x, y, w, h] or null, "
+            "\"boxes\": [...], \"strict_box\": bool, \"sharpen\": bool} jobs, each photo with its own "
+            "output file, crop (source pixels) and --boxes-file style body entries. A job that "
+            "sharpens (\"sharpen\", default: it has boxes) sharpens just its segmented bodies "
+            "(\"strict_box\": never past each body's own box) with face enhancement, or, when none "
+            "can be segmented or there are no boxes, the whole frame without it; the other jobs are "
+            "only cropped. Everything runs in this "
+            "one process, so the models load once (and only if some job sharpens). Replaces "
+            "inputPath, -pipelines, --out-file, --crop and --boxes-file."
+        ),
     )
     parser.add_argument(
         "-pipelines", "--pipelines", nargs="*", default=["all"], metavar="NAME",
@@ -1952,7 +2123,8 @@ def main() -> None:
     parser.add_argument(
         "--face-enhance", action="store_true",
         help="Run a GFPGAN face-restoration pass after Real-ESRGAN in the aisharpen "
-             "pipeline (off by default).",
+             "pipeline (off by default). Only applied to segmented players (see "
+             "--boxes-file); a whole-frame sharpen never face-enhances.",
     )
     parser.add_argument(
         "--boxes-file", type=Path, default=None, metavar="PATH",
@@ -2012,6 +2184,28 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if args.jobs_file is not None:
+        conflicting = [
+            flag for flag, value in (
+                ("inputPath", args.inputPath), ("--out-file", args.out_file),
+                ("--crop", args.crop), ("--boxes-file", args.boxes_file),
+            ) if value is not None
+        ]
+        if conflicting:
+            log.error("--jobs-file can't be combined with %s.", ", ".join(conflicting))
+            sys.exit(2)
+        try:
+            jobs = load_jobs_file(args.jobs_file)
+        except (OSError, ValueError) as exc:
+            log.error("Could not read --jobs-file %s: %s", args.jobs_file, exc)
+            sys.exit(1)
+        if not jobs:
+            log.error("No usable jobs in %s", args.jobs_file)
+            sys.exit(1)
+        sys.exit(1 if run_jobs(jobs, args) else 0)
+    if args.inputPath is None:
+        parser.error("inputPath is required unless --jobs-file is given")
 
     tone = None
     tone_args = (args.highlights, args.midtones, args.shadows, args.contrast)

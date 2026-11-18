@@ -1403,6 +1403,7 @@ input.image-window-path:focus { outline: none; border-color: rgba(255, 255, 255,
   cursor: pointer;
 }
 .auto-crop-choices { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.batch-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 10em)); gap: 6px; }
 .edit-slider {
   display: grid;
   grid-template-columns: 74px 1fr 38px;

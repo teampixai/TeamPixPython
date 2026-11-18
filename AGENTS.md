@@ -25,7 +25,7 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | `webui/index.html`, `webui/static/` | Older single-page UI. Not served by `culling_app.py`. |
 | `1_prep_review.py` | Import/scoring worker. Turns a folder of photos into an album. |
 | `apply_export.py` | Export worker. Copies kept photos flat to a destination, writes `players.csv`, adds EXIF star ratings (piexif). |
-| `autoedit.py` | AI Edit worker: tone (`apply_tone()`), Real-ESRGAN player sharpening, `--rotate` (Level), crop. |
+| `autoedit.py` | AI Edit worker: tone (`apply_tone()`), Real-ESRGAN player sharpening (segmented players, else the whole frame without face enhancement), `--rotate` (Level), crop. `--jobs-file` runs many photos (each with its own crop, output file, bodies and `sharpen` flag) in one process for Batch Auto Edit. |
 | `esrsharpen.py` | Standalone Real-ESRGAN/GFPGAN sharpening. |
 | `RebuildFaceDB.py` | Recomputes face-DB embeddings and calibrates match thresholds. |
 | `MigrateFaceDB.py` | One-off migration from a flat face DB to the per-team layout. |
@@ -56,7 +56,7 @@ Key `algo/` modules:
 - **Server:** `culling_app.py` serves the pages and a JSON API. Each page is a separate template and script,
   with no SPA router.
 - **Long jobs run as subprocesses** started with `sys.executable`: import (`1_prep_review.py`), export
-  (`apply_export.py`), AI Edit (`autoedit.py`), and face-DB rebuild (`RebuildFaceDB.py`, from export and
+  (`apply_export.py`), AI Edit and Batch Auto Edit (`autoedit.py`), and face-DB rebuild (`RebuildFaceDB.py`, from export and
   from the Players page). The UI polls output endpoints such as `/api/processing-output?since=N` and shows
   the log in a dialog.
 - **Rule: use the log-dialog UX for anything slow.** Any UI action that runs another Python script, or is
@@ -183,6 +183,38 @@ burst ranking) and logs each step for the log dialog. It needs the album's team 
 `OPENAI_API_KEY` in the environment). The first check fetches the suggestion and applies it; unchecking
 restores the level and crop from just before, and re-checking re-applies the same suggestion without a new
 request.
+
+**Batch Auto Edit (experimental)** is an Album Tools panel (`batch-auto-edit/*` in `culling_app.py`,
+`BatchAutoEditState`) that runs Auto crop and Sharpen players over every photo at or above a minimum star
+rating (default 5) and writes `<name>_ai_edited.jpg` into a folder picked when Start is clicked (a RAW + JPEG
+pair of one shot gets `<stem>_<EXT>_ai_edited.jpg`). It always starts from the originals and never applies tone.
+Its **Player** picker ("All Players" = no filter) lists the names in the album's named face clusters
+(`_face_name_index`); a chosen player limits the batch to photos they are in, sharpens only that player (their own
+outline, `strict_box` jobs: `sharpen_bodies(clip_margin_pct=0)` keeps it strictly inside their bounding box, with
+everyone else, teammates included, protected) and tells the LLM which box is the player to build the crop around.
+With All Players the sharpening is the teammate logic below, with the usual 5% margin past each box.
+Two phases, one job:
+- **Plan.** With Resize on, the originals are shrunk to 768 px and sent to the LLM **6 photos per request**
+  (`auto_crop.suggest_crops_batches`, the same batching idea as the import's standalone grading: one request
+  carries the editorial prompt once, each photo is labelled with its file name and size, answers are matched
+  back by file name, requests run concurrently through the shared throttled `OpenAIProvider`). A photo a batch
+  left out is asked again on its own; one that still gets no answer is not cropped. The box is snapped to the
+  exact ratio (`auto_crop.fit_box_to_ratio`, the Python twin of the panel's `reshapeCrop`). With Sharpen on,
+  the teammates (`is_teammate`, i.e. the team's jersey colour) are taken from the stored detections and every
+  other body is sent as `protect`, so **no detector or pose model runs**. With Sharpen on every qualifying photo
+  is sharpened (photos with no teammate, or whose player can't be segmented, whole-frame: see below); with it off a
+  photo with no crop obtained is skipped. One the model answered with the whole frame is still written.
+- **Process.** One `autoedit.py --jobs-file` subprocess for the whole batch, so the models load once. A job with
+  `"sharpen": true` runs the aisharpen pipeline; Real-ESRGAN loads only if some job sharpens, GFPGAN only if some job
+  has bodies, and `SharpenDispatcher(cpu_spillover=False)` skips the second, CPU copy of the models when a GPU is
+  present.
+
+**Sharpening rule in `autoedit.py` (`AiSharpenPipeline`, everywhere it runs):** players passed in as boxes are
+segmented and sharpened with face enhancement (`sharpen_bodies`, which reports how many boxes it sharpened). If **no**
+person ends up sharpened (segmentation failed or found nobody for every box) or no box was given at all, the **whole
+frame** is sharpened instead, always **without** face enhancement (`SharpenDispatcher.submit(face_enhance=False)`):
+face enhancement only ever runs on segmented players. A box that fails while another succeeds is just left untouched.
+Whole-frame sharpening of a 24 MP photo is far slower than sharpening one player.
 
 ### Players page (team face-DB curation)
 

@@ -12,7 +12,7 @@
 // each `*Job` below is created once in the init block at the bottom of
 // this file.
 let deepRegradeJob, quickRegradeJob, jerseyColorJob, exportJob, importMoreJob, rerunFacerecoJob;
-let burstVideoJob, faceTaggingCsvJob, playerVideoJob;
+let burstVideoJob, faceTaggingCsvJob, playerVideoJob, batchAutoEditJob;
 
 let lastStarBreakdown = null;
 
@@ -258,6 +258,127 @@ async function refreshPlayerVideoSummary() {
   }
 }
 
+// ------------------------------------------------------------------ //
+// Batch Auto Edit (experimental) — AI Edit's Auto crop + Sharpen players
+// over every photo at or above a star rating, saved to a chosen folder via
+// /api/album-tools/batch-auto-edit/*. Same background-job/poll/modal
+// pattern as the dialogs above (batchAutoEditJob, created in the init
+// block).
+// ------------------------------------------------------------------ //
+let batchResizeChoice = "instagram";
+let batchCount = 0;
+let batchRunning = false;
+let batchCountRequest = 0;
+
+function updateBatchControls() {
+  const resize = $("#batchResizeInput").prop("checked");
+  const sharpen = $("#batchSharpenInput").prop("checked");
+  $("#batchResizeChoices button").each(function () {
+    $(this).prop("disabled", !resize || batchRunning)
+      .attr("aria-pressed", String($(this).data("choice") === batchResizeChoice));
+  });
+  $("#batchResizeInput, #batchSharpenInput, #batchMinStarsInput, #batchPlayerInput").prop("disabled", batchRunning);
+  $("#batchStartBtn").prop("disabled", batchRunning || !(resize || sharpen) || batchCount < 1);
+}
+
+// Fills the Player picker with the album's tagged players ("All Players"
+// stays first and means no player filter).
+async function loadBatchPlayers() {
+  try {
+    const data = await apiGet("/api/album-tools/batch-auto-edit/players");
+    const $select = $("#batchPlayerInput");
+    data.players.forEach((name) => $select.append($("<option>").val(name).text(name)));
+  } catch (err) {
+    // Keep just "All Players" if this fails.
+  }
+}
+
+function batchPlayer() {
+  return $("#batchPlayerInput").val() || "";
+}
+
+async function refreshBatchCount() {
+  const minStars = parseInt($("#batchMinStarsInput").val(), 10) || 5;
+  const player = batchPlayer();
+  const request = ++batchCountRequest;
+  try {
+    const data = await apiGet(
+      `/api/album-tools/batch-auto-edit/summary?minStars=${minStars}&player=${encodeURIComponent(player)}`
+    );
+    if (request !== batchCountRequest) return;
+    batchCount = data.count;
+    const stars = minStars === 5 ? "5 stars" : `${minStars}+ stars`;
+    $("#batchCountLabel").text(
+      data.count
+        ? `${data.count} photo(s) will be processed`
+        : (player ? `No photos of ${player} have ${stars}` : `No photos have ${stars}`)
+    );
+  } catch (err) {
+    if (request !== batchCountRequest) return;
+    batchCount = 0;
+    $("#batchCountLabel").text("");
+  }
+  updateBatchControls();
+}
+
+// Start asks for the destination folder first (like Export); canceling the
+// picker leaves everything as it was.
+async function startBatchAutoEdit() {
+  batchRunning = true;
+  updateBatchControls();
+  $("#batchStatus").text("Choose a destination folder…");
+  $("#openBatchFolderBtn").hide();
+  let res;
+  try {
+    res = await apiPost("/api/browse-folder", { title: "Select folder for the edited photos", context: "export" });
+  } catch (err) {
+    $("#batchStatus").text("Browse failed: " + err.message);
+    batchRunning = false;
+    updateBatchControls();
+    return;
+  }
+  if (!res.path) {
+    $("#batchStatus").text("");
+    batchRunning = false;
+    updateBatchControls();
+    return;
+  }
+  $("#batchStatus").text("");
+  batchAutoEditJob.reset();
+  batchAutoEditJob.open("Batch Auto Edit…");
+  const finish = () => {
+    batchRunning = false;
+    updateBatchControls();
+  };
+  try {
+    await apiPost("/api/album-tools/batch-auto-edit/start", {
+      destination: res.path,
+      resize: $("#batchResizeInput").prop("checked") ? batchResizeChoice : null,
+      sharpen: $("#batchSharpenInput").prop("checked"),
+      player: batchPlayer() || null,
+      minStars: parseInt($("#batchMinStarsInput").val(), 10) || 5,
+    });
+  } catch (err) {
+    $("#batchStatus").text("Failed to start: " + err.message);
+    batchAutoEditJob.close();
+    finish();
+    return;
+  }
+  batchAutoEditJob.startPolling((data) => {
+    if (data.running) return;
+    finish();
+    const success = !data.error;
+    batchAutoEditJob.setFinished(success ? "Batch complete" : "Batch failed");
+    const r = data.result;
+    if (success) {
+      $("#batchStatus").text(r ? `Wrote ${r.processed} photo(s) (${r.cropped} cropped, ${r.sharpened} sharpened).` : "Done.");
+    } else {
+      $("#batchStatus").text("Failed: " + data.error);
+    }
+    if (r && r.processed) $("#openBatchFolderBtn").show();
+  });
+}
+
 $(function () {
   loadSummary();
   loadJerseyOptions();
@@ -319,6 +440,30 @@ $(function () {
     outputId: "playerVideoOutput",
     statusUrl: (since) => `/api/album-tools/player-video/status?since=${since}`,
     label: "player-video rendering",
+  });
+  batchAutoEditJob = LogDialog.create({
+    dialogId: "batchAutoEditDialog",
+    outputId: "batchAutoEditOutput",
+    statusUrl: (since) => `/api/album-tools/batch-auto-edit/status?since=${since}`,
+    dialogOptions: { width: 720 },
+    label: "batch auto edit",
+  });
+
+  loadBatchPlayers();
+  refreshBatchCount();
+  $("#batchResizeInput, #batchSharpenInput").on("change", updateBatchControls);
+  $("#batchMinStarsInput, #batchPlayerInput").on("change", refreshBatchCount);
+  $("#batchResizeChoices").on("click", "button", function () {
+    batchResizeChoice = $(this).data("choice");
+    updateBatchControls();
+  });
+  $("#batchStartBtn").on("click", startBatchAutoEdit);
+  $("#openBatchFolderBtn").on("click", async () => {
+    try {
+      await apiPost("/api/album-tools/batch-auto-edit/open-folder", {});
+    } catch (err) {
+      $("#batchStatus").text("Could not open folder: " + err.message);
+    }
   });
 
   loadBurstVideoSettings().then(refreshBurstSummary);

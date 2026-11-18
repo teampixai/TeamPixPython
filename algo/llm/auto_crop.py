@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Optional
@@ -42,31 +43,14 @@ INSTAGRAM = "instagram"
 ORIGINAL = "original"
 CROP_FORMATS: dict[str, Optional[tuple[int, int]]] = {INSTAGRAM: (5, 4), ORIGINAL: None}
 
-_PROMPT = """ROLE. You are an elite sports photography editor working at the \
+_ROLE = """ROLE. You are an elite sports photography editor working at the \
 editorial standard of ESPN and Sports Illustrated. Photography is the art of \
 reduction: a photograph is complete when nothing more can be removed without \
 weakening it, but a powerful photograph also needs room to breathe. Your goal \
 is not the tightest crop but the most visually compelling one: intentional \
-composition, balanced negative space, no unnecessary distractions. You only \
-crop and level the photo; you never change its content.
+composition, balanced negative space, no unnecessary distractions. """
 
-The photo you see is {width} x {height} pixels.
-{subject_line}
-Do step 1 before step 2.
-
-1. LEVEL. Look for lines that should be level or vertical: the horizon, the \
-far touchline or field edge, a fence, a building, a goal post, a pole. \
-Estimate how far they are tilted, then give level_degrees: the rotation that \
-makes them straight. Positive turns the photo counter-clockwise, negative \
-clockwise. Do not default to 0: a tilt of even 0.5 to 3 degrees is worth \
-fixing, and a clearly turned photo may need more (up to 180). Use 0 only \
-when the lines really are straight, or when nothing in the photo gives a \
-reliable reference. Put in level_check one short sentence naming the line \
-you used and how it tilts (for example "the far touchline rises about 2 \
-degrees to the right").
-
-2. CROP. Make two editorial crops of the photo, following these rules.
-a. Story. Find the primary athlete, the essential action or emotional moment, \
+_CROP_RULES = """a. Story. Find the primary athlete, the essential action or emotional moment, \
 the teammates, opponents and ball that matter to it, and the athlete's \
 expression, movement, posture and direction of attention. Not every strong \
 sports photo is intense action: a player walking with a thoughtful expression \
@@ -104,7 +88,31 @@ the subject have comfortable room, with no essential body part or the ball \
 accidentally cut? Is every bit of negative space intentional? Would removing \
 anything more weaken the photo? If the crop feels cramped, loosen it; if it \
 feels empty or distracted, tighten it.
+"""
 
+_CLOSING = """Remove everything that weakens the photograph, keep everything that tells \
+the story, and leave enough room for the composition to breathe."""
+
+_PROMPT = _ROLE + """You only \
+crop and level the photo; you never change its content.
+
+The photo you see is {width} x {height} pixels.
+{subject_line}
+Do step 1 before step 2.
+
+1. LEVEL. Look for lines that should be level or vertical: the horizon, the \
+far touchline or field edge, a fence, a building, a goal post, a pole. \
+Estimate how far they are tilted, then give level_degrees: the rotation that \
+makes them straight. Positive turns the photo counter-clockwise, negative \
+clockwise. Do not default to 0: a tilt of even 0.5 to 3 degrees is worth \
+fixing, and a clearly turned photo may need more (up to 180). Use 0 only \
+when the lines really are straight, or when nothing in the photo gives a \
+reliable reference. Put in level_check one short sentence naming the line \
+you used and how it tilts (for example "the far touchline rises about 2 \
+degrees to the right").
+
+2. CROP. Make two editorial crops of the photo, following these rules.
+""" + _CROP_RULES + """
 The two crops:
 {formats}
 Give each box as fractions of the photo as you see it, before any rotation, \
@@ -119,8 +127,7 @@ Answer with JSON only, exactly in this shape:
 {{"level_check": "<one short sentence>", "level_degrees": <number>, \
 {answer_shape}}}
 
-Remove everything that weakens the photograph, keep everything that tells \
-the story, and leave enough room for the composition to breathe."""
+""" + _CLOSING
 
 
 @dataclass(frozen=True)
@@ -170,14 +177,7 @@ def build_prompt(width: int, height: int, jersey_color: Optional[str] = None) ->
     """The instructions for the model, which is shown a *width* x *height*
     photo; with *jersey_color* (a stored "HUE:SHADE" team colour) the
     primary athlete is a player in that colour."""
-    jersey_color = describe_jersey_color(jersey_color)
-    if jersey_color:
-        subject = (
-            f"The team being photographed wears {jersey_color} jerseys: the primary athlete is a player "
-            f"in {jersey_color}.\n"
-        )
-    else:
-        subject = "The primary athlete is the player at the heart of the action or moment.\n"
+    subject = _subject_line(jersey_color)
     formats = []
     shapes = []
     for name, ratio in CROP_FORMATS.items():
@@ -269,3 +269,218 @@ def suggest_crop(
     log.info("Auto crop (%s): level %+.2f, crops %s in %.1fs", provider.model, suggestion.level,
              {name: c.box for name, c in suggestion.crops.items()}, elapsed)
     return suggestion
+
+
+# --------------------------------------------------------------------------- #
+# Batches: many photos per request (Album Tools -> Batch Auto Edit)
+# --------------------------------------------------------------------------- #
+
+# Photos sent in one request, like the standalone grading batches of the
+# import (algo/stages/llm_culling.py DEFAULT_SINGLETON_BATCH_SIZE): it spreads
+# a request's fixed cost over several photos. The model still crops each one on
+# its own, never comparing them.
+AUTO_CROP_BATCH_SIZE = 6
+
+_BATCH_PROMPT = _ROLE + """You only crop the photos; you never change their content.
+
+You are shown {count} unrelated photos, one after another, each labelled with \
+its file name and its size in pixels (W x H). Crop each photo on its own \
+merits and never compare them.
+{subject_line}
+CROP. For every photo, make two editorial crops of it, following these rules.
+""" + _CROP_RULES + """
+The two crops of each photo:
+{formats}
+Give each box as fractions of that photo, with four decimals: x1, y1 is the \
+top-left corner and x2, y2 the bottom-right corner, all between 0 and 1, with \
+x1 < x2 and y1 < y2. The box must stay inside the photo and have exactly the \
+required shape in pixels, using that photo's own W and H. In removed, list in \
+a few words what that crop cuts away; in reason, explain the compositional \
+choices in one short sentence.
+
+Answer with JSON only, exactly in this shape, with one entry per photo and \
+each file name exactly as labelled:
+{{"photos": [{{"file": "<file name>", {answer_shape}}}]}}
+
+""" + _CLOSING
+
+
+@dataclass(frozen=True)
+class CropPhoto:
+    """One photo of a batch: the shrunken copy the model sees (base64 JPEG)
+    and its size in pixels. *focus* is the normalised (x1, y1, x2, y2) box of
+    the player the crop must be built around, when one was chosen."""
+    file: str
+    image_b64: str
+    width: int
+    height: int
+    focus: Optional[tuple[float, float, float, float]] = None
+
+
+def _subject_line(jersey_color: Optional[str]) -> str:
+    colour = describe_jersey_color(jersey_color)
+    if colour:
+        return (
+            f"The team being photographed wears {colour} jerseys: the primary athlete is a player "
+            f"in {colour}.\n"
+        )
+    return "The primary athlete is the player at the heart of the action or moment.\n"
+
+
+_FOCUS_SUBJECT_LINE = (
+    "The primary athlete in each photo is the player inside the box given in its label (x1, y1, x2, y2 as "
+    "fractions of that photo): build both crops around that player, whatever else is going on.\n"
+)
+
+
+def build_batch_prompt(count: int, jersey_color: Optional[str] = None, focus: bool = False) -> str:
+    """The instructions for a request carrying *count* photos; with *focus*
+    every photo's label names the box of the player to build the crops
+    around."""
+    formats = []
+    shapes = []
+    for name, ratio in CROP_FORMATS.items():
+        if ratio is None:
+            shape = "the photo's own proportions, so x2 - x1 = y2 - y1"
+        else:
+            ratio_h, ratio_w = ratio
+            shape = (
+                f"{ratio_w}:{ratio_h} (width:height), a portrait for Instagram, so "
+                f"(x2 - x1) * W = {ratio_w / ratio_h:.3f} * (y2 - y1) * H"
+            )
+        formats.append(f'- "{name}": {shape}.')
+        shapes.append(
+            f'"{name}": {{"crop": {{"x1": <number>, "y1": <number>, "x2": <number>, "y2": <number>}}, '
+            '"removed": "<a few words>", "reason": "<one short sentence>"}'
+        )
+    return _BATCH_PROMPT.format(
+        count=count,
+        subject_line=_FOCUS_SUBJECT_LINE if focus else _subject_line(jersey_color),
+        formats="\n".join(formats) + "\n",
+        answer_shape=", ".join(shapes),
+    )
+
+
+def parse_batch_suggestions(raw: Optional[str], files: list[str]) -> dict[str, dict[str, AutoCropBox]]:
+    """Reads a batch answer into ``{file: {crop name: AutoCropBox}}``. Entries
+    are matched to *files* by name and anything else is dropped; a crop that
+    is missing or unusable is left out (a photo may keep only one of its
+    two), like the standalone grade parsing. Never raises: an unreadable
+    answer gives ``{}``."""
+    try:
+        data = json.loads(raw or "")
+    except (json.JSONDecodeError, TypeError) as exc:
+        log.warning("Auto crop batch: the answer is not JSON (%s): %r", exc, raw)
+        return {}
+    items = data.get("photos") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return {}
+    valid = set(files)
+    parsed: dict[str, dict[str, AutoCropBox]] = {}
+    for item in items:
+        file = item.get("file") if isinstance(item, dict) else None
+        if not isinstance(file, str) or file not in valid:
+            continue
+        crops: dict[str, AutoCropBox] = {}
+        for name in CROP_FORMATS:
+            try:
+                crops[name] = _parse_crop(name, item.get(name))
+            except ValueError as exc:
+                log.warning("Auto crop batch: %s: %s", file, exc)
+        if crops:
+            parsed[file] = crops
+    return parsed
+
+
+def _batch_label(index: int, photo: CropPhoto, focus: bool) -> str:
+    label = f"Image {index + 1} ({photo.file}, {photo.width} x {photo.height} pixels)"
+    if focus and photo.focus:
+        x1, y1, x2, y2 = photo.focus
+        label += f", primary athlete in box x1={x1:.3f}, y1={y1:.3f}, x2={x2:.3f}, y2={y2:.3f}"
+    return label + ":"
+
+
+def suggest_crops_batch(
+    provider: OpenAIProvider,
+    photos: list[CropPhoto],
+    *,
+    jersey_color: Optional[str] = None,
+) -> dict[str, dict[str, AutoCropBox]]:
+    """One request for all of *photos*; returns ``{file: {crop name:
+    AutoCropBox}}`` for the photos the model answered usably. Lets the
+    provider's request errors through."""
+    focus = any(p.focus for p in photos)
+    images = [
+        (_batch_label(i, p, focus), p.image_b64)
+        for i, p in enumerate(photos)
+    ]
+    raw, elapsed = provider.ask_json_images(build_batch_prompt(len(photos), jersey_color, focus), images)
+    parsed = parse_batch_suggestions(raw, [p.file for p in photos])
+    log.info("Auto crop batch (%s): %d/%d photo(s) answered in %.1fs",
+             provider.model, len(parsed), len(photos), elapsed)
+    return parsed
+
+
+def split_batches(photos: list[CropPhoto], size: int = AUTO_CROP_BATCH_SIZE) -> list[list[CropPhoto]]:
+    return [photos[i:i + size] for i in range(0, len(photos), size)]
+
+
+def suggest_crops_batches(
+    provider: OpenAIProvider,
+    batches: list[list[CropPhoto]],
+    *,
+    jersey_color: Optional[str] = None,
+    on_batch_done=None,
+) -> list[dict[str, dict[str, AutoCropBox]]]:
+    """Runs *batches* concurrently (up to the provider's ``max_concurrency``;
+    its limiter paces the requests) and returns the answers in the order of
+    *batches*. A failed batch gives ``{}`` rather than sinking the run.
+    *on_batch_done(done, total, error)* is called as each one finishes."""
+    results: list[dict[str, dict[str, AutoCropBox]]] = [{} for _ in batches]
+    if not batches:
+        return results
+    workers = max(1, min(getattr(provider, "max_concurrency", 4), len(batches)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(suggest_crops_batch, provider, batch, jersey_color=jersey_color): i
+            for i, batch in enumerate(batches)
+        }
+        for done, future in enumerate(as_completed(futures), start=1):
+            error = None
+            try:
+                results[futures[future]] = future.result()
+            except Exception as exc:  # noqa: BLE001 — one batch's failure must not sink the run
+                error = exc
+                log.warning("Auto crop batch #%d failed: %s", futures[future], exc)
+            if on_batch_done is not None:
+                on_batch_done(done, len(batches), error)
+    return results
+
+
+def fit_box_to_ratio(
+    box: tuple[float, float, float, float], ratio: float, width: int, height: int,
+) -> tuple[float, float, float, float]:
+    """*box* (fractions of a *width* x *height* photo) reshaped to the pixel
+    ratio width / height = *ratio*, keeping its centre and area and shrinking
+    or shifting as needed to stay inside the photo. The model only
+    approximates the shape it is asked for; the edit panel does the same
+    (reshapeCrop in ai-edit.js)."""
+    x1, y1, x2, y2 = box
+    box_w, box_h = (x2 - x1) * width, (y2 - y1) * height
+    cx, cy = (x1 + x2) / 2 * width, (y1 + y2) / 2 * height
+    h = math.sqrt(box_w * box_h / ratio)
+    w = h * ratio
+    if w > width:
+        w, h = float(width), width / ratio
+    if h > height:
+        h, w = float(height), height * ratio
+    x = min(max(cx - w / 2, 0.0), width - w)
+    y = min(max(cy - h / 2, 0.0), height - h)
+    return (x / width, y / height, (x + w) / width, (y + h) / height)
+
+
+def crop_ratio(name: str, width: int, height: int) -> float:
+    """The pixel width / height of the crop *name* for a *width* x *height*
+    photo."""
+    ratio = CROP_FORMATS[name]
+    return width / height if ratio is None else ratio[1] / ratio[0]

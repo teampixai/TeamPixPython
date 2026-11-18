@@ -252,6 +252,79 @@
   <textarea id="faceTaggingCsvOutput" class="output-box" rows="16" readonly></textarea>
 </div>
 
+<div class="panel" id="batchAutoEditPanel">
+  <h3>Batch Auto Edit <span class="muted">(experimental)</span></h3>
+  <p class="muted">
+    Runs AI Edit on every photo at or above the selected star rating and saves
+    each result as <code>&lt;name&gt;_ai_edited.jpg</code> in a folder of your
+    choice. Always starts from the original photo.
+  </p>
+  <div class="row">
+    <label class="inline-check">Player
+      <select id="batchPlayerInput">
+        <option value="" selected>All Players</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="batchResizeInput" />
+      Resize (AI crop)
+    </label>
+  </div>
+  <div class="row">
+    <div class="batch-choices" id="batchResizeChoices" role="group" aria-label="Resize shape">
+      <button type="button" class="crop-tile" data-choice="instagram" aria-pressed="true" disabled>
+        <span class="crop-icon" aria-hidden="true"><span class="crop-icon-shape" style="width:18px;height:22px"></span></span>
+        <span class="crop-tile-label">Instagram 4:5</span>
+      </button>
+      <button type="button" class="crop-tile" data-choice="original" aria-pressed="false" disabled>
+        <span class="crop-icon crop-icon-free" aria-hidden="true"><span class="crop-icon-shape"></span></span>
+        <span class="crop-tile-label">Original ratio</span>
+      </button>
+    </div>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="batchSharpenInput" />
+      Sharpen players
+    </label>
+    <span class="muted">Sharpens your team's players (picked by jersey colour), or only the chosen player; opponents are left untouched.</span>
+  </div>
+  <div class="row">
+    <label class="inline-check">Minimum stars to process
+      <select id="batchMinStarsInput">
+        <option value="1">1+ ★</option>
+        <option value="2">2+ ★</option>
+        <option value="3">3+ ★</option>
+        <option value="4">4+ ★</option>
+        <option value="5" selected>5 ★ only</option>
+      </select>
+    </label>
+    <span id="batchCountLabel" class="muted"></span>
+  </div>
+
+  <div class="row actions">
+    <span id="batchStatus" class="muted"></span>
+    <button id="openBatchFolderBtn" class="btn btn-icon-text" title="Open destination folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="batchStartBtn" class="btn btn-primary btn-icon-text" title="Choose a destination folder and start" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+      </svg>
+      <span>Start Auto edit</span>
+    </button>
+  </div>
+</div>
+
+<div id="batchAutoEditDialog" title="Batch Auto Edit…" style="display:none">
+  <textarea id="batchAutoEditOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
 <div class="panel" id="playerVideoPanel">
   <h3>Per-Player Highlight Videos <span class="muted">(experimental)</span></h3>
   <p class="muted">

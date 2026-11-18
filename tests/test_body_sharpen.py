@@ -86,7 +86,7 @@ def test_album_sharpness_threshold(settings, expected):
 class _FakeDispatcher:
     """Stands in for SharpenDispatcher: 'sharpening' paints the crop white."""
 
-    def submit(self, crop):
+    def submit(self, crop, face_enhance=True):
         return np.full_like(crop, 255)
 
 
@@ -138,10 +138,12 @@ class _NobodyIsPerson:
 class _CountingDispatcher(_FakeDispatcher):
     def __init__(self):
         self.calls = 0
+        self.face_enhance_flags = []
 
-    def submit(self, crop):
+    def submit(self, crop, face_enhance=True):
         self.calls += 1
-        return super().submit(crop)
+        self.face_enhance_flags.append(face_enhance)
+        return super().submit(crop, face_enhance)
 
 
 @pytest.mark.parametrize("segmenter,expected_text", [
@@ -343,6 +345,132 @@ def test_process_one_saves_nothing_without_silhouette_dir_or_when_nothing_is_sha
     autoedit.process_one(src, [autoedit.AiSharpenPipeline()], tmp_path / "out", "png", 95, _FakeDispatcher(), None,
                          out_file=tmp_path / "r.png", body_boxes=[(0.4, 0.25, 0.5, 0.75)], silhouette_dir=debug_dir)
     assert not debug_dir.exists()  # segmentation found nobody -> nothing sharpened -> nothing saved
+
+
+# --- whole-frame fallback: no segmented player -> sharpen everything ------- #
+
+def _apply_pipeline(image, dispatcher, boxes, tmp_path, **ctx_kwargs):
+    ctx = autoedit.EditContext(source=tmp_path / "photo.jpg", dispatcher=dispatcher, body_boxes=boxes, **ctx_kwargs)
+    return autoedit.AiSharpenPipeline().apply(image, ctx)
+
+
+@pytest.mark.parametrize("segmenter", [_RaisingSegmenter(), _NobodyIsPerson()])
+def test_when_no_player_can_be_segmented_the_whole_frame_is_sharpened_without_face_enhancement(
+    monkeypatch, tmp_path, segmenter,
+):
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: segmenter)
+    image = np.zeros((400, 1000, 3), dtype=np.uint8)
+    dispatcher = _CountingDispatcher()
+
+    result = _apply_pipeline(image, dispatcher, [(0.40, 0.25, 0.50, 0.75)], tmp_path)
+
+    assert (result == 255).all()                      # the whole frame, not just the box
+    assert dispatcher.calls == 1 and dispatcher.face_enhance_flags == [False]
+
+
+def test_with_no_boxes_at_all_the_whole_frame_is_sharpened_without_face_enhancement(tmp_path):
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    for boxes in (None, []):
+        dispatcher = _CountingDispatcher()
+        assert (_apply_pipeline(image, dispatcher, boxes, tmp_path) == 255).all()
+        assert dispatcher.face_enhance_flags == [False]
+
+
+def test_a_segmented_player_keeps_the_silhouette_sharpening_with_face_enhancement(monkeypatch, tmp_path):
+    import algo.segmentation as segmentation
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: _EverythingIsPerson())
+    image = np.zeros((400, 1000, 3), dtype=np.uint8)
+    dispatcher = _CountingDispatcher()
+
+    result = _apply_pipeline(image, dispatcher, [(0.40, 0.25, 0.50, 0.75)], tmp_path)
+
+    assert result[200, 450].min() > 240 and result[200, 100].max() == 0   # only the player
+    assert dispatcher.calls == 1 and dispatcher.face_enhance_flags == [True]  # the padded crop, face enhanced
+
+
+def test_one_player_failing_does_not_trigger_the_whole_frame_when_another_was_sharpened(monkeypatch, tmp_path):
+    import algo.segmentation as segmentation
+
+    class FailsOnTheFirstBox:
+        def __init__(self):
+            self.calls = 0
+
+        def segment(self, crop):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("model exploded")
+            return np.ones(crop.shape[:2], dtype=np.float32)
+
+    monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None: FailsOnTheFirstBox())
+    image = np.zeros((400, 1000, 3), dtype=np.uint8)
+    dispatcher = _CountingDispatcher()
+
+    result = _apply_pipeline(image, dispatcher, [(0.10, 0.25, 0.20, 0.75), (0.60, 0.25, 0.70, 0.75)], tmp_path)
+
+    assert result[200, 150].max() == 0        # the failed player stays as it was
+    assert result[200, 650].min() > 240       # the other one is sharpened
+    assert result[200, 400].max() == 0        # and nothing else
+    assert dispatcher.face_enhance_flags == [True]
+
+
+def test_sharpen_bodies_reports_how_many_boxes_it_sharpened(monkeypatch):
+    import algo.segmentation as segmentation
+
+    image = np.zeros((400, 1000, 3), dtype=np.uint8)
+    for segmenter, expected in ((_EverythingIsPerson(), 1), (_NobodyIsPerson(), 0)):
+        monkeypatch.setattr(segmentation, "get_segmenter", lambda name=None, s=segmenter: s)
+        report = {}
+        autoedit.sharpen_bodies(image, [(0.40, 0.25, 0.50, 0.75)], _FakeDispatcher(), report=report)
+        assert report == {"sharpened": expected, "total": 1}
+
+
+def test_the_dispatcher_carries_the_face_enhance_flag_to_the_processor():
+    seen = []
+
+    class Recording(autoedit.SharpenProcessor):
+        label = "fake"
+
+        def process(self, image, face_enhance=True):
+            seen.append(face_enhance)
+            return image
+
+    dispatcher = autoedit.SharpenDispatcher()
+    dispatcher._gpu_count = 0
+    dispatcher._spawn(Recording(), dispatcher._cpu_loop, "fake")
+    try:
+        dispatcher.submit(np.zeros((4, 4, 3), np.uint8))
+        dispatcher.submit(np.zeros((4, 4, 3), np.uint8), face_enhance=False)
+    finally:
+        dispatcher.shutdown()
+    assert seen == [True, False]
+
+
+def test_the_local_processor_skips_the_face_enhancer_when_asked(tmp_path):
+    calls = []
+
+    class Upsampler:
+        tile_size = 0
+
+        def enhance(self, image, outscale=1):
+            calls.append("plain")
+            return image, None
+
+    class Enhancer:
+        def enhance(self, image, **kwargs):
+            calls.append("face")
+            return None, None, image
+
+    processor = autoedit.LocalSharpenProcessor(
+        "cpu", "weights.pth", autoedit.SHARPEN_MODELS[autoedit.DEFAULT_SHARPEN_MODEL], "gfpgan.pth")
+    processor._upsampler, processor._face_enhancer = Upsampler(), Enhancer()
+    image = np.zeros((32, 32, 3), np.uint8)
+    processor.process(image)
+    processor.process(image, face_enhance=False)
+    processor.process(image, face_enhance=True)
+    assert calls == ["face", "plain", "face"]
 
 
 # --- unselected ("protected") players -------------------------------------- #
