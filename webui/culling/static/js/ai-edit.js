@@ -379,17 +379,22 @@ const AiEdit = (function () {
 
     // --- Auto crop ---
     const $autoCrop = $("<input>", { type: "checkbox" });
-    const $autoCropNote = $("<p>", { class: "edit-hint" });
+    const $autoCropChoices = $("<div>", { class: "auto-crop-choices", role: "group" });
+    const autoChoiceTiles = [["instagram", "Instagram 4:5", 5, 4], ["original", "Original ratio", srcH, srcW]].map(
+      ([value, label, h, w]) => {
+        const $icon = ratioIcon(h, w);
+        const $tile = $("<button>", {
+          type: "button", class: "crop-tile", "aria-pressed": String(value === "instagram"), disabled: true,
+        }).data({ choice: value, $icon }).append($icon, $("<span>", { class: "crop-tile-label" }).text(label));
+        $autoCropChoices.append($tile);
+        return $tile;
+      }
+    );
     const $autoCropSection = $("<section>", { class: "edit-section" }).append(
       $("<div>", { class: "edit-section-head" }).append(
-        $("<label>", { class: "edit-check" }).append($autoCrop, $("<h3>").text("Auto crop"))
+        $("<label>", { class: "edit-check" }).append($autoCrop, $("<h3>").text("AI Auto Crop"))
       ),
-      $("<p>", { class: "edit-hint" }).text(
-        "Checking it asks an AI model (OpenAI) to crop out what doesn't belong, using a small copy of the photo. " +
-        "While it is checked the crop controls are locked. " +
-        "Unchecking it brings back the crop you had before; checking it again re-applies the suggestion."
-      ),
-      $autoCropNote
+      $autoCropChoices
     );
 
     const $cropX = $("<span>", { class: "crop-readout-value" });
@@ -844,14 +849,24 @@ const AiEdit = (function () {
     $levelReset.on("click", () => setLevel(0));
 
     // ------------------------------ Auto crop ---------------------------- //
-    // The model's box is in the photo as it is now, unturned; the crop box
-    // becomes the box's bounds on the turned photo, in the selected preset's
-    // shape if one is, kept inside the photo.
-    function applyAutoCrop(result) {
+    // The chosen crop's box is in the photo as it is now, unturned; the crop
+    // box becomes the box's bounds on the turned photo, reshaped to exactly
+    // that crop's ratio (Instagram 4:5, or the photo's own) and kept inside
+    // the photo. The matching preset tile is selected when there is one.
+    function autoCropPreset(choice) {
+      const ratio = choice === "instagram" ? 4 / 5 : srcW / srcH;
+      const presets = CROP_GROUPS.flatMap((g) => g.presets);
+      const tile = choice === "instagram"
+        ? presets.find((p) => p.id === "ig-5x4")
+        : presets.find((p) => p.id.startsWith("print-") && Math.abs(p.w / p.h - ratio) < 0.005 * ratio);
+      return tile || { id: "auto-original", h: srcH, w: srcW };
+    }
+
+    function applyAutoCrop(result, choice) {
       level = LEVEL_ENABLED ? cleanLevel(result.level) : 0;
       refreshCanvas();
       syncLevelControls();
-      const [x1, y1, x2, y2] = result.box;
+      const [x1, y1, x2, y2] = result.crops[choice].box;
       const rad = (level * Math.PI) / 180;
       const c = Math.cos(rad);
       const s = Math.sin(rad);
@@ -866,7 +881,8 @@ const AiEdit = (function () {
       const left = clamp(Math.min(...xs), 0, imgW);
       const top = clamp(Math.min(...ys), 0, imgH);
       let box = { x: left, y: top, w: clamp(Math.max(...xs), 0, imgW) - left, h: clamp(Math.max(...ys), 0, imgH) - top };
-      if (cropPreset) box = reshapeCrop(box, cropPreset.w / cropPreset.h);
+      cropPreset = autoCropPreset(choice);
+      box = reshapeCrop(box, cropPreset.w / cropPreset.h);
       crop = shrinkIntoPhoto(box);
       renderBoxes();
       renderCrop();
@@ -875,14 +891,15 @@ const AiEdit = (function () {
 
     // The checkbox: its first check asks the server for a suggestion (kept
     // for later re-checks); unchecking brings back what the level and crop
-    // were just before it was applied.
+    // were just before it was applied. The radios pick which of its two
+    // crops is applied; switching re-applies at once, with no new request.
     let autoSuggestion = null;
     let beforeAuto = null;
+    let autoChoice = "instagram";
 
     function applyAutoSuggestion() {
-      beforeAuto = { level, crop: Object.assign({}, crop), preset: cropPreset };
-      applyAutoCrop(autoSuggestion);
-      $autoCropNote.text(autoSuggestion.reason || "");
+      if (!beforeAuto) beforeAuto = { level, crop: Object.assign({}, crop), preset: cropPreset };
+      applyAutoCrop(autoSuggestion, autoChoice);
     }
 
     function restoreBeforeAuto() {
@@ -897,14 +914,12 @@ const AiEdit = (function () {
         renderCrop();
         schedulePreview();
       }
-      $autoCropNote.text("");
     }
 
     function forgetAutoCrop() {
       autoSuggestion = null;
       beforeAuto = null;
       $autoCrop.prop("checked", false);
-      $autoCropNote.text("");
       renderAutoLock();
     }
 
@@ -914,8 +929,17 @@ const AiEdit = (function () {
       return $autoCrop.prop("checked");
     }
 
+    // The Instagram / Original ratio buttons only work while Auto crop is on.
+    function renderAutoChoices() {
+      autoChoiceTiles.forEach(($tile) => {
+        $tile.prop("disabled", busy || !autoLocked());
+        $tile.attr("aria-pressed", String($tile.data("choice") === autoChoice));
+      });
+    }
+
     function renderAutoLock() {
       const locked = autoLocked();
+      renderAutoChoices();
       levelSlider.setEnabled(!locked);
       $levelNumber.prop("disabled", locked);
       $levelReset.prop("disabled", locked);
@@ -931,11 +955,7 @@ const AiEdit = (function () {
       $previewStatus.removeClass("error").text("");
       j.reset();
       try {
-        await apiPost("/api/edit/ai-edit/auto-crop", {
-          file: key,
-          ratioH: cropPreset ? cropPreset.h : null,
-          ratioW: cropPreset ? cropPreset.w : null,
-        });
+        await apiPost("/api/edit/ai-edit/auto-crop", { file: key });
       } catch (err) {
         setBusy(false);
         $previewStatus.addClass("error").text(`Auto crop: ${errorText(err)}`);
@@ -975,6 +995,12 @@ const AiEdit = (function () {
       applyAutoSuggestion();
     });
 
+    $autoCropChoices.on("click", "button", (e) => {
+      autoChoice = $(e.currentTarget).data("choice");
+      renderAutoChoices();
+      if (autoLocked() && autoSuggestion) applyAutoSuggestion();
+    });
+
     // -------------------------------- Tabs ------------------------------- //
     function setTab(id) {
       activeTab = id;
@@ -1003,6 +1029,7 @@ const AiEdit = (function () {
       $reload.prop("disabled", on);
       $external.prop("disabled", on);
       $autoCrop.prop("disabled", on);
+      renderAutoChoices();
       $apply.prop("disabled", on);
       renderOther();
     }
@@ -1018,6 +1045,12 @@ const AiEdit = (function () {
       srcH = next.height;
       bodiesUnavailable = !!next.bodiesUnavailable;
       if (fresh || sizeChanged) level = 0;
+      if (sizeChanged) {
+        const $original = autoChoiceTiles[1];
+        const $icon = ratioIcon(srcH, srcW);
+        $original.data("$icon").replaceWith($icon);
+        $original.data("$icon", $icon);
+      }
       if (fresh || sizeChanged) forgetAutoCrop();
       refreshCanvas();
       syncLevelControls();

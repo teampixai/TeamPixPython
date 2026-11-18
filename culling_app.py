@@ -270,10 +270,6 @@ class AiEditApplyRequest(BaseModel):
 
 class AutoCropRequest(BaseModel):
     file: str
-    # Height and width of the ratio the Crop tab has selected (a preset), so
-    # the suggested crop is composed for it; both None for a free crop.
-    ratioH: Optional[float] = Field(default=None, gt=0)
-    ratioW: Optional[float] = Field(default=None, gt=0)
 
 # --------------------------------------------------------------------------- #
 # Processing (1_prep_review.py) — run in a background thread, buffer combined
@@ -3640,7 +3636,20 @@ def api_ai_edit_session_close() -> dict:
     return {"ok": True}
 
 
-def _run_auto_crop(key: str, api_key: str, ratio_h: Optional[float], ratio_w: Optional[float]) -> None:
+def _album_jersey_color(album_dir: Path) -> str:
+    """The team colour Auto crop centres on: the album's pinned colour, else
+    the one detected at import; empty when the album ignores jersey colour."""
+    album = album_for(album_dir)
+    run_settings = album.run_settings
+    if run_settings.get("noteam"):
+        return ""
+    return run_settings.get("team_color_override") or album.our_jersey_color
+
+
+_AUTO_CROP_LABELS = {"instagram": "Instagram 4:5", "original": "Original ratio"}
+
+
+def _run_auto_crop(key: str, api_key: str, jersey_color: str) -> None:
     """Auto crop's job, run in the web server itself: one request to the
     OpenAI model through the shared OpenAIProvider, narrated into
     auto_crop_state's log, which the edit panel's log dialog shows."""
@@ -3659,27 +3668,35 @@ def _run_auto_crop(key: str, api_key: str, ratio_h: Optional[float], ratio_w: Op
                                interpolation=cv2.INTER_AREA)
         jpeg = _encode_jpeg(small, auto_crop.AUTO_CROP_JPEG_QUALITY)
         provider = auto_crop.make_provider(api_key)
+        colour = auto_crop.describe_jersey_color(jersey_color)
         auto_crop_state.log(
             f"Sending a {small.shape[1]}x{small.shape[0]} copy ({len(jpeg) // 1024} KB) of the photo "
-            f"to {provider.model}…"
+            f"to {provider.model}"
+            + (f", looking for a player in {colour}" if colour else "")
+            + "…"
         )
-        suggestion = auto_crop.suggest_crop(provider, jpeg, ratio_h=ratio_h, ratio_w=ratio_w)
+        suggestion = auto_crop.suggest_crop(
+            provider, jpeg, width=small.shape[1], height=small.shape[0], jersey_color=jersey_color
+        )
         auto_crop_state.log(f"Answer received in {suggestion.elapsed:.1f}s (cost ${suggestion.cost_usd:.4f}).")
-        x1, y1, x2, y2 = suggestion.box
         auto_crop_state.log(
             f"Level {suggestion.level:+g}°" + (f" — {suggestion.level_check}" if suggestion.level_check else "")
         )
-        auto_crop_state.log(
-            f"Crop: keep x {x1:.0%}–{x2:.0%}, y {y1:.0%}–{y2:.0%} of the photo"
-            + (f" — removes {suggestion.removed}" if suggestion.removed else "")
-        )
-        if suggestion.reason:
-            auto_crop_state.log(suggestion.reason)
+        for name, crop in suggestion.crops.items():
+            x1, y1, x2, y2 = crop.box
+            auto_crop_state.log(
+                f"{_AUTO_CROP_LABELS.get(name, name)}: keep x {x1:.0%}–{x2:.0%}, y {y1:.0%}–{y2:.0%} of the photo"
+                + (f" — removes {crop.removed}" if crop.removed else "")
+            )
+            if crop.reason:
+                auto_crop_state.log(f"  {crop.reason}")
         with auto_crop_state.lock:
             auto_crop_state.result = {
                 "level": suggestion.level,
-                "box": list(suggestion.box),
-                "reason": suggestion.reason,
+                "crops": {
+                    name: {"box": list(crop.box), "reason": crop.reason}
+                    for name, crop in suggestion.crops.items()
+                },
             }
             auto_crop_state.done = True
     except HTTPException as exc:
@@ -3704,10 +3721,10 @@ def api_ai_edit_auto_crop(req: AutoCropRequest) -> dict:
             status_code=400,
             detail="Auto crop needs an OpenAI API key. Add one on the Team page.",
         )
+    jersey_color = _album_jersey_color(_current_album_path())
     if not auto_crop_state.claim():
         raise HTTPException(status_code=409, detail="An auto crop is already running.")
-    ratio = (req.ratioH, req.ratioW) if req.ratioH and req.ratioW else (None, None)
-    threading.Thread(target=_run_auto_crop, args=(req.file, api_key, *ratio), daemon=True).start()
+    threading.Thread(target=_run_auto_crop, args=(req.file, api_key, jersey_color), daemon=True).start()
     return {"ok": True}
 
 

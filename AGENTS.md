@@ -166,8 +166,14 @@ edit can't be mapped back onto the stored detections, so it records `edited_rota
 the original-frame detections as they are. The edit window keeps the unturned photo's shape
 (`showCompareWindow`'s `viewportSize`) and letterboxes the turned one, so the layout doesn't jump.
 
-Auto crop is the Crop tab's checkbox; while it is on, the crop controls are locked. Its
-prompt makes the model measure the tilt first, then crop out only what doesn't belong. **The Level UI is
+Auto crop is the Crop tab's checkbox; while it is on, the crop controls are locked. Its prompt
+(`algo/llm/auto_crop.py`) makes the model measure the tilt first, then compose an editorial crop (ESPN/SI
+brief: story, reduction of distractions, rule of thirds, 5–10% breathing room, weighing tight / balanced /
+environmental candidates) centred on a player in the album's team colour (the pinned colour, else the detected
+one; none when the album ignores jersey colour). One request returns **two crops**, `instagram` (4:5) and
+`original` (the photo's own ratio), each as an x1/y1/x2/y2 box with `removed` and `reason`; two buttons under the
+checkbox ("Instagram 4:5" / "Original ratio", enabled only while it is checked) switch between them without a
+new request, and the panel reshapes the box to the exact ratio. **The Level UI is
 temporarily hidden** (`LEVEL_ENABLED = false` in `ai-edit.js`): no Level widgets, and Auto crop ignores the
 level the model returns. The server side (`--rotate`, `level` in the API, `edited_rotated`) is intact; set the
 flag to true to bring it back. It runs **inside the web server** (no subprocess): a

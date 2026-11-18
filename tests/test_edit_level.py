@@ -286,50 +286,81 @@ def test_sharpening_runs_on_the_unturned_photo_before_the_turn(album_dir, tmp_pa
 
 # ---- Auto crop: the suggestion ---------------------------------------------- #
 
+def _crop(**over) -> dict:
+    data = {"crop": {"x1": 0.1, "y1": 0.2, "x2": 0.9, "y2": 0.8}, "reason": " Thirds. ", "removed": " a bystander "}
+    data.update(over)
+    return data
+
+
 def _answer(**over) -> str:
-    data = {"level_degrees": -2.5, "crop": {"x1": 0.1, "y1": 0.2, "x2": 0.9, "y2": 0.8}, "reason": " Tilted. "}
+    data = {
+        "level_degrees": -2.5,
+        "instagram": _crop(),
+        "original": _crop(crop={"x1": 0.0, "y1": 0.05, "x2": 0.95, "y2": 1.0}, reason="Room to breathe.", removed=None),
+    }
     data.update(over)
     return json.dumps(data)
 
 
-def test_parse_suggestion_reads_level_box_and_reason():
+def test_parse_suggestion_reads_level_and_both_crops():
     s = auto_crop.parse_suggestion(_answer())
-    assert s.level == -2.5 and s.box == (0.1, 0.2, 0.9, 0.8) and s.reason == "Tilted."
+    assert s.level == -2.5 and set(s.crops) == {"instagram", "original"}
+    ig = s.crops["instagram"]
+    assert ig.box == (0.1, 0.2, 0.9, 0.8) and ig.reason == "Thirds." and ig.removed == "a bystander"
+    assert s.crops["original"].box == (0.0, 0.05, 0.95, 1.0)
+    assert s.crops["original"].reason == "Room to breathe." and s.crops["original"].removed == ""
 
 
 def test_parse_suggestion_clamps_and_orders_the_numbers():
-    s = auto_crop.parse_suggestion(_answer(level_degrees=400, crop={"x1": 1.2, "y1": 0.9, "x2": -0.1, "y2": 0.1}))
-    assert s.level == 180 and s.box == (0.0, 0.1, 1.0, 0.9)
+    s = auto_crop.parse_suggestion(_answer(level_degrees=400, instagram=_crop(
+        crop={"x1": 1.2, "y1": 0.9, "x2": -0.1, "y2": 0.1})))
+    assert s.level == 180 and s.crops["instagram"].box == (0.0, 0.1, 1.0, 0.9)
 
 
 @pytest.mark.parametrize("raw", [
     None, "", "not json", "[]", json.dumps({"level_degrees": 1}),
-    _answer(crop={"x1": 0.1, "y1": 0.1, "x2": 0.12, "y2": 0.9}),
+    _answer(instagram=_crop(crop={"x1": 0.1, "y1": 0.1, "x2": 0.12, "y2": 0.9})),
     _answer(level_degrees="tilted"),
-    _answer(crop={"x1": 0, "y1": 0, "x2": 1}),
+    _answer(original=_crop(crop={"x1": 0, "y1": 0, "x2": 1})),
+    _answer(original=None),
+    _answer(instagram="the top half"),
+    json.dumps({"level_degrees": 0, "crop": {"x1": 0, "y1": 0, "x2": 1, "y2": 1}}),  # the old one-crop answer
 ])
 def test_parse_suggestion_rejects_unusable_answers(raw):
     with pytest.raises(ValueError):
         auto_crop.parse_suggestion(raw)
 
 
-def test_parse_suggestion_keeps_the_level_check_and_what_was_removed():
-    s = auto_crop.parse_suggestion(_answer(level_check=" Touchline rises 2 degrees. ", removed=" a bystander "))
-    assert (s.level_check, s.removed) == ("Touchline rises 2 degrees.", "a bystander")
+def test_parse_suggestion_keeps_the_level_check():
+    s = auto_crop.parse_suggestion(_answer(level_check=" Touchline rises 2 degrees. "))
+    assert s.level_check == "Touchline rises 2 degrees."
     assert auto_crop.parse_suggestion(_answer()).level_check == ""
 
 
-def test_prompt_asks_for_a_level_evaluation_before_a_crop_that_removes_distractions():
-    prompt = auto_crop.build_prompt()
+def test_prompt_asks_for_a_level_evaluation_before_an_editorial_crop():
+    prompt = auto_crop.build_prompt(768, 512)
     assert prompt.index("LEVEL") < prompt.index("CROP")
     assert "level_check" in prompt and "Do not default to 0" in prompt
-    assert "remove what does not belong" in prompt and "bystanders" in prompt
+    for rule in ("art of reduction", "Rule of thirds", "Breathing room", "5 to 10%", "prefer the balanced crop"):
+        assert rule in prompt
 
 
-def test_prompt_mentions_the_ratio_only_when_one_is_selected():
-    assert "ratio" not in auto_crop.build_prompt()
-    prompt = auto_crop.build_prompt(2034, 1398)
-    assert "2034:1398" in prompt and "0.687" in prompt
+def test_prompt_asks_for_an_instagram_and_an_original_ratio_crop():
+    prompt = auto_crop.build_prompt(768, 512)
+    assert "768 x 512 pixels" in prompt
+    assert '"instagram": 4:5 (width:height)' in prompt and "0.800" in prompt
+    assert '"original": the photo\'s own proportions, about 3:2' in prompt and "1.500" in prompt
+    assert '"instagram": {"crop"' in prompt and '"original": {"crop"' in prompt
+    # A shape with no simple ratio is named as it is.
+    assert "1000:577" in auto_crop.build_prompt(1000, 577)
+    assert "about 2:3" in auto_crop.build_prompt(511, 768)
+
+
+def test_prompt_names_the_team_colour_only_when_there_is_one():
+    assert "jerseys" not in auto_crop.build_prompt(768, 512)
+    assert "wears bright white jerseys" in auto_crop.build_prompt(768, 512, "White:Bright")
+    assert "wears navy jerseys" in auto_crop.build_prompt(768, 512, "Navy:")
+    assert "jerseys" not in auto_crop.build_prompt(768, 512, ":")
 
 
 def test_suggest_crop_asks_the_provider_and_returns_the_suggestion():
@@ -345,12 +376,11 @@ def test_suggest_crop_asks_the_provider_and_returns_the_suggestion():
         def get_cost_summary(self):
             return SimpleNamespace(total_cost_usd=0.0042)
 
-    s = auto_crop.suggest_crop(FakeProvider(), b"\xff\xd8jpeg", ratio_h=5, ratio_w=4)
+    s = auto_crop.suggest_crop(FakeProvider(), b"\xff\xd8jpeg", width=512, height=768, jersey_color="Red")
     assert (s.level, s.elapsed, s.cost_usd) == (-2.5, 1.25, 0.0042)
     (instructions, image_b64), = calls
-    assert "5:4" in instructions
+    assert "512 x 768 pixels" in instructions and "about 2:3" in instructions and "wears red jerseys" in instructions
     assert base64.b64decode(image_b64) == b"\xff\xd8jpeg"
-
 
 def test_the_provider_ask_json_uses_the_shared_request_path():
     from algo.llm.culling_provider import OpenAIProvider
@@ -411,20 +441,48 @@ def test_auto_crop_job_returns_the_suggestion(album_dir, tmp_path, client, team,
     def fake_suggest(provider, jpeg, **kwargs):
         seen.update(model=provider.model, shape=_jpeg_shape(jpeg), **kwargs)
         return auto_crop.AutoCropSuggestion(
-            level=1.5, box=(0.1, 0.2, 0.9, 0.8), reason="Straighten.", elapsed=2.0, cost_usd=0.001)
+            level=1.5,
+            crops={
+                "instagram": auto_crop.AutoCropBox(box=(0.1, 0.2, 0.9, 0.8), reason="Thirds.", removed="a coach"),
+                "original": auto_crop.AutoCropBox(box=(0.0, 0.0, 1.0, 0.9), reason="Wider."),
+            },
+            elapsed=2.0, cost_usd=0.001)
 
     monkeypatch.setattr(auto_crop, "make_provider", fake_provider)
     monkeypatch.setattr(auto_crop, "suggest_crop", fake_suggest)
-    response = client.post("/api/edit/ai-edit/auto-crop", json={"file": KEY, "ratioH": 5, "ratioW": 4})
+    monkeypatch.setattr(culling_app, "_album_jersey_color", lambda album_dir: "White:Bright")
+    response = client.post("/api/edit/ai-edit/auto-crop", json={"file": KEY})
     assert response.status_code == 200
     status = _wait_for_job(client)
     assert status["error"] is None and status["done"] is True
-    assert status["result"] == {"level": 1.5, "box": [0.1, 0.2, 0.9, 0.8], "reason": "Straighten."}
-    assert any("Straighten." in line for line in status["lines"])
-    assert any("fake-model" in line for line in status["lines"])  # the log is written by the server's own code
-    assert seen["api_key"] == "sk-test" and (seen["ratio_h"], seen["ratio_w"]) == (5, 4)
-    # A small copy goes to the model, not the 1600-pixel preview.
+    assert status["result"] == {"level": 1.5, "crops": {
+        "instagram": {"box": [0.1, 0.2, 0.9, 0.8], "reason": "Thirds."},
+        "original": {"box": [0.0, 0.0, 1.0, 0.9], "reason": "Wider."},
+    }}
+    assert any("Thirds." in line for line in status["lines"])
+    assert any("Original ratio" in line and "Wider." not in line for line in status["lines"])
+    assert any("removes a coach" in line for line in status["lines"])
+    assert any("fake-model" in line and "bright white" in line for line in status["lines"])
+    assert seen["api_key"] == "sk-test" and seen["jersey_color"] == "White:Bright"
+    # A small copy goes to the model, not the 1600-pixel preview, and the
+    # prompt is told its size.
     assert max(seen["shape"]) == auto_crop.AUTO_CROP_IMAGE_LONG_EDGE
+    assert (seen["height"], seen["width"]) == seen["shape"][:2]
+
+
+@pytest.mark.parametrize("run_settings, detected, expected", [
+    ({}, "White:Bright", "White:Bright"),
+    ({"team_color_override": "Navy"}, "White:Bright", "Navy"),
+    ({"noteam": True, "team_color_override": "Navy"}, "White", ""),
+    ({}, "", ""),
+])
+def test_auto_crop_uses_the_albums_team_colour(album_dir, run_settings, detected, expected):
+    write_album(album_dir, [make_entry(KEY)])
+    payload = json.loads((album_dir / "album.json").read_text())
+    payload.update(run_settings=run_settings, our_jersey_color=detected)
+    (album_dir / "album.json").write_text(json.dumps(payload))
+    album_module.invalidate_all()
+    assert culling_app._album_jersey_color(album_dir) == expected
 
 
 def test_auto_crop_job_reports_a_failure(album_dir, tmp_path, client, team, monkeypatch):
