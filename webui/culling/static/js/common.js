@@ -170,6 +170,11 @@ $(function () {
 // If the server stops answering for ~10s while polling, the dialog becomes
 // closable (and says so in the log) instead of trapping the user.
 //
+// "Closable" means the titlebar [x] and a [Close] button at the bottom of the
+// dialog both appear (and Escape works); while the job runs neither is shown.
+// job.setClosable(true|false) sets it directly, for callers that open the
+// dialog in its finished state.
+//
 // If `dialogId` isn't already a <div> on the page, one is created lazily
 // (with a single <textarea outputId>) the first time create() runs, so new
 // callers (like ai-edit.js) don't need to hand-author any dialog markup.
@@ -193,7 +198,11 @@ const LogDialog = (function () {
       draggable: false,
       resizable: false,
       width: 640,
+      // Shown (together with the titlebar [x]) only once the dialog may be
+      // closed: see setClosable() in create().
+      buttons: [{ text: "Close", class: "btn", click: function () { $(this).dialog("close"); } }],
     }, dialogOptions || {}));
+    $dialog.dialog("widget").addClass("log-dialog");
     return $dialog;
   }
 
@@ -228,19 +237,26 @@ const LogDialog = (function () {
       box.scrollTop = atBottom ? box.scrollHeight : Math.max(0, previousScrollTop - removedHeight);
     }
 
+    // Whether the user may close the dialog: the titlebar [x], the Close
+    // button at the bottom and Escape all follow it, so none is ever offered
+    // while the job is running.
+    function setClosable(closable) {
+      $dialog.dialog("option", "closeOnEscape", closable);
+      const $widget = $dialog.dialog("widget");
+      $widget.find(".ui-dialog-titlebar-close").toggle(closable);
+      $widget.find(".ui-dialog-buttonpane").toggle(closable);
+    }
+
     function open(title) {
       if (title) $dialog.dialog("option", "title", title);
-      $dialog.dialog("option", "closeOnEscape", false);
       $dialog.dialog("open");
-      // Non-closable while running: hide the titlebar's [x] button too.
-      $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+      setClosable(false);
       if (opts.label) appendLines([`Starting ${opts.label}…`]);
     }
 
     function setFinished(title) {
       if (title) $dialog.dialog("option", "title", title);
-      $dialog.dialog("option", "closeOnEscape", true);
-      $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+      setClosable(true);
     }
 
     function close() {
@@ -286,15 +302,13 @@ const LogDialog = (function () {
       function markStalled() {
         stalled = true;
         appendLines(["⚠ Lost contact with the server — it may be busy, paused or stopped. You can close this dialog; the job may still be running."]);
-        $dialog.dialog("option", "closeOnEscape", true);
-        $dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+        setClosable(true);
       }
 
       function markRecovered() {
         stalled = false;
         appendLines(["Reconnected to the server."]);
-        $dialog.dialog("option", "closeOnEscape", false);
-        $dialog.dialog("widget").find(".ui-dialog-titlebar-close").hide();
+        setClosable(false);
       }
 
       async function tick() {
@@ -333,7 +347,7 @@ const LogDialog = (function () {
       tick();
     }
 
-    return { $dialog, appendLines, open, setFinished, close, reset, startPolling, stop };
+    return { $dialog, appendLines, open, setFinished, setClosable, close, reset, startPolling, stop };
   }
 
   return { create };

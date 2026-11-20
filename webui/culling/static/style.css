@@ -154,7 +154,7 @@ code {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 12px;
+  padding: 7px 9px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--surface);
@@ -167,8 +167,7 @@ code {
 .settings-btn:hover,
 .settings-btn[aria-expanded="true"] { background: var(--surface-2); color: var(--text); }
 .settings-btn.active { color: var(--text); background: var(--accent-soft); border-color: var(--accent); }
-.settings-icon { font-size: 15px; line-height: 1; }
-.settings-caret { font-size: 10px; }
+.settings-icon { display: block; }
 .settings-panel {
   position: absolute;
   top: calc(100% + 8px);
@@ -197,7 +196,6 @@ code {
 
 @media (max-width: 720px) {
   .step-label { display: none; }
-  .settings-label { display: none; }
 }
 
 /* Narrower still: the step nav is already down to just numbered circles,
@@ -364,6 +362,11 @@ label { font-size: 13.5px; display: flex; align-items: center; gap: 6px; }
   padding: 12px 16px;
 }
 .ui-widget-overlay { background: #000; opacity: 0.55; }
+
+/* Task-log dialogs (LogDialog): the Close button sits bottom-centre so it is easy to spot. */
+.ui-dialog.log-dialog .ui-dialog-buttonpane { text-align: center; }
+.ui-dialog.log-dialog .ui-dialog-buttonpane .ui-dialog-buttonset { float: none; }
+.ui-dialog.log-dialog .ui-dialog-buttonpane .btn { min-width: 96px; margin: 0; }
 
 /* ------------------------------------------------------------------ *
  * Polaroid album gallery (Select Album page)

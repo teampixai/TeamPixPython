@@ -34,10 +34,13 @@
     <div class="settings-menu" id="settingsMenu">
       <button type="button" id="settingsBtn"
               class="settings-btn {{ 'active' if active_step in ('team', 'players') else '' }}"
+              aria-label="Settings" title="Settings"
               aria-haspopup="menu" aria-expanded="false" aria-controls="settingsPanel">
-        <span class="settings-icon" aria-hidden="true">&#9881;</span>
-        <span class="settings-label">Settings</span>
-        <span class="settings-caret" aria-hidden="true">&#9662;</span>
+        <svg class="settings-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="4" y1="6" x2="20" y2="6"></line>
+          <line x1="4" y1="12" x2="20" y2="12"></line>
+          <line x1="4" y1="18" x2="20" y2="18"></line>
+        </svg>
       </button>
       <div class="settings-panel" id="settingsPanel" role="menu" aria-labelledby="settingsBtn" hidden>
         {% for key, label in settings_items %}

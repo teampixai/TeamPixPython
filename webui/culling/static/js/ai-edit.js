@@ -1299,9 +1299,8 @@ const AiEdit = (function () {
     const j = dialog();
     j.appendLines([message]);
     j.$dialog.dialog("option", "title", title);
-    j.$dialog.dialog("option", "closeOnEscape", true);
     j.$dialog.dialog("open");
-    j.$dialog.dialog("widget").find(".ui-dialog-titlebar-close").show();
+    j.setClosable(true);
   }
 
   // Reports how one run() ended to its onResult callback — exactly once, so
