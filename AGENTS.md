@@ -20,7 +20,7 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | Path | Role |
 |---|---|
 | `culling_app.py` | **The app.** FastAPI server (default `127.0.0.1:8010`) plus all page routes and `/api/*` endpoints. Long-running work is started as subprocesses (see §3). |
-| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `album-tools`), all extending `base.html` (top bar: a numbered stepper for Select Album → Culling → Faces → Album Tools, plus a right-aligned **Settings** dropdown holding Team and Players). |
+| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `export`, `tools`), all extending `base.html` (top bar: a numbered stepper for Select Album → Culling → Faces → Export → Tools & More, plus a right-aligned **Settings** dropdown holding Team and Players). |
 | `webui/culling/static/js/*.js` | One jQuery script per page, plus shared `common.js` (API helpers, `LogDialog`, heartbeat), `viewport.js` (zoom/pan image window) and `ai-edit.js` (the AI Edit dialog, `AiEdit.run(key, { onResult })`). jQuery 3.7.1 and jQuery UI 1.13.2 load from code.jquery.com. |
 | `webui/index.html`, `webui/static/` | Older single-page UI. Not served by `culling_app.py`. |
 | `1_prep_review.py` | Import/scoring worker. Turns a folder of photos into an album. |
@@ -184,7 +184,7 @@ burst ranking) and logs each step for the log dialog. It needs the album's team 
 restores the level and crop from just before, and re-checking re-applies the same suggestion without a new
 request.
 
-**Batch Auto Edit (experimental)** is an Album Tools panel (`batch-auto-edit/*` in `culling_app.py`,
+**Batch Auto Edit (experimental)** is a Tools & More panel (Photo Utilities) (`batch-auto-edit/*` in `culling_app.py`,
 `BatchAutoEditState`) that runs Auto crop and Sharpen players over every photo at or above a minimum star
 rating (default 5) and writes `<name>_ai_edited.jpg` into a folder picked when Start is clicked (a RAW + JPEG
 pair of one shot gets `<stem>_<EXT>_ai_edited.jpg`). It always starts from the originals and never applies tone.
@@ -316,7 +316,7 @@ The app builds this command line itself. It's useful for debugging an import wit
 | `--openaikey KEY` | `OPENAI_API_KEY` env var | Enables LLM burst culling |
 | `--llm-model`, `--skip-llm-cull` | `gpt-6-luna` | LLM model, or opt out |
 | `--autoadjust`, `--cpu-only`, `--enable-long-paths` | off | Auto exposure, force CPU, Windows long-path registry opt-in |
-| `--rerun-facereco-only`, `--regrade-only` | off | Partial re-runs on an existing album (used by Album Tools) |
+| `--rerun-facereco-only`, `--regrade-only` | off | Partial re-runs on an existing album (used by Tools & More) |
 
 Run `python 1_prep_review.py --help` for the full, authoritative list.
 

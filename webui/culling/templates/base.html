@@ -15,8 +15,8 @@
       <h1 id="title"><span id="titleBase">Photo Culling</span><span id="titleAlbum" class="title-album"></span></h1>
     </div>
     <nav id="steps" class="stepper">
-      {% set step_labels = [("select-album", "Select Album"), ("culling", "Culling"), ("faces", "Faces"), ("album-tools", "Album Tools")] %}
-      {% set gated_steps = ("culling", "faces", "album-tools") %}
+      {% set step_labels = [("select-album", "Select Album"), ("culling", "Culling"),       ("faces", "Faces"), ("export", "Export"), ("tools", "Tools & More")] %}
+            {% set gated_steps = ("culling", "faces", "export", "tools") %}
       {% set no_team = not has_teams() %}
       {% for key, label in step_labels %}
       {% set needs_team = key == "select-album" and no_team %}

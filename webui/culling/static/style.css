@@ -18,7 +18,7 @@
   --shadow-md: 0 4px 16px rgba(20, 20, 30, 0.06);
   --radius: 10px;
   /* Star-rating scale (1 = white, ramping up to deep blue at 5) shared by
-     the Album Tools-page breakdown and the Culling page's dots/preview border.
+     the Export-page breakdown and the Culling page's dots/preview border.
      0 = skipped (no person detected, never graded) — a distinct muted grey
      so it's never mistaken for a genuinely-scored 1-star photo. */
   --star-0: #e2e2e2;
@@ -221,6 +221,16 @@ code {
   margin-bottom: 18px;
 }
 .panel h3 + p.muted { margin-top: 0; margin-bottom: 12px; font-size: 13px; }
+
+.section-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 28px 0 10px;
+}
+.section-title:first-of-type { margin-top: 0; }
 
 .row {
   display: flex;

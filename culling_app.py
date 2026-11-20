@@ -11,7 +11,10 @@ natural code isolation instead of one giant single-page app:
                          recognition) and run the detection pipeline.
   3. Culling          — sort blur / sharp / skipped.
   4. Faces            — group and label face clusters.
-  5. Album Tools      — move files / write face-reco info, with progress.
+  5. Export           — copy the keepers / write face-reco info, with progress;
+                         import more photos.
+  6. Tools & More     — batch auto edit, videos, regrade, jersey colour,
+                         face-detection re-run.
 
 This module currently implements the server-side pieces for pages 1 and 2
 (team persistence + import-folder selection with "remember last" support).
@@ -552,7 +555,7 @@ class BackgroundJobState:
 
 
 # --------------------------------------------------------------------------- #
-# Export (page 5 — Album Tools) — copy "keep" images and merge tagged-player faces
+# Export (Export page) — copy "keep" images and merge tagged-player faces
 # into a .FaceReco database at a destination folder, run in a background
 # thread with the same buffered-lines-for-polling pattern as ProcessingState.
 # --------------------------------------------------------------------------- #
@@ -582,7 +585,7 @@ export_state = ExportState()
 
 
 # --------------------------------------------------------------------------- #
-# Burst → MP4 (experimental, page 5 — Album Tools) — see algo/burst_video.py.
+# Burst → MP4 (experimental, Tools & More page) — see algo/burst_video.py.
 # Same buffered-lines-for-polling background-job pattern as ExportState; like
 # PlayerVideoState/FaceTaggingCsvState, writes to a user-chosen destination
 # folder (tracked here so "Open folder" knows where to point after a run).
@@ -597,8 +600,8 @@ burst_video_state = BurstVideoState()
 
 
 # --------------------------------------------------------------------------- #
-# Export all face tagging to CSV / per-player highlight MP4s (page 5 — Album
-# Tools). Same buffered-lines-for-polling background-job pattern as
+# Export all face tagging to CSV (Export page) / per-player highlight MP4s
+# (Tools & More page). Same buffered-lines-for-polling background-job pattern as
 # BurstVideoState — both write to a user-chosen destination folder.
 # --------------------------------------------------------------------------- #
 class FaceTaggingCsvState(BackgroundJobState):
@@ -620,7 +623,7 @@ player_video_state = PlayerVideoState()
 
 
 # --------------------------------------------------------------------------- #
-# Batch Auto Edit (experimental, page 5 — Album Tools): the AI Edit panel's
+# Batch Auto Edit (experimental, Tools & More page): the AI Edit panel's
 # Auto crop and Sharpen players over every photo at or above a star rating,
 # written to a user-chosen destination folder. Same background-job pattern.
 # --------------------------------------------------------------------------- #
@@ -1315,7 +1318,7 @@ def _stream_logs_to_job():
 
 
 def _regrade_result(summary) -> dict:
-    """The fields the Album Tools page shows after a quick regrade."""
+    """The fields the Tools & More page shows after a quick regrade."""
     return {
         "threshold": summary.threshold,
         "teamColor": summary.team_color,
@@ -1839,7 +1842,7 @@ def _culling_images(
 def _kept_image_basenames(album_path: Path, min_stars: int = 3) -> set[str]:
     """Basenames of every image at or above *min_stars* — the same effective
     (explicit-or-default) star rating the Culling page shows. Used by the
-    Album Tools/export step to decide which original photos (and which face crops)
+    Export step to decide which original photos (and which face crops)
     to copy to the destination."""
     kept: set[str] = set()
     for category in CULLING_CATEGORIES:
@@ -2767,7 +2770,7 @@ def _commit_cluster_operations(album_path: Path, req: FacesCommitRequest) -> dic
 
 
 # --------------------------------------------------------------------------- #
-# Export (page 5 — Album Tools). Three steps, run in a background thread while the
+# Export (Export page). Three steps, run in a background thread while the
 # browser polls /api/album-tools/export-status the same way it polls processing
 # output:
 #
@@ -3427,7 +3430,7 @@ templates.env.globals["static_url"] = _static_url
 templates.env.globals["has_active_album"] = _has_active_album
 templates.env.globals["has_teams"] = _has_teams
 
-PAGE_STEPS: tuple[str, ...] = ("team", "players", "select-album", "culling", "faces", "album-tools")
+PAGE_STEPS: tuple[str, ...] = ("team", "players", "select-album", "culling", "faces", "export", "tools")
 
 
 @app.get("/")
@@ -3462,6 +3465,12 @@ for _step in PAGE_STEPS:
             return _render_page(step, request)
         return _route
     app.add_api_route(f"/{_step}", _make_route(_step), methods=["GET"], response_class=HTMLResponse)
+
+
+@app.get("/album-tools")
+def legacy_album_tools_page() -> RedirectResponse:
+    # The old combined page was split into Export and Tools & More.
+    return RedirectResponse(url="/export")
 
 
 @app.get("/add-new-album")
@@ -3796,8 +3805,8 @@ def api_start_processing(req: StartProcessingRequest) -> dict:
 
 @app.post("/api/import-more")
 def api_import_more(req: ImportMoreRequest) -> dict:
-    """Import additional photos into the currently-selected album (page 5's
-    "Import more images" button). Reuses the same processing_state/polling
+    """Import additional photos into the currently-selected album (the Export
+    page's "Import more images" button). Reuses the same processing_state/polling
     machinery as /api/start-processing — only one processing job (initial
     import OR import-more) can run at a time."""
     path = Path(req.path)
@@ -3824,7 +3833,7 @@ def api_import_more(req: ImportMoreRequest) -> dict:
 
 @app.post("/api/album-tools/rerun-facereco")
 def api_rerun_facereco() -> dict:
-    """Re-run face detection/clustering for the current album (Album Tools
+    """Re-run face detection/clustering for the current album (Tools & More
     page's "Re-run Face Detection" button). Reuses the same
     processing_state/polling machinery as /api/start-processing and
     /api/import-more — only one processing job can run at a time."""
@@ -4815,7 +4824,7 @@ def api_burst_video_summary(minFrames: int = Query(DEFAULT_MIN_FRAMES)) -> dict:
 @app.get("/api/album-tools/burst-video/settings")
 def api_burst_video_settings() -> dict:
     """Last-used min-frames/fps/timing-mode render settings, persisted in
-    state.json (see api_burst_video_render below) so the Album Tools page
+    state.json (see api_burst_video_render below) so the Tools & More page
     pre-fills them on load instead of always resetting to the hardcoded
     defaults."""
     state = _load_state()

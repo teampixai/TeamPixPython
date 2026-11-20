@@ -55,7 +55,7 @@ ship untested code just to see how it goes.
 
 ## Your first album
 
-Five steps, left to right along the top of the page (the optional **Players** step is covered
+Six steps, left to right along the top of the page (the optional **Players** step is covered
 [below](#tidying-up-a-players-faces-players)). Like a fast break, but with more clicking.
 
 1. **Team.** Name, jersey colour(s) and, optionally, the roster. The goalie's in a different kit? Add that
@@ -72,12 +72,13 @@ Five steps, left to right along the top of the page (the optional **Players** st
    never touched; edits are saved as copies.
 4. **Faces.** Name each group of faces once. The app remembers them for future albums. It never forgets a
    face, which is more than we can say for the coach.
-5. **Album Tools.** **Export** the keepers, each with its star rating (Lightroom and Windows Explorer can
+5. **Export.** Export the keepers, each with its star rating (Lightroom and Windows Explorer can
    read it), plus a `players.csv` of who's in which photo. Heads-up: export copies your **original** files.
    AI Edit results aren't applied yet, except photos you saved with **Save Copy**, which are exported as
-   photos of their own. You can also re-tune sensitivity or jersey colour, import more photos, re-run face
-   detection, and (experimental) turn bursts into MP4s, which needs [FFmpeg](https://ffmpeg.org/) on your
-   PATH.
+   photos of their own. This page also shows the album's star statistics and lets you import more photos.
+6. **Tools & More.** *Photo Utilities*: **Batch Auto Edit** and (experimental) per-player highlight videos
+   and burst-to-MP4 clips, which need [FFmpeg](https://ffmpeg.org/) on your PATH. *Album Maintenance*:
+   re-tune the blur sensitivity, change the jersey color, or re-run face detection.
 
 Closed the browser tab by accident? The app keeps running. Open **TeamPixPython** from the Start Menu
 again, or use the link in the console window.

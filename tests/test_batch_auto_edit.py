@@ -1,4 +1,4 @@
-"""Batch Auto Edit (Album Tools): the batched LLM crop requests
+"""Batch Auto Edit (Tools & More): the batched LLM crop requests
 (algo/llm/auto_crop.py), autoedit.py's --jobs-file mode, and the server job
 that plans the crops and bodies and then runs one autoedit.py process."""
 

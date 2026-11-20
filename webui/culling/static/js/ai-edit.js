@@ -35,7 +35,7 @@
 //      the crop), streaming its output into a non-closable jQuery UI modal
 //      via LogDialog (see common.js), reusing the same
 //      processing_state/`/api/processing-output` polling plumbing as
-//      import-more/rerun-facereco/deep-regrade (see album-tools.js) — only
+//      import-more/rerun-facereco/deep-regrade (see export.js / tools.js) — only
 //      one such background job can run at a time.
 //   3. Review: the log gives way to the before/after compare window whose
 //      Abort / Save Copy / Save buttons decide what happens to the result:

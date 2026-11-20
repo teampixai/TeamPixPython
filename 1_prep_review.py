@@ -923,8 +923,8 @@ def main() -> None:
     }
     # Persist the resolved pin/auto-detect choice (not just honour it for this
     # run) so it survives into info.json's run_settings and is remembered by
-    # later "import more"/regrade runs and reflected back in the album-tools
-    # "Team Jersey Colour" picker.
+    # later "import more"/regrade runs and reflected back in the Tools & More
+    # "Change Jersey Color" picker.
     run_settings_out["team_color_override"] = team_color_override
     # Face-score cut-off below the real sharp threshold: bodies above it get
     # their jersey identified (see algo/thresholds.py). Recorded per album so

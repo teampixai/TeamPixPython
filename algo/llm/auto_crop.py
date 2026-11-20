@@ -272,7 +272,7 @@ def suggest_crop(
 
 
 # --------------------------------------------------------------------------- #
-# Batches: many photos per request (Album Tools -> Batch Auto Edit)
+# Batches: many photos per request (Tools & More -> Batch Auto Edit)
 # --------------------------------------------------------------------------- #
 
 # Photos sent in one request, like the standalone grading batches of the

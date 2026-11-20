@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block title %}Tools &amp; More — Photo Culling{% endblock %}
+{% block content %}
+<h2>Tools &amp; More</h2>
+
+<h3 class="section-title">Photo Utilities</h3>
+
+<div class="panel" id="batchAutoEditPanel">
+  <h3>Batch Auto Edit <span class="muted">(experimental)</span></h3>
+  <p class="muted">
+    Runs AI Edit on every photo at or above the selected star rating and saves
+    each result as <code>&lt;name&gt;_ai_edited.jpg</code> in a folder of your
+    choice. Always starts from the original photo.
+  </p>
+  <div class="row">
+    <label class="inline-check">Player
+      <select id="batchPlayerInput">
+        <option value="" selected>All Players</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="batchResizeInput" />
+      Resize (AI crop)
+    </label>
+  </div>
+  <div class="row">
+    <div class="batch-choices" id="batchResizeChoices" role="group" aria-label="Resize shape">
+      <button type="button" class="crop-tile" data-choice="instagram" aria-pressed="true" disabled>
+        <span class="crop-icon" aria-hidden="true"><span class="crop-icon-shape" style="width:18px;height:22px"></span></span>
+        <span class="crop-tile-label">Instagram 4:5</span>
+      </button>
+      <button type="button" class="crop-tile" data-choice="original" aria-pressed="false" disabled>
+        <span class="crop-icon crop-icon-free" aria-hidden="true"><span class="crop-icon-shape"></span></span>
+        <span class="crop-tile-label">Original ratio</span>
+      </button>
+    </div>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="batchSharpenInput" />
+      Sharpen players
+    </label>
+    <span class="muted">Sharpens your team's players (picked by jersey colour), or only the chosen player; opponents are left untouched.</span>
+  </div>
+  <div class="row">
+    <label class="inline-check">Minimum stars to process
+      <select id="batchMinStarsInput">
+        <option value="1">1+ ★</option>
+        <option value="2">2+ ★</option>
+        <option value="3">3+ ★</option>
+        <option value="4">4+ ★</option>
+        <option value="5" selected>5 ★ only</option>
+      </select>
+    </label>
+    <span id="batchCountLabel" class="muted"></span>
+  </div>
+
+  <div class="row actions">
+    <span id="batchStatus" class="muted"></span>
+    <button id="openBatchFolderBtn" class="btn btn-icon-text" title="Open destination folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="batchStartBtn" class="btn btn-primary btn-icon-text" title="Choose a destination folder and start" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+      </svg>
+      <span>Start Auto edit</span>
+    </button>
+  </div>
+</div>
+
+<div id="batchAutoEditDialog" title="Batch Auto Edit…" style="display:none">
+  <textarea id="batchAutoEditOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div class="panel" id="playerVideoPanel">
+  <h3>Per-Player Highlight Videos <span class="muted">(experimental)</span></h3>
+  <p class="muted">
+    Renders one MP4 per tagged player, containing every photo they're
+    recognized in (chronological order), regardless of star rating. Always
+    uses the original photos, never AI-edited versions. Uses
+    ffmpeg if it's on PATH for best quality, otherwise falls back to a
+    lower-quality built-in encoder.
+  </p>
+  <div class="row">
+    <label class="inline-check">Frame rate (FPS)
+      <input type="number" id="playerVideoFpsInput" min="1" max="30" value="15" style="width:4em" />
+    </label>
+    <span id="playerVideoSummaryLabel" class="muted"></span>
+  </div>
+  <div class="row actions">
+    <span id="playerVideoStatus" class="muted"></span>
+    <button id="openPlayerVideoFolderBtn" class="btn btn-icon-text" title="Open output folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="renderPlayerVideosBtn" class="btn btn-icon-text" title="Choose destination &amp; render per-player videos">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="23 7 16 12 23 17 23 7"></polygon>
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+      </svg>
+      <span>Render per-player videos</span>
+    </button>
+  </div>
+</div>
+
+<div id="playerVideoDialog" title="Rendering player videos…" style="display:none">
+  <textarea id="playerVideoOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div class="panel" id="burstVideoPanel">
+  <h3>Burst &rarr; MP4 <span class="muted">(experimental)</span></h3>
+  <p class="muted">
+    Stitches each detected photo burst (consecutive shots within 1 second of
+    each other, regardless of blur/sharp verdict) into its own MP4, saved to
+    a destination folder of your choice. Always uses the original photos,
+    never AI-edited versions. Uses ffmpeg if it's on PATH for
+    best quality, otherwise falls back to a lower-quality built-in encoder.
+  </p>
+  <div class="row">
+    <label class="inline-check">Minimum frames per burst
+      <input type="number" id="burstMinFramesInput" min="2" max="50" value="3" style="width:4em" />
+    </label>
+    <span id="burstSummaryLabel" class="muted"></span>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="radio" name="burstTimingMode" value="fps" checked />
+      Fixed FPS
+    </label>
+    <input type="number" id="burstFpsInput" min="1" max="30" value="6" style="width:4em" />
+    <label class="inline-check">
+      <input type="radio" name="burstTimingMode" value="timestamp" />
+      Match real capture timing
+    </label>
+  </div>
+  <div class="row actions">
+    <span id="burstVideoStatus" class="muted"></span>
+    <button id="openBurstsFolderBtn" class="btn btn-icon-text" title="Open bursts folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="renderBurstsBtn" class="btn btn-icon-text" title="Choose destination &amp; render all qualifying bursts">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="23 7 16 12 23 17 23 7"></polygon>
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+      </svg>
+      <span>Render all qualifying bursts</span>
+    </button>
+  </div>
+</div>
+
+<div id="burstVideoDialog" title="Rendering bursts…" style="display:none">
+  <textarea id="burstVideoOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<h3 class="section-title">Album Maintenance</h3>
+
+<div class="panel" id="sensitivityPanel">
+  <h3>Adjust Blur Sensitivity</h3>
+  <p class="muted">
+    Move the cut-line between Blur and Sharp. Jersey colours are re-evaluated
+    and the team colour re-polled either way; photos where no usable face was
+    detected are only revisited by a deep regrade.
+  </p>
+  <div id="regradeSensitivityPresets" class="sensitivity-options">
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="low" />
+      <span class="option-text">
+        <span class="option-title">Low <span class="muted">(0.35)</span></span>
+        <span class="option-desc muted">Allows through all but the most severely blurred images.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="medium" />
+      <span class="option-text">
+        <span class="option-title">Medium <span class="muted">(0.50)</span></span>
+        <span class="option-desc muted">Allows through mildly soft images; noticeably blurry ones are filtered out.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="high" />
+      <span class="option-text">
+        <span class="option-title">High <span class="muted">(0.68)</span></span>
+        <span class="option-desc muted">Keeps only sharply focused faces.</span>
+      </span>
+    </label>
+    <label class="sensitivity-option">
+      <input type="radio" name="regradeSensMode" value="custom" />
+      <span class="option-text">
+        <span class="option-title">Custom</span>
+        <span class="option-desc muted">Set your own threshold below.</span>
+      </span>
+    </label>
+  </div>
+  <div class="row">
+    <input type="range" id="regradeSensitivitySlider" min="0" max="0.99" step="0.01" value="0.50" />
+    <span id="regradeSensitivityValue" class="muted">0.50</span>
+  </div>
+  <div class="row actions">
+    <span id="regradeStatus" class="muted"></span>
+    <button id="regradeBtn" class="btn btn-icon-text" title="Re-bucket Blur/Sharp from the sharpness scores already measured">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+      </svg>
+      <span>Quick Regrade</span>
+    </button>
+    <button id="deepRegradeBtn" class="btn btn-icon-text" title="Re-detect and re-score every photo from the originals">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <polyline points="1 20 1 14 7 14"></polyline>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+      </svg>
+      <span>Deep Regrade</span>
+    </button>
+  </div>
+  <p class="muted">
+    <strong>Quick</strong> re-uses the sharpness scores already measured, then
+    re-checks jersey colours and re-polls the team colour against the new cut-line —
+    fast, but it can't revisit photos where no usable face was detected.
+    <strong>Deep</strong> additionally re-detects people and re-measures sharpness
+    from the original photos, so it also fixes albums where detection itself was
+    off — much slower. Both keep your star ratings and face tagging.
+  </p>
+</div>
+
+<div id="deepRegradeDialog" title="Deep regrade…" style="display:none">
+  <textarea id="deepRegradeOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div id="jerseyColorDialog" title="Applying jersey colour…" style="display:none">
+  <textarea id="jerseyColorOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div class="panel" id="jerseyColorPanel">
+  <h3>Change Jersey Color</h3>
+  <p class="muted">
+    By default this album's team colour is auto-detected from the photos.
+    Pin it here if detection picked the wrong colour — every photo is
+    re-checked against the new colour, star ratings for any photo that
+    changes side of the keep line are reset to their baseline, and the
+    previews/thumbnails for those photos are redrawn. Face tagging is
+    untouched — face recognition doesn't depend on jersey colour.
+  </p>
+  <div class="row">
+    <span class="muted">Team colour</span>
+    <div id="jerseyColorPicker" class="color-picker"></div>
+    <span id="jerseyColorDetected" class="muted"></span>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="jerseyRerunLlmInput" />
+      Re-run LLM burst ranking after this change (uses OpenAI credits)
+    </label>
+  </div>
+  <div class="row actions">
+    <span id="jerseyColorStatus" class="muted"></span>
+    <button id="jerseyColorBtn" class="btn btn-icon-text" title="Apply this jersey colour to the whole album">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"></circle>
+        <path d="M12 3a9 9 0 0 0 0 18 5 5 0 0 0 0-10h4a4 4 0 0 0 0-8z"></path>
+      </svg>
+      <span>Apply Jersey Colour</span>
+    </button>
+  </div>
+</div>
+
+<div class="panel" id="rerunFacerecoPanel">
+  <h3>Re-run Face Detection</h3>
+  <p class="muted">
+    Re-clusters faces from scratch using this album's already-detected
+    photos (no re-import, no re-detecting blur). Existing tagged players
+    and deletions from the Faces page are preserved; untagged/pending
+    clusters may be renumbered or grouped differently.
+  </p>
+  <div class="row actions">
+    <span id="rerunFacerecoStatus" class="muted"></span>
+    <button id="rerunFacerecoBtn" class="btn btn-icon-text" title="Re-run face detection/clustering">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+      </svg>
+      <span>Re-run Face Detection</span>
+    </button>
+  </div>
+</div>
+
+<div id="rerunFacerecoDialog" title="Re-running face detection…" style="display:none">
+  <textarea id="rerunFacerecoOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="{{ static_url('js/tools.js') }}"></script>
+{% endblock %}

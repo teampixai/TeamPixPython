@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Export — Photo Culling{% endblock %}
+{% block content %}
+<h2>Export</h2>
+
+<div class="panel" id="summaryPanel">
+  <h3 id="summaryAlbumName">Album</h3>
+  <div class="star-breakdown" id="starBreakdown"></div>
+  <div class="stat-grid" id="summaryStats">
+    <div class="stat"><span class="stat-value" id="statFaces">–</span><span class="stat-label">Faces detected</span></div>
+    <div class="stat"><span class="stat-value" id="statPlayers">–</span><span class="stat-label">Players detected</span></div>
+  </div>
+</div>
+
+<div class="panel" id="exportPanel">
+  <h3>Export to Folder</h3>
+  <p class="muted">
+    Copies every photo at or above the selected star rating to a destination
+    folder of your choice. If face tagging is enabled below, also generates
+    a <code>players.csv</code> file listing which players appear in each
+    photo.
+  </p>
+  <div class="row">
+    <label class="inline-check">Minimum stars to export
+      <select id="minStarsInput">
+        <option value="1">1+ ★</option>
+        <option value="2">2+ ★</option>
+        <option value="3" selected>3+ ★</option>
+        <option value="4">4+ ★</option>
+        <option value="5">5 ★ only</option>
+      </select>
+    </label>
+    <span id="exportCountLabel" class="muted"></span>
+  </div>
+  <div class="row">
+    <label class="inline-check">
+      <input type="checkbox" id="exportFaceTaggingInput" checked />
+      Export face tagging
+    </label>
+  </div>
+
+  <div class="row actions">
+    <span id="exportStatus" class="muted"></span>
+    <button id="openDestBtn" class="btn btn-icon-text" title="Open destination folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="exportBtn" class="btn btn-primary btn-icon-text" title="Choose destination &amp; export">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="17 8 12 3 7 8"></polyline>
+        <line x1="12" y1="3" x2="12" y2="15"></line>
+      </svg>
+      <span>Export</span>
+    </button>
+  </div>
+
+  <hr />
+  <p class="muted">
+    Writes a CSV listing every tagged face in this album — every player
+    recognized in every photo, regardless of star rating or whether that
+    photo is ever exported — to a destination folder of your choice.
+  </p>
+  <div class="row actions">
+    <span id="faceTaggingCsvStatus" class="muted"></span>
+    <button id="openFaceTaggingCsvFolderBtn" class="btn btn-icon-text" title="Open output folder" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"></path>
+      </svg>
+      <span>Open folder</span>
+    </button>
+    <button id="faceTaggingCsvBtn" class="btn btn-icon-text" title="Choose destination &amp; export CSV">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="7 10 12 15 17 10"></polyline>
+        <line x1="12" y1="15" x2="12" y2="3"></line>
+      </svg>
+      <span>Export All Face Tagging (CSV)</span>
+    </button>
+  </div>
+</div>
+
+<div id="exportDialog" title="Exporting…" style="display:none">
+  <p id="exportDialogStatus" class="muted"></p>
+  <textarea id="exportOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div id="faceTaggingCsvDialog" title="Exporting…" style="display:none">
+  <p id="faceTaggingCsvDialogStatus" class="muted"></p>
+  <textarea id="faceTaggingCsvOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+
+<div class="panel" id="importMorePanel">
+  <h3>Import More Images</h3>
+  <p class="muted">
+    Add photos from another folder into this album. Files already imported
+    (matched by source path) are automatically skipped — importing the same
+    folder twice is harmless. Newly imported photos go through the full
+    pipeline (blur detection, face recognition, LLM culling) using this
+    album's original settings.
+  </p>
+  <div class="row actions">
+    <span id="importMoreStatus" class="muted"></span>
+    <button id="importMoreBtn" class="btn btn-icon-text" title="Choose a folder to import">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="7 10 12 15 17 10"></polyline>
+        <line x1="12" y1="15" x2="12" y2="3"></line>
+      </svg>
+      <span>Import more images</span>
+    </button>
+  </div>
+</div>
+
+<div id="importMoreDialog" title="Importing…" style="display:none">
+  <textarea id="importMoreOutput" class="output-box" rows="16" readonly></textarea>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="{{ static_url('js/export.js') }}"></script>
+{% endblock %}
