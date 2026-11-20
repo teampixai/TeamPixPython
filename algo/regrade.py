@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from algo.config import app_config
+from algo.jersey_colors import resolve_jersey_color
 from algo.models import ColorLab
 from algo.results import baseline_stars
 from algo.stages.annotation import invalidate_previews
@@ -345,7 +346,8 @@ def regrade_sensitivity(
     team_bucket: str | None = None
     our_color: ColorLab | None = None
     if not no_team:
-        our_label, team_target_lab, team_bucket = _poll_jersey(candidates, app_config, pinned)
+        our_label, team_target_lab, team_bucket = _poll_jersey(
+            candidates, app_config, resolve_jersey_color(pinned or "") or pinned)
         if our_label is None:
             log.warning("[regrade] no usable cloth colour found — skipping team-colour filter")
         else:

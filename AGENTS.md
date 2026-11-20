@@ -20,7 +20,7 @@ Main platform: **Windows 10/11**, installed with `InitPhotoProcessing.bat`. See 
 | Path | Role |
 |---|---|
 | `culling_app.py` | **The app.** FastAPI server (default `127.0.0.1:8010`) plus all page routes and `/api/*` endpoints. Long-running work is started as subprocesses (see §3). |
-| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `export`, `tools`), all extending `base.html` (top bar: a numbered stepper for Select Album → Culling → Faces → Export → Tools & More, plus a right-aligned **Settings** dropdown holding Team and Players). |
+| `webui/culling/templates/*.html` | One Jinja2 template per page (`team`, `players`, `select-album`, `add-new-album`, `culling`, `faces`, `export`, `tools`), all extending `base.html` (top bar: a numbered stepper for Select Album → Culling → Faces → Export → Tools & More, plus a right-aligned **Settings** dropdown holding Team Settings and Face Recognition, i.e. the `team` and `players` pages). |
 | `webui/culling/static/js/*.js` | One jQuery script per page, plus shared `common.js` (API helpers, `LogDialog`, heartbeat), `viewport.js` (zoom/pan image window) and `ai-edit.js` (the AI Edit dialog, `AiEdit.run(key, { onResult })`). jQuery 3.7.1 and jQuery UI 1.13.2 load from code.jquery.com. |
 | `webui/index.html`, `webui/static/` | Older single-page UI. Not served by `culling_app.py`. |
 | `1_prep_review.py` | Import/scoring worker. Turns a folder of photos into an album. |
@@ -43,6 +43,7 @@ Key `algo/` modules:
 | `album.py` | `Album` / `AlbumImage` / `PersonRecord`: the **only** layer that knows the shape of `album.json`. `album_for(path)` returns a cached instance. |
 | `album_info.py` | `AlbumInfo`: `info.json`, the per-category file lists (blur / sharp / skipped). |
 | `config.py` | `AppConfig` tunables (§7). |
+| `jersey_colors.py` | Jersey colour names in the Team page dropdowns. Most are aliases that resolve to one of the classifier's 16 reference `Hue:Shade` labels (`resolve_jersey_color`, applied in the matchers in `utils.py` / `jersey_counting.py` / `regrade.py`). A new name must map to a reference label. |
 | `sharpness.py` | `SharpnessEvaluator` implementations. The active one is the module-level `sharpness_evaluator` (currently `ContrastNormalizedEvaluator`). |
 | `regrade.py` | Quick regrade: re-buckets blur/sharp from stored scores without re-detecting. |
 | `facereco.py`, `face_crop_embed.py`, `*_provider.py` | Face clustering and matching. Providers: `facenet_provider` (default), `dlib_provider`, `mediapipe_provider`, `torchvision_provider` (person boxes). |

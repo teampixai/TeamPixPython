@@ -153,27 +153,24 @@ $(function () {
   bindEnableOnInput("#jerseyColorInput", "#addJerseyBtn");
   bindEnableOnInput("#goalkeeperJerseyInput", "#addGoalkeeperJerseyBtn");
 
-  $("#addJerseyBtn").on("click", () => {
-    const color = $("#jerseyColorInput").val().trim();
+  // Add the selected colour, skipping one already in the list.
+  const addJerseyColor = (selector, forced) => {
+    const color = ($(selector).val() || "").trim();
     if (!color) return;
-    Team.jerseyColors.push({ color, forced: false });
-    $("#jerseyColorInput").val("").trigger("change");
+    if (!Team.jerseyColors.some((jc) => jc.color === color && !!jc.forced === forced)) {
+      Team.jerseyColors.push({ color, forced });
+    }
+    $(selector).val("").trigger("change");
     renderJerseyList();
-  });
-  $("#jerseyColorInput").on("keydown", (e) => { if (e.key === "Enter") $("#addJerseyBtn").click(); });
+  };
+
+  $("#addJerseyBtn").on("click", () => addJerseyColor("#jerseyColorInput", false));
 
   $("#hasGoalkeeperInput").on("change", function () {
     $("#goalkeeperJerseyRow").toggle($(this).is(":checked"));
   });
 
-  $("#addGoalkeeperJerseyBtn").on("click", () => {
-    const color = $("#goalkeeperJerseyInput").val().trim();
-    if (!color) return;
-    Team.jerseyColors.push({ color, forced: true });
-    $("#goalkeeperJerseyInput").val("").trigger("change");
-    renderJerseyList();
-  });
-  $("#goalkeeperJerseyInput").on("keydown", (e) => { if (e.key === "Enter") $("#addGoalkeeperJerseyBtn").click(); });
+  $("#addGoalkeeperJerseyBtn").on("click", () => addJerseyColor("#goalkeeperJerseyInput", true));
 
   $("#addPlayerBtn").on("click", () => {
     const raw = $("#playerBulkInput").val();

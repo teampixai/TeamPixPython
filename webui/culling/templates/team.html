@@ -20,14 +20,28 @@
   <p class="muted">Colors your team wears.</p>
   <div id="jerseyList" class="tag-list"></div>
   <div class="row">
-    <input type="text" id="jerseyColorInput" placeholder="Team Jersey, e.g. Blue" />
+    <select id="jerseyColorInput" class="jersey-select">
+      <option value="">Team Jersey, e.g. Blue</option>
+      {% for g in jersey_color_groups %}
+      <optgroup label="{{ g.group }}">
+        {% for c in g.colors %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </optgroup>
+      {% endfor %}
+    </select>
     <button id="addJerseyBtn" class="btn" disabled>Add</button>
   </div>
   <div class="row">
     <label class="inline-check"><input type="checkbox" id="hasGoalkeeperInput" /> My team has a goalkeeper/player in different jersey color</label>
   </div>
   <div class="row" id="goalkeeperJerseyRow" style="display:none">
-    <input type="text" id="goalkeeperJerseyInput" placeholder="Goal Keeper/Special Jersey, e.g. Neon Green" />
+    <select id="goalkeeperJerseyInput" class="jersey-select">
+      <option value="">Goal Keeper/Special Jersey, e.g. Neon Green</option>
+      {% for g in jersey_color_groups %}
+      <optgroup label="{{ g.group }}">
+        {% for c in g.colors %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </optgroup>
+      {% endfor %}
+    </select>
     <button id="addGoalkeeperJerseyBtn" class="btn" disabled>Add</button>
   </div>
 </div>
@@ -49,7 +63,8 @@ Sam Rivera"></textarea>
 
 <div class="panel">
   <h3>OpenAI API Key</h3>
-  <p class="muted">Optional. Used only for UI-related AI assist features. Stored locally in <code>team.json</code>.</p>
+  <p class="muted">Optional. Used only for UI-related AI assist features. Stored locally in <code>team.json</code>.
+    Need a key? <a href="https://youtu.be/TbranXJ0hmk?si=pR_1kSmWRJf3uLTi" target="_blank" rel="noopener noreferrer">How to get an OpenAI key (YouTube video)</a>.</p>
   <div class="row">
     <input type="password" id="openaiKeyInput" placeholder="sk-…" style="min-width:320px" />
     <button id="toggleKeyVisibilityBtn" class="btn">Show</button>

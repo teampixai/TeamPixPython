@@ -16,6 +16,7 @@ from typing import Optional, Union
 import cv2
 import numpy as np
 
+from algo.jersey_colors import resolve_jersey_color
 from algo.models import AutoAdjustment, Box, ColorLab, Face
 
 try:
@@ -432,6 +433,7 @@ def _color_from_label(label: str) -> "ColorLab | None":
     """Parse a 'Hue:Shade' label into a ColorLab, or return None for N/A / Unknown."""
     if not label or label in ("N/A", "Unknown"):
         return None
+    label = resolve_jersey_color(label) or label
     hue, _, shade = label.partition(":")
     return ColorLab(hue.strip(), shade.strip())
 
@@ -447,7 +449,7 @@ def _matches_allowed_jersey_color(color: "ColorLab | None", allowed_colors: froz
     c_hue_l   = color.hue.strip().lower()
     c_shade_l = color.shade.strip().lower()
     for allowed in allowed_colors:
-        a = allowed.strip().lower()
+        a = (resolve_jersey_color(allowed) or allowed).strip().lower()
         if not a:
             continue
         if ":" in a:

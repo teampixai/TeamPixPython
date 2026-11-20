@@ -30,7 +30,7 @@
       </a>
       {% endfor %}
     </nav>
-    {% set settings_items = [("team", "Team"), ("players", "Players")] %}
+    {% set settings_items = [("team", "Team Settings"), ("players", "Face Recognition")] %}
     <div class="settings-menu" id="settingsMenu">
       <button type="button" id="settingsBtn"
               class="settings-btn {{ 'active' if active_step in ('team', 'players') else '' }}"

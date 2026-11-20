@@ -55,12 +55,13 @@ ship untested code just to see how it goes.
 
 ## Your first album
 
-Six steps, left to right along the top of the page (the optional **Players** step is covered
-[below](#tidying-up-a-players-faces-players)). Like a fast break, but with more clicking.
+Six steps, left to right along the top of the page (the optional **Face Recognition** page, in the **Settings**
+menu, is covered [below](#tidying-up-a-players-faces-face-recognition)). Like a fast break, but with more clicking.
 
-1. **Team.** Name, jersey colour(s) and, optionally, the roster. The goalie's in a different kit? Add that
+1. **Team.** (**Settings → Team Settings**.) Name, jersey colour(s) and, optionally, the roster. The goalie's in a different kit? Add that
    colour as *forced*: no keeper left behind. An optional **OpenAI API key** turns on AI burst ranking
-   (see [Privacy](#privacy-and-your-data)).
+   (see [Privacy](#privacy-and-your-data)). Need a key?
+   [How to get an OpenAI key (YouTube video)](https://youtu.be/TbranXJ0hmk?si=pR_1kSmWRJf3uLTi).
 2. **Select Album.** Click **+**, pick a photo folder, the team and a blur sensitivity (*low* = only flag
    the truly smeared shots, *high* = also flag slightly soft ones). Tick **Recognize Faces** if you want
    it. For practices or anything where the team isn't in its usual kit, tick **Ignore jersey color**. Hit
@@ -83,9 +84,9 @@ Six steps, left to right along the top of the page (the optional **Players** ste
 Closed the browser tab by accident? The app keeps running. Open **TeamPixPython** from the Start Menu
 again, or use the link in the console window.
 
-### Tidying up a player's faces (Players)
+### Tidying up a player's faces (Face Recognition)
 
-The **Players** step (right after Team) shows each player's picture and the faces the app has learned for
+The **Face Recognition** page (in the **Settings** menu) shows each player's picture and the faces the app has learned for
 them. Pick a player in the list. The middle column, **Positive**, holds photos of that player, and the
 right-hand column, **Negative**, holds look-alikes that must *not* be matched to them. Rest the mouse on a
 photo for a moment to see it full size.

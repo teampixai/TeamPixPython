@@ -5,6 +5,7 @@ import statistics
 
 from algo.config import AppConfig
 from algo.frame import Frame
+from algo.jersey_colors import resolve_jersey_color
 from algo.models import Body, ColorLab
 from algo.stage import ProcessStage
 from algo.stages.grading import ClothColorPredictor
@@ -147,7 +148,7 @@ def _allowed_reference_labs(allowed_colors: frozenset[str]) -> list[tuple[float,
         hue_l = c.hue.strip().lower()
         shade_l = c.shade.strip().lower()
         for allowed in allowed_colors:
-            a = allowed.strip().lower()
+            a = (resolve_jersey_color(allowed) or allowed).strip().lower()
             if not a:
                 continue
             if ":" in a:

@@ -54,6 +54,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
 from algo.facereco import record_manual_override
+from algo.jersey_colors import jersey_color_groups
 from algo.regrade import regrade_sensitivity
 from algo.stages.annotation import invalidate_previews, render_album_preview
 from algo.album import ALBUM_JSON_NAME, EDITEDIMAGES_SUBDIR, AlbumImage, PersonRecord, album_for, box_in_crop
@@ -3451,7 +3452,10 @@ def api_heartbeat() -> dict:
 
 
 def _render_page(step: str, request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, f"{step}.html", {"active_step": step})
+    context = {"active_step": step}
+    if step == "team":
+        context["jersey_color_groups"] = jersey_color_groups()
+    return templates.TemplateResponse(request, f"{step}.html", context)
 
 
 for _step in PAGE_STEPS:
