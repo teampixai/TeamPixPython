@@ -252,7 +252,8 @@ Whole-frame sharpening of a 24 MP photo is far slower than sharpening one player
   Volta, driver ≥ 528; 2.14.x is the last release with Windows cu126 wheels), else `cpu`.
   `facenet-pytorch==2.6.0` is **not** in `requirements.txt`: it declares `torch<2.3` (which would pull in a
   CPU-only 2.2.x with no Blackwell code), so it's installed with `pip install --no-deps`, and both
-  `InitPhotoProcessing.bat` and `UpdateDeps.bat` filter it out of `pip install -r`. `numpy<2` (tested set;
+  `InitPhotoProcessing.bat` and `UpdateDeps.bat` filter it out of `pip install -r`. Pip installs that run
+  afterwards use `--no-warn-conflicts`, or pip prints its stale torch/torchvision/Pillow pins as errors. `numpy<2` (tested set;
   torch itself no longer needs it), `setuptools<81` (keeps `pkg_resources` for face_recognition_models).
   Install torch **before** `pip install -r requirements.txt`, or pip may pull a CPU build from PyPI.
   `esrsharpen.py`/`autoedit.py` patch basicsr's removed `torchvision.transforms.functional_tensor` import

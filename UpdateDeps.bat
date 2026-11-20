@@ -32,12 +32,12 @@ set "REQ_FILTERED=%TEMP%\bpd-requirements.filtered.txt"
 :: must be installed with --no-deps or pip would downgrade PyTorch to the
 :: CPU-only 2.2.x it declares (an older requirements.txt still lists it).
 findstr /V /R /C:"^dlib" /C:"^facenet-pytorch" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
-"%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
+"%ENV_PY%" -m pip install --no-warn-conflicts -r "%REQ_FILTERED%"
 if errorlevel 1 goto :warn
-"%ENV_PY%" -m pip install --no-deps "facenet-pytorch==2.6.0"
+"%ENV_PY%" -m pip install --no-deps --no-warn-conflicts "facenet-pytorch==2.6.0"
 if errorlevel 1 goto :warn
 :: Same pins InitPhotoProcessing.bat re-asserts after installing requirements.
-"%ENV_PY%" -m pip install "numpy>=1.26.0,<2" "setuptools<81"
+"%ENV_PY%" -m pip install --no-warn-conflicts "numpy>=1.26.0,<2" "setuptools<81"
 if errorlevel 1 goto :warn
 
 >"%STAMP%" echo %NEW_BLOB%

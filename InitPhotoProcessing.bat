@@ -520,16 +520,18 @@ if not errorlevel 1 (
 echo [8/11] Installing remaining dependencies from requirements.txt...
 set "REQ_FILTERED=%WORK_DIR%\requirements.filtered.txt"
 findstr /V /R /C:"^dlib" /C:"^facenet-pytorch" "%APP_DIR%\requirements.txt" > "%REQ_FILTERED%"
-"%ENV_PY%" -m pip install -r "%REQ_FILTERED%"
+"%ENV_PY%" -m pip install --no-warn-conflicts -r "%REQ_FILTERED%"
 if errorlevel 1 goto :fail
 
 echo       Installing %FACENET_SPEC% without its outdated torch^<2.3 pin
-echo       ^(pip may warn that it "requires torch^<2.3.0" - that is expected and harmless^)...
+echo       ^(its torch/torchvision/Pillow version pins are intentionally ignored - the app works with the newer ones^)...
 "%ENV_PY%" -m pip install --no-deps %FACENET_SPEC%
 if errorlevel 1 goto :fail
 
+:: --no-warn-conflicts on the pip installs from here on: pip would otherwise
+:: re-report facenet-pytorch's stale torch/torchvision/Pillow pins as errors.
 echo       Re-asserting numpy^<2 pin ^(dlib-gpu's conda-forge numpy dependency can bump it to 2.x^)...
-"%ENV_PY%" -m pip install --force-reinstall "numpy>=1.26.0,<2"
+"%ENV_PY%" -m pip install --no-warn-conflicts --force-reinstall "numpy>=1.26.0,<2"
 if errorlevel 1 goto :fail
 
 :: ----------------------------------------------------------------------------
@@ -550,11 +552,11 @@ if errorlevel 1 goto :fail
 :: newer setuptools as a transitive dependency.
 :: ----------------------------------------------------------------------------
 echo [9/11] Re-asserting setuptools^<81 pin ^(pkg_resources compatibility^)...
-"%ENV_PY%" -m pip install "setuptools<81"
+"%ENV_PY%" -m pip install --no-warn-conflicts "setuptools<81"
 if errorlevel 1 goto :fail
 
 echo       Installing face_recognition_models ^(from source - PyPI releases are unreliable^)...
-"%ENV_PY%" -m pip install --upgrade --force-reinstall --no-deps https://github.com/ageitgey/face_recognition_models/archive/refs/heads/master.zip
+"%ENV_PY%" -m pip install --upgrade --force-reinstall --no-deps --no-warn-conflicts https://github.com/ageitgey/face_recognition_models/archive/refs/heads/master.zip
 if errorlevel 1 goto :fail
 
 echo       Verifying face_recognition_models imports correctly...
@@ -582,7 +584,7 @@ if "%HAS_NVIDIA_GPU%"=="1" (
             echo       WARNING: this PyTorch build cannot run on this GPU - switching to the CPU-only build.
             call :install_torch cpu
             if errorlevel 1 goto :fail
-            "%ENV_PY%" -m pip install "numpy>=1.26.0,<2" "setuptools<81"
+            "%ENV_PY%" -m pip install --no-warn-conflicts "numpy>=1.26.0,<2" "setuptools<81"
             if errorlevel 1 goto :fail
         ) else (
             echo       PyTorch CUDA: OK
@@ -684,7 +686,7 @@ goto :eof
 :: ----------------------------------------------------------------------------
 :install_torch
 "%ENV_PY%" -m pip uninstall -y torch torchvision torchaudio >nul 2>nul
-"%ENV_PY%" -m pip install torch==%TORCH_VER% torchvision==%TORCHVISION_VER% --index-url https://download.pytorch.org/whl/%~1
+"%ENV_PY%" -m pip install --no-warn-conflicts torch==%TORCH_VER% torchvision==%TORCHVISION_VER% --index-url https://download.pytorch.org/whl/%~1
 exit /b %errorlevel%
 
 :: ----------------------------------------------------------------------------
